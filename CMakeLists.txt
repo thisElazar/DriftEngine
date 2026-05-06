@@ -32,7 +32,15 @@ FetchContent_Declare(
     GIT_TAG        3.4
     GIT_SHALLOW    TRUE
 )
-FetchContent_MakeAvailable(glfw)
+
+FetchContent_Declare(
+    vk-bootstrap
+    GIT_REPOSITORY https://github.com/charles-lunarg/vk-bootstrap.git
+    GIT_TAG        v1.4.349
+    GIT_SHALLOW    TRUE
+)
+
+FetchContent_MakeAvailable(glfw vk-bootstrap)
 
 # ---------------------------------------------------------------------------
 # Vulkan
@@ -50,7 +58,7 @@ add_executable(drift_engine
     src/main.cpp
 )
 
-target_link_libraries(drift_engine PRIVATE Vulkan::Vulkan glfw)
+target_link_libraries(drift_engine PRIVATE Vulkan::Vulkan glfw vk-bootstrap::vk-bootstrap)
 target_compile_definitions(drift_engine PRIVATE GLFW_INCLUDE_NONE)
 
 # Strict-ish warnings; expand later
@@ -63,4 +71,8 @@ endif()
 # macOS: ensure we link against the right SDK frameworks if/when we add them
 if(APPLE)
     target_compile_definitions(drift_engine PRIVATE VK_USE_PLATFORM_METAL_EXT)
+    # GLFW and vk-bootstrap dlopen libvulkan at runtime; the Homebrew loader
+    # isn't in the default search path, so embed an rpath.
+    get_filename_component(_vulkan_lib_dir "${Vulkan_LIBRARIES}" DIRECTORY)
+    target_link_options(drift_engine PRIVATE "LINKER:-rpath,${_vulkan_lib_dir}")
 endif()
