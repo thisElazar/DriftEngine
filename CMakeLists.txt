@@ -89,3 +89,33 @@ if(APPLE)
     get_filename_component(_vulkan_lib_dir "${Vulkan_LIBRARIES}" DIRECTORY)
     target_link_options(drift_engine PRIVATE "LINKER:-rpath,${_vulkan_lib_dir}")
 endif()
+
+# ---------------------------------------------------------------------------
+# HLSL → SPIR-V shader compilation
+# ---------------------------------------------------------------------------
+find_program(GLSLC glslc REQUIRED HINTS ENV VULKAN_SDK PATH_SUFFIXES bin)
+message(STATUS "glslc: ${GLSLC}")
+
+set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+set(SHADER_OUT_DIR ${CMAKE_BINARY_DIR}/shaders)
+file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
+
+file(GLOB HLSL_SHADERS ${SHADER_DIR}/*.hlsl)
+
+set(SPV_OUTPUTS "")
+foreach(HLSL ${HLSL_SHADERS})
+    get_filename_component(NAME_WE ${HLSL} NAME_WE)
+    set(SPV ${SHADER_OUT_DIR}/${NAME_WE}.spv)
+    add_custom_command(
+        OUTPUT ${SPV}
+        COMMAND ${GLSLC} -x hlsl -fshader-stage=compute -fentry-point=main
+                --target-env=vulkan1.3 ${HLSL} -o ${SPV}
+        DEPENDS ${HLSL}
+        COMMENT "HLSL→SPIR-V: ${NAME_WE}.hlsl"
+        VERBATIM
+    )
+    list(APPEND SPV_OUTPUTS ${SPV})
+endforeach()
+
+add_custom_target(shaders ALL DEPENDS ${SPV_OUTPUTS})
+add_dependencies(drift_engine shaders)

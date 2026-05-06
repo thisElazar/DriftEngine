@@ -1,8 +1,7 @@
-// Drift Engine — v0.1.4
+// Drift Engine — v0.1.5
 //
-// VMA integration: creates a swapchain-sized RGBA16F storage image via VMA.
-// The image is allocated but unused — v0.1.5 will write to it from compute.
-// Frame loop still clears the swapchain directly (unchanged from v0.1.3).
+// Compute → blit pipeline: loads a SPIR-V compute shader, writes a procedural
+// pattern into the VMA storage image, blits to the swapchain for present.
 
 #include <vulkan/vulkan.h>
 #include <GLFW/glfw3.h>
@@ -10,8 +9,9 @@
 #include <vk_mem_alloc.h>
 
 #include <array>
-#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <vector>
 
 namespace {
@@ -30,6 +30,13 @@ struct RenderTarget {
     VkImage       image;
     VmaAllocation allocation;
     VkImageView   view;
+};
+
+struct PushConstants {
+    float    time;
+    uint32_t width;
+    uint32_t height;
+    uint32_t _pad;
 };
 
 bool g_framebuffer_resized = false;
@@ -54,6 +61,20 @@ void framebuffer_resize_callback(GLFWwindow* /*window*/, int /*width*/, int /*he
             std::abort();                                                        \
         }                                                                       \
     } while (0)
+
+std::vector<uint32_t> load_spirv(const char* path)
+{
+    std::ifstream file(path, std::ios::ate | std::ios::binary);
+    if (!file.is_open()) {
+        std::fprintf(stderr, "Failed to open SPIR-V file: %s\n", path);
+        std::abort();
+    }
+    size_t size = static_cast<size_t>(file.tellg());
+    std::vector<uint32_t> buffer(size / sizeof(uint32_t));
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(size));
+    return buffer;
+}
 
 RenderTarget create_render_target(VkDevice device, VmaAllocator allocator, VkExtent2D extent)
 {
@@ -97,10 +118,33 @@ void destroy_render_target(VkDevice device, VmaAllocator allocator, RenderTarget
     rt = {};
 }
 
+void update_descriptor_set(VkDevice device, VkDescriptorSet set, VkImageView view)
+{
+    VkDescriptorImageInfo img_info{};
+    img_info.imageView = view;
+    img_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set;
+    write.dstBinding = 0;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &img_info;
+
+    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+}
+
 } // namespace
 
 int main()
 {
+#ifdef __APPLE__
+    // MoltenVK argument buffers require explicit base type info for storage
+    // images that we don't provide. Disable until we need them.
+    setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0);
+#endif
+
     // ---- GLFW init -----------------------------------------------------------
     if (!glfwInit()) {
         std::fprintf(stderr, "Failed to initialize GLFW.\n");
@@ -248,6 +292,85 @@ int main()
     // ---- Storage image (render target) --------------------------------------
     RenderTarget render_target = create_render_target(device, allocator, vkb_swapchain.extent);
 
+    // ---- Compute pipeline ---------------------------------------------------
+    auto spirv = load_spirv("shaders/visualize.spv");
+
+    VkShaderModuleCreateInfo sm_ci{};
+    sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    sm_ci.codeSize = spirv.size() * sizeof(uint32_t);
+    sm_ci.pCode = spirv.data();
+
+    VkShaderModule shader_module = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &shader_module));
+
+    VkDescriptorSetLayoutBinding binding{};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo dsl_ci{};
+    dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dsl_ci.bindingCount = 1;
+    dsl_ci.pBindings = &binding;
+
+    VkDescriptorSetLayout desc_set_layout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &dsl_ci, nullptr, &desc_set_layout));
+
+    VkPushConstantRange push_range{};
+    push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    push_range.offset = 0;
+    push_range.size = sizeof(PushConstants);
+
+    VkPipelineLayoutCreateInfo pl_ci{};
+    pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pl_ci.setLayoutCount = 1;
+    pl_ci.pSetLayouts = &desc_set_layout;
+    pl_ci.pushConstantRangeCount = 1;
+    pl_ci.pPushConstantRanges = &push_range;
+
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &pipeline_layout));
+
+    VkPipelineShaderStageCreateInfo stage{};
+    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage.module = shader_module;
+    stage.pName = "main";
+
+    VkComputePipelineCreateInfo cp_ci{};
+    cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cp_ci.stage = stage;
+    cp_ci.layout = pipeline_layout;
+
+    VkPipeline compute_pipeline = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &compute_pipeline));
+
+    // ---- Descriptor pool + set ----------------------------------------------
+    VkDescriptorPoolSize pool_size{};
+    pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    pool_size.descriptorCount = 1;
+
+    VkDescriptorPoolCreateInfo dp_ci{};
+    dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dp_ci.maxSets = 1;
+    dp_ci.poolSizeCount = 1;
+    dp_ci.pPoolSizes = &pool_size;
+
+    VkDescriptorPool desc_pool = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorPool(device, &dp_ci, nullptr, &desc_pool));
+
+    VkDescriptorSetAllocateInfo ds_ai{};
+    ds_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    ds_ai.descriptorPool = desc_pool;
+    ds_ai.descriptorSetCount = 1;
+    ds_ai.pSetLayouts = &desc_set_layout;
+
+    VkDescriptorSet desc_set = VK_NULL_HANDLE;
+    VK_CHECK(vkAllocateDescriptorSets(device, &ds_ai, &desc_set));
+
+    update_descriptor_set(device, desc_set, render_target.view);
+
     // ---- Per-frame resources ------------------------------------------------
     std::array<FrameData, FRAMES_IN_FLIGHT> frames{};
 
@@ -297,12 +420,13 @@ int main()
 
         destroy_render_target(device, allocator, render_target);
         render_target = create_render_target(device, allocator, vkb_swapchain.extent);
+        update_descriptor_set(device, desc_set, render_target.view);
 
         g_framebuffer_resized = false;
     };
 
     // ---- Startup printout ---------------------------------------------------
-    std::printf("drift_engine v0.1.4 — Vulkan up.\n");
+    std::printf("drift_engine v0.1.5 — Vulkan up.\n");
     std::printf("Device:   %s\n", vkb_phys.name.c_str());
     std::printf("Queues:   graphics=%u  present=%u\n",
                 gfx_family,
@@ -314,11 +438,12 @@ int main()
                 vkb_swapchain.extent.width, vkb_swapchain.extent.height,
                 (vkb_swapchain.extent.width * vkb_swapchain.extent.height * 8)
                     / (1024.0 * 1024.0));
-    std::printf("Window open. Press ESC or close the window to exit.\n");
+    std::printf("Compute pipeline ready. Window open.\n");
     std::fflush(stdout);
 
     // ---- Frame loop ---------------------------------------------------------
     uint32_t current_frame = 0;
+    const VkImageSubresourceRange color_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -355,65 +480,123 @@ int main()
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(frame.cmd, &begin_info));
 
-        // Barrier: UNDEFINED → TRANSFER_DST
-        VkImageMemoryBarrier2 barrier_to_clear{};
-        barrier_to_clear.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        barrier_to_clear.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-        barrier_to_clear.srcAccessMask = VK_ACCESS_2_NONE;
-        barrier_to_clear.dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-        barrier_to_clear.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barrier_to_clear.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        barrier_to_clear.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barrier_to_clear.image = swapchain_images[image_index];
-        barrier_to_clear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkExtent2D extent = vkb_swapchain.extent;
 
-        VkDependencyInfo dep_to_clear{};
-        dep_to_clear.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        dep_to_clear.imageMemoryBarrierCount = 1;
-        dep_to_clear.pImageMemoryBarriers = &barrier_to_clear;
+        // -- (a) Storage image: UNDEFINED → GENERAL for compute write ---------
+        VkImageMemoryBarrier2 barrier_to_general{};
+        barrier_to_general.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barrier_to_general.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+        barrier_to_general.srcAccessMask = VK_ACCESS_2_NONE;
+        barrier_to_general.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        barrier_to_general.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        barrier_to_general.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier_to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier_to_general.image = render_target.image;
+        barrier_to_general.subresourceRange = color_range;
 
-        vkCmdPipelineBarrier2(frame.cmd, &dep_to_clear);
+        VkDependencyInfo dep_to_general{};
+        dep_to_general.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep_to_general.imageMemoryBarrierCount = 1;
+        dep_to_general.pImageMemoryBarriers = &barrier_to_general;
+        vkCmdPipelineBarrier2(frame.cmd, &dep_to_general);
 
-        // Clear with cycling color
-        float t = static_cast<float>(glfwGetTime());
-        VkClearColorValue clear_color = {{
-            0.5f + 0.5f * std::sin(t),
-            0.5f + 0.5f * std::sin(t + 2.094f),
-            0.5f + 0.5f * std::sin(t + 4.188f),
-            1.0f
-        }};
+        // -- (b-d) Bind compute pipeline, push constants, dispatch ------------
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compute_pipeline);
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                pipeline_layout, 0, 1, &desc_set, 0, nullptr);
 
-        VkImageSubresourceRange clear_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdClearColorImage(frame.cmd, swapchain_images[image_index],
-                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                             &clear_color, 1, &clear_range);
+        PushConstants pc{};
+        pc.time = static_cast<float>(glfwGetTime());
+        pc.width = extent.width;
+        pc.height = extent.height;
+        vkCmdPushConstants(frame.cmd, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(pc), &pc);
 
-        // Barrier: TRANSFER_DST → PRESENT_SRC
+        vkCmdDispatch(frame.cmd,
+                      (extent.width + 15) / 16,
+                      (extent.height + 15) / 16,
+                      1);
+
+        // -- (e) Storage image: GENERAL → TRANSFER_SRC ------------------------
+        VkImageMemoryBarrier2 barrier_rt_to_src{};
+        barrier_rt_to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barrier_rt_to_src.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        barrier_rt_to_src.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        barrier_rt_to_src.dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+        barrier_rt_to_src.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        barrier_rt_to_src.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier_rt_to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier_rt_to_src.image = render_target.image;
+        barrier_rt_to_src.subresourceRange = color_range;
+
+        // -- (f) Swapchain image: UNDEFINED → TRANSFER_DST --------------------
+        VkImageMemoryBarrier2 barrier_sc_to_dst{};
+        barrier_sc_to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barrier_sc_to_dst.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+        barrier_sc_to_dst.srcAccessMask = VK_ACCESS_2_NONE;
+        barrier_sc_to_dst.dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+        barrier_sc_to_dst.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barrier_sc_to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier_sc_to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier_sc_to_dst.image = swapchain_images[image_index];
+        barrier_sc_to_dst.subresourceRange = color_range;
+
+        VkImageMemoryBarrier2 blit_barriers[] = {barrier_rt_to_src, barrier_sc_to_dst};
+        VkDependencyInfo dep_blit{};
+        dep_blit.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep_blit.imageMemoryBarrierCount = 2;
+        dep_blit.pImageMemoryBarriers = blit_barriers;
+        vkCmdPipelineBarrier2(frame.cmd, &dep_blit);
+
+        // -- (g) Blit storage image → swapchain image -------------------------
+        VkImageBlit2 region{};
+        region.sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2;
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.srcOffsets[0] = {0, 0, 0};
+        region.srcOffsets[1] = {static_cast<int32_t>(extent.width),
+                                static_cast<int32_t>(extent.height), 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstOffsets[0] = {0, 0, 0};
+        region.dstOffsets[1] = {static_cast<int32_t>(extent.width),
+                                static_cast<int32_t>(extent.height), 1};
+
+        VkBlitImageInfo2 blit_info{};
+        blit_info.sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2;
+        blit_info.srcImage = render_target.image;
+        blit_info.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        blit_info.dstImage = swapchain_images[image_index];
+        blit_info.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        blit_info.regionCount = 1;
+        blit_info.pRegions = &region;
+        blit_info.filter = VK_FILTER_NEAREST;
+
+        vkCmdBlitImage2(frame.cmd, &blit_info);
+
+        // -- (h) Swapchain image: TRANSFER_DST → PRESENT_SRC ------------------
         VkImageMemoryBarrier2 barrier_to_present{};
         barrier_to_present.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        barrier_to_present.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+        barrier_to_present.srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
         barrier_to_present.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
         barrier_to_present.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
         barrier_to_present.dstAccessMask = VK_ACCESS_2_NONE;
         barrier_to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         barrier_to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         barrier_to_present.image = swapchain_images[image_index];
-        barrier_to_present.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barrier_to_present.subresourceRange = color_range;
 
         VkDependencyInfo dep_to_present{};
         dep_to_present.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         dep_to_present.imageMemoryBarrierCount = 1;
         dep_to_present.pImageMemoryBarriers = &barrier_to_present;
-
         vkCmdPipelineBarrier2(frame.cmd, &dep_to_present);
 
         VK_CHECK(vkEndCommandBuffer(frame.cmd));
 
-        // Submit
+        // -- (i) Submit -------------------------------------------------------
         VkSemaphoreSubmitInfo wait_sem{};
         wait_sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
         wait_sem.semaphore = frame.image_available;
-        wait_sem.stageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+        wait_sem.stageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
 
         VkSemaphoreSubmitInfo signal_sem{};
         signal_sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -471,6 +654,12 @@ int main()
     for (auto view : swapchain_views)
         vkDestroyImageView(device, view, nullptr);
     vkb::destroy_swapchain(vkb_swapchain);
+
+    vkDestroyPipeline(device, compute_pipeline, nullptr);
+    vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+    vkDestroyDescriptorPool(device, desc_pool, nullptr);
+    vkDestroyDescriptorSetLayout(device, desc_set_layout, nullptr);
+    vkDestroyShaderModule(device, shader_module, nullptr);
 
     destroy_render_target(device, allocator, render_target);
     vmaDestroyAllocator(allocator);
