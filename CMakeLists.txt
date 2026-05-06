@@ -40,7 +40,14 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 
-FetchContent_MakeAvailable(glfw vk-bootstrap)
+FetchContent_Declare(
+    VulkanMemoryAllocator
+    GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+    GIT_TAG        v3.2.1
+    GIT_SHALLOW    TRUE
+)
+
+FetchContent_MakeAvailable(glfw vk-bootstrap VulkanMemoryAllocator)
 
 # ---------------------------------------------------------------------------
 # Vulkan
@@ -56,9 +63,15 @@ message(STATUS "Vulkan library:     ${Vulkan_LIBRARIES}")
 # ---------------------------------------------------------------------------
 add_executable(drift_engine
     src/main.cpp
+    src/vma_impl.cpp
 )
 
-target_link_libraries(drift_engine PRIVATE Vulkan::Vulkan glfw vk-bootstrap::vk-bootstrap)
+target_link_libraries(drift_engine PRIVATE
+    Vulkan::Vulkan
+    glfw
+    vk-bootstrap::vk-bootstrap
+    GPUOpen::VulkanMemoryAllocator
+)
 target_compile_definitions(drift_engine PRIVATE GLFW_INCLUDE_NONE)
 
 # Strict-ish warnings; expand later

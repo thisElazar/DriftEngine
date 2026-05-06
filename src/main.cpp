@@ -1,12 +1,13 @@
-// Drift Engine — v0.1.3
+// Drift Engine — v0.1.4
 //
-// Swapchain + frame loop: acquires a swapchain image, clears it to a cycling
-// color via vkCmdClearColorImage, and presents. Proves the entire present
-// pipeline end-to-end with animated pixels.
+// VMA integration: creates a swapchain-sized RGBA16F storage image via VMA.
+// The image is allocated but unused — v0.1.5 will write to it from compute.
+// Frame loop still clears the swapchain directly (unchanged from v0.1.3).
 
 #include <vulkan/vulkan.h>
 #include <GLFW/glfw3.h>
 #include <VkBootstrap.h>
+#include <vk_mem_alloc.h>
 
 #include <array>
 #include <cmath>
@@ -23,6 +24,12 @@ struct FrameData {
     VkSemaphore     image_available;
     VkSemaphore     render_finished;
     VkFence         in_flight;
+};
+
+struct RenderTarget {
+    VkImage       image;
+    VmaAllocation allocation;
+    VkImageView   view;
 };
 
 bool g_framebuffer_resized = false;
@@ -47,6 +54,48 @@ void framebuffer_resize_callback(GLFWwindow* /*window*/, int /*width*/, int /*he
             std::abort();                                                        \
         }                                                                       \
     } while (0)
+
+RenderTarget create_render_target(VkDevice device, VmaAllocator allocator, VkExtent2D extent)
+{
+    VkImageCreateInfo img_ci{};
+    img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_ci.imageType = VK_IMAGE_TYPE_2D;
+    img_ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    img_ci.extent = {extent.width, extent.height, 1};
+    img_ci.mipLevels = 1;
+    img_ci.arrayLayers = 1;
+    img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    img_ci.usage = VK_IMAGE_USAGE_STORAGE_BIT
+                 | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                 | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo alloc_ci{};
+    alloc_ci.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_ci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    alloc_ci.priority = 1.0f;
+
+    RenderTarget rt{};
+    VK_CHECK(vmaCreateImage(allocator, &img_ci, &alloc_ci, &rt.image, &rt.allocation, nullptr));
+
+    VkImageViewCreateInfo view_ci{};
+    view_ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_ci.image = rt.image;
+    view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    view_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(device, &view_ci, nullptr, &rt.view));
+
+    return rt;
+}
+
+void destroy_render_target(VkDevice device, VmaAllocator allocator, RenderTarget& rt)
+{
+    vkDestroyImageView(device, rt.view, nullptr);
+    vmaDestroyImage(allocator, rt.image, rt.allocation);
+    rt = {};
+}
 
 } // namespace
 
@@ -155,6 +204,21 @@ int main()
     VkQueue present_queue = vkb_device.get_queue(vkb::QueueType::present).value();
     uint32_t gfx_family = vkb_device.get_queue_index(vkb::QueueType::graphics).value();
 
+    // ---- VMA allocator ------------------------------------------------------
+    VmaVulkanFunctions vk_funcs{};
+    vk_funcs.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+    vk_funcs.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+
+    VmaAllocatorCreateInfo alloc_info{};
+    alloc_info.physicalDevice = vkb_phys.physical_device;
+    alloc_info.device = device;
+    alloc_info.instance = vkb_inst.instance;
+    alloc_info.vulkanApiVersion = VK_API_VERSION_1_3;
+    alloc_info.pVulkanFunctions = &vk_funcs;
+
+    VmaAllocator allocator = VK_NULL_HANDLE;
+    VK_CHECK(vmaCreateAllocator(&alloc_info, &allocator));
+
     // ---- Swapchain ----------------------------------------------------------
     auto build_swapchain = [&]() -> vkb::Swapchain {
         int w, h;
@@ -181,6 +245,9 @@ int main()
     std::vector<VkImage> swapchain_images = vkb_swapchain.get_images().value();
     std::vector<VkImageView> swapchain_views = vkb_swapchain.get_image_views().value();
 
+    // ---- Storage image (render target) --------------------------------------
+    RenderTarget render_target = create_render_target(device, allocator, vkb_swapchain.extent);
+
     // ---- Per-frame resources ------------------------------------------------
     std::array<FrameData, FRAMES_IN_FLIGHT> frames{};
 
@@ -191,12 +258,12 @@ int main()
         pool_ci.queueFamilyIndex = gfx_family;
         VK_CHECK(vkCreateCommandPool(device, &pool_ci, nullptr, &f.pool));
 
-        VkCommandBufferAllocateInfo alloc_ci{};
-        alloc_ci.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        alloc_ci.commandPool = f.pool;
-        alloc_ci.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        alloc_ci.commandBufferCount = 1;
-        VK_CHECK(vkAllocateCommandBuffers(device, &alloc_ci, &f.cmd));
+        VkCommandBufferAllocateInfo cmd_alloc{};
+        cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_alloc.commandPool = f.pool;
+        cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_alloc.commandBufferCount = 1;
+        VK_CHECK(vkAllocateCommandBuffers(device, &cmd_alloc, &f.cmd));
 
         VkSemaphoreCreateInfo sem_ci{};
         sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -228,11 +295,14 @@ int main()
         swapchain_images = vkb_swapchain.get_images().value();
         swapchain_views = vkb_swapchain.get_image_views().value();
 
+        destroy_render_target(device, allocator, render_target);
+        render_target = create_render_target(device, allocator, vkb_swapchain.extent);
+
         g_framebuffer_resized = false;
     };
 
     // ---- Startup printout ---------------------------------------------------
-    std::printf("drift_engine v0.1.3 — Vulkan up.\n");
+    std::printf("drift_engine v0.1.4 — Vulkan up.\n");
     std::printf("Device:   %s\n", vkb_phys.name.c_str());
     std::printf("Queues:   graphics=%u  present=%u\n",
                 gfx_family,
@@ -240,6 +310,10 @@ int main()
     std::printf("Swapchain: %ux%u, %u images\n",
                 vkb_swapchain.extent.width, vkb_swapchain.extent.height,
                 static_cast<uint32_t>(swapchain_images.size()));
+    std::printf("Storage image: %ux%u R16G16B16A16_SFLOAT (%.1f MiB)\n",
+                vkb_swapchain.extent.width, vkb_swapchain.extent.height,
+                (vkb_swapchain.extent.width * vkb_swapchain.extent.height * 8)
+                    / (1024.0 * 1024.0));
     std::printf("Window open. Press ESC or close the window to exit.\n");
     std::fflush(stdout);
 
@@ -249,7 +323,6 @@ int main()
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        // Skip rendering while minimized
         int fb_w, fb_h;
         glfwGetFramebufferSize(window, &fb_w, &fb_h);
         if (fb_w == 0 || fb_h == 0)
@@ -257,10 +330,8 @@ int main()
 
         FrameData& frame = frames[current_frame];
 
-        // Wait for this frame's previous submission to finish
         VK_CHECK(vkWaitForFences(device, 1, &frame.in_flight, VK_TRUE, UINT64_MAX));
 
-        // Acquire next swapchain image
         uint32_t image_index = 0;
         VkResult acquire_result = vkAcquireNextImageKHR(
             device, vkb_swapchain.swapchain, UINT64_MAX,
@@ -279,7 +350,6 @@ int main()
         VK_CHECK(vkResetFences(device, 1, &frame.in_flight));
         VK_CHECK(vkResetCommandBuffer(frame.cmd, 0));
 
-        // Record command buffer
         VkCommandBufferBeginInfo begin_info{};
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -339,7 +409,7 @@ int main()
 
         VK_CHECK(vkEndCommandBuffer(frame.cmd));
 
-        // Submit (synchronization2 — VkSubmitInfo2)
+        // Submit
         VkSemaphoreSubmitInfo wait_sem{};
         wait_sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
         wait_sem.semaphore = frame.image_available;
@@ -401,6 +471,9 @@ int main()
     for (auto view : swapchain_views)
         vkDestroyImageView(device, view, nullptr);
     vkb::destroy_swapchain(vkb_swapchain);
+
+    destroy_render_target(device, allocator, render_target);
+    vmaDestroyAllocator(allocator);
 
     vkb::destroy_device(vkb_device);
     vkDestroySurfaceKHR(vkb_inst.instance, surface, nullptr);
