@@ -1,16 +1,19 @@
-// Drift Engine — v0.1.5
+// Drift Engine — v0.1.6
 //
-// Compute → blit pipeline: loads a SPIR-V compute shader, writes a procedural
-// pattern into the VMA storage image, blits to the swapchain for present.
+// Heightmap upload: loads a .r16 file via staging buffer into a R16_UNORM
+// sampled image on the GPU. Descriptor set carries it at binding 1.
+// Frame loop unchanged from v0.1.5 (procedural pattern, no heightmap viz yet).
 
 #include <vulkan/vulkan.h>
 #include <GLFW/glfw3.h>
 #include <VkBootstrap.h>
 #include <vk_mem_alloc.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <vector>
 
@@ -37,6 +40,18 @@ struct PushConstants {
     uint32_t width;
     uint32_t height;
     uint32_t _pad;
+};
+
+struct HeightmapData {
+    std::vector<uint16_t> values;
+    uint32_t width;
+    uint32_t height;
+};
+
+struct HeightmapGPU {
+    VkImage       image;
+    VmaAllocation allocation;
+    VkImageView   view;
 };
 
 bool g_framebuffer_resized = false;
@@ -74,6 +89,28 @@ std::vector<uint32_t> load_spirv(const char* path)
     file.seekg(0);
     file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(size));
     return buffer;
+}
+
+HeightmapData load_r16(const char* path, uint32_t w, uint32_t h)
+{
+    std::ifstream file(path, std::ios::ate | std::ios::binary);
+    if (!file.is_open()) {
+        std::fprintf(stderr, "Failed to open heightmap: %s\n", path);
+        std::abort();
+    }
+    size_t expected = static_cast<size_t>(w) * h * sizeof(uint16_t);
+    size_t actual = static_cast<size_t>(file.tellg());
+    if (actual != expected) {
+        std::fprintf(stderr, "Heightmap size mismatch: expected %zu, got %zu\n", expected, actual);
+        std::abort();
+    }
+    HeightmapData hm{};
+    hm.width = w;
+    hm.height = h;
+    hm.values.resize(w * h);
+    file.seekg(0);
+    file.read(reinterpret_cast<char*>(hm.values.data()), static_cast<std::streamsize>(expected));
+    return hm;
 }
 
 RenderTarget create_render_target(VkDevice device, VmaAllocator allocator, VkExtent2D extent)
@@ -118,21 +155,188 @@ void destroy_render_target(VkDevice device, VmaAllocator allocator, RenderTarget
     rt = {};
 }
 
-void update_descriptor_set(VkDevice device, VkDescriptorSet set, VkImageView view)
+HeightmapGPU upload_heightmap(VkDevice device, VmaAllocator allocator,
+                              VkQueue queue, uint32_t queue_family,
+                              const HeightmapData& hm)
 {
-    VkDescriptorImageInfo img_info{};
-    img_info.imageView = view;
-    img_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkDeviceSize buf_size = static_cast<VkDeviceSize>(hm.width) * hm.height * sizeof(uint16_t);
 
-    VkWriteDescriptorSet write{};
-    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write.dstSet = set;
-    write.dstBinding = 0;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    write.pImageInfo = &img_info;
+    // Staging buffer
+    VkBufferCreateInfo buf_ci{};
+    buf_ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buf_ci.size = buf_size;
+    buf_ci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
 
-    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    VmaAllocationCreateInfo staging_ai{};
+    staging_ai.usage = VMA_MEMORY_USAGE_AUTO;
+    staging_ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+                     | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    VkBuffer staging_buf = VK_NULL_HANDLE;
+    VmaAllocation staging_alloc = VK_NULL_HANDLE;
+    VmaAllocationInfo staging_info{};
+    VK_CHECK(vmaCreateBuffer(allocator, &buf_ci, &staging_ai,
+                             &staging_buf, &staging_alloc, &staging_info));
+
+    std::memcpy(staging_info.pMappedData, hm.values.data(), buf_size);
+    vmaFlushAllocation(allocator, staging_alloc, 0, VK_WHOLE_SIZE);
+
+    // GPU image
+    VkImageCreateInfo img_ci{};
+    img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_ci.imageType = VK_IMAGE_TYPE_2D;
+    img_ci.format = VK_FORMAT_R16_UNORM;
+    img_ci.extent = {hm.width, hm.height, 1};
+    img_ci.mipLevels = 1;
+    img_ci.arrayLayers = 1;
+    img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    img_ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo gpu_ai{};
+    gpu_ai.usage = VMA_MEMORY_USAGE_AUTO;
+    gpu_ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+    HeightmapGPU gpu{};
+    VK_CHECK(vmaCreateImage(allocator, &img_ci, &gpu_ai, &gpu.image, &gpu.allocation, nullptr));
+
+    // One-shot command buffer
+    VkCommandPoolCreateInfo pool_ci{};
+    pool_ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    pool_ci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    pool_ci.queueFamilyIndex = queue_family;
+
+    VkCommandPool tmp_pool = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateCommandPool(device, &pool_ci, nullptr, &tmp_pool));
+
+    VkCommandBufferAllocateInfo cmd_ai{};
+    cmd_ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmd_ai.commandPool = tmp_pool;
+    cmd_ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmd_ai.commandBufferCount = 1;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VK_CHECK(vkAllocateCommandBuffers(device, &cmd_ai, &cmd));
+
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
+
+    // Barrier: UNDEFINED → TRANSFER_DST
+    VkImageMemoryBarrier2 barrier_to_dst{};
+    barrier_to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrier_to_dst.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+    barrier_to_dst.srcAccessMask = VK_ACCESS_2_NONE;
+    barrier_to_dst.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    barrier_to_dst.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier_to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier_to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier_to_dst.image = gpu.image;
+    barrier_to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    VkDependencyInfo dep_to_dst{};
+    dep_to_dst.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep_to_dst.imageMemoryBarrierCount = 1;
+    dep_to_dst.pImageMemoryBarriers = &barrier_to_dst;
+    vkCmdPipelineBarrier2(cmd, &dep_to_dst);
+
+    // Copy buffer → image
+    VkBufferImageCopy2 copy_region{};
+    copy_region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
+    copy_region.bufferOffset = 0;
+    copy_region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy_region.imageExtent = {hm.width, hm.height, 1};
+
+    VkCopyBufferToImageInfo2 copy_info{};
+    copy_info.sType = VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2;
+    copy_info.srcBuffer = staging_buf;
+    copy_info.dstImage = gpu.image;
+    copy_info.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    copy_info.regionCount = 1;
+    copy_info.pRegions = &copy_region;
+    vkCmdCopyBufferToImage2(cmd, &copy_info);
+
+    // Barrier: TRANSFER_DST → SHADER_READ_ONLY
+    VkImageMemoryBarrier2 barrier_to_read{};
+    barrier_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrier_to_read.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    barrier_to_read.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier_to_read.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier_to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    barrier_to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier_to_read.image = gpu.image;
+    barrier_to_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    VkDependencyInfo dep_to_read{};
+    dep_to_read.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep_to_read.imageMemoryBarrierCount = 1;
+    dep_to_read.pImageMemoryBarriers = &barrier_to_read;
+    vkCmdPipelineBarrier2(cmd, &dep_to_read);
+
+    VK_CHECK(vkEndCommandBuffer(cmd));
+
+    // Submit and wait
+    VkFenceCreateInfo fence_ci{};
+    fence_ci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VkFence fence = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateFence(device, &fence_ci, nullptr, &fence));
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    VK_CHECK(vkQueueSubmit(queue, 1, &submit, fence));
+    VK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+
+    vkDestroyFence(device, fence, nullptr);
+    vkDestroyCommandPool(device, tmp_pool, nullptr);
+    vmaDestroyBuffer(allocator, staging_buf, staging_alloc);
+
+    // Image view
+    VkImageViewCreateInfo view_ci{};
+    view_ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_ci.image = gpu.image;
+    view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_ci.format = VK_FORMAT_R16_UNORM;
+    view_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(device, &view_ci, nullptr, &gpu.view));
+
+    return gpu;
+}
+
+void update_descriptor_set(VkDevice device, VkDescriptorSet set,
+                           VkImageView storage_view,
+                           VkImageView heightmap_view, VkSampler sampler)
+{
+    VkDescriptorImageInfo storage_info{};
+    storage_info.imageView = storage_view;
+    storage_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo heightmap_info{};
+    heightmap_info.imageView = heightmap_view;
+    heightmap_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    heightmap_info.sampler = sampler;
+
+    VkWriteDescriptorSet writes[2]{};
+
+    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[0].dstSet = set;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    writes[0].pImageInfo = &storage_info;
+
+    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[1].dstSet = set;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[1].pImageInfo = &heightmap_info;
+
+    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
 }
 
 } // namespace
@@ -140,8 +344,6 @@ void update_descriptor_set(VkDevice device, VkDescriptorSet set, VkImageView vie
 int main()
 {
 #ifdef __APPLE__
-    // MoltenVK argument buffers require explicit base type info for storage
-    // images that we don't provide. Disable until we need them.
     setenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0", 0);
 #endif
 
@@ -263,6 +465,26 @@ int main()
     VmaAllocator allocator = VK_NULL_HANDLE;
     VK_CHECK(vmaCreateAllocator(&alloc_info, &allocator));
 
+    // ---- Heightmap load + upload --------------------------------------------
+    HeightmapData hm = load_r16("data/heightmaps/test.r16", 513, 513);
+
+    auto [hm_min, hm_max] = std::minmax_element(hm.values.begin(), hm.values.end());
+
+    HeightmapGPU heightmap_gpu = upload_heightmap(device, allocator, graphics_queue, gfx_family, hm);
+
+    // ---- Sampler ------------------------------------------------------------
+    VkSamplerCreateInfo sampler_ci{};
+    sampler_ci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sampler_ci.magFilter = VK_FILTER_LINEAR;
+    sampler_ci.minFilter = VK_FILTER_LINEAR;
+    sampler_ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sampler_ci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_ci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sampler_ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+
+    VkSampler sampler = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateSampler(device, &sampler_ci, nullptr, &sampler));
+
     // ---- Swapchain ----------------------------------------------------------
     auto build_swapchain = [&]() -> vkb::Swapchain {
         int w, h;
@@ -303,16 +525,21 @@ int main()
     VkShaderModule shader_module = VK_NULL_HANDLE;
     VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &shader_module));
 
-    VkDescriptorSetLayoutBinding binding{};
-    binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    binding.descriptorCount = 1;
-    binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding bindings[2]{};
+    bindings[0].binding = 0;
+    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    bindings[0].descriptorCount = 1;
+    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    bindings[1].binding = 1;
+    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[1].descriptorCount = 1;
+    bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutCreateInfo dsl_ci{};
     dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dsl_ci.bindingCount = 1;
-    dsl_ci.pBindings = &binding;
+    dsl_ci.bindingCount = 2;
+    dsl_ci.pBindings = bindings;
 
     VkDescriptorSetLayout desc_set_layout = VK_NULL_HANDLE;
     VK_CHECK(vkCreateDescriptorSetLayout(device, &dsl_ci, nullptr, &desc_set_layout));
@@ -347,15 +574,17 @@ int main()
     VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &compute_pipeline));
 
     // ---- Descriptor pool + set ----------------------------------------------
-    VkDescriptorPoolSize pool_size{};
-    pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    pool_size.descriptorCount = 1;
+    VkDescriptorPoolSize pool_sizes[2]{};
+    pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    pool_sizes[0].descriptorCount = 1;
+    pool_sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    pool_sizes[1].descriptorCount = 1;
 
     VkDescriptorPoolCreateInfo dp_ci{};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dp_ci.maxSets = 1;
-    dp_ci.poolSizeCount = 1;
-    dp_ci.pPoolSizes = &pool_size;
+    dp_ci.poolSizeCount = 2;
+    dp_ci.pPoolSizes = pool_sizes;
 
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     VK_CHECK(vkCreateDescriptorPool(device, &dp_ci, nullptr, &desc_pool));
@@ -369,7 +598,7 @@ int main()
     VkDescriptorSet desc_set = VK_NULL_HANDLE;
     VK_CHECK(vkAllocateDescriptorSets(device, &ds_ai, &desc_set));
 
-    update_descriptor_set(device, desc_set, render_target.view);
+    update_descriptor_set(device, desc_set, render_target.view, heightmap_gpu.view, sampler);
 
     // ---- Per-frame resources ------------------------------------------------
     std::array<FrameData, FRAMES_IN_FLIGHT> frames{};
@@ -420,13 +649,13 @@ int main()
 
         destroy_render_target(device, allocator, render_target);
         render_target = create_render_target(device, allocator, vkb_swapchain.extent);
-        update_descriptor_set(device, desc_set, render_target.view);
+        update_descriptor_set(device, desc_set, render_target.view, heightmap_gpu.view, sampler);
 
         g_framebuffer_resized = false;
     };
 
     // ---- Startup printout ---------------------------------------------------
-    std::printf("drift_engine v0.1.5 — Vulkan up.\n");
+    std::printf("drift_engine v0.1.6 — Vulkan up.\n");
     std::printf("Device:   %s\n", vkb_phys.name.c_str());
     std::printf("Queues:   graphics=%u  present=%u\n",
                 gfx_family,
@@ -438,10 +667,12 @@ int main()
                 vkb_swapchain.extent.width, vkb_swapchain.extent.height,
                 (vkb_swapchain.extent.width * vkb_swapchain.extent.height * 8)
                     / (1024.0 * 1024.0));
+    std::printf("Heightmap: %ux%u R16_UNORM, min=%u max=%u\n",
+                hm.width, hm.height, *hm_min, *hm_max);
     std::printf("Compute pipeline ready. Window open.\n");
     std::fflush(stdout);
 
-    // ---- Frame loop ---------------------------------------------------------
+    // ---- Frame loop (unchanged from v0.1.5) ---------------------------------
     uint32_t current_frame = 0;
     const VkImageSubresourceRange color_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
@@ -482,7 +713,6 @@ int main()
 
         VkExtent2D extent = vkb_swapchain.extent;
 
-        // -- (a) Storage image: UNDEFINED → GENERAL for compute write ---------
         VkImageMemoryBarrier2 barrier_to_general{};
         barrier_to_general.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         barrier_to_general.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
@@ -500,7 +730,6 @@ int main()
         dep_to_general.pImageMemoryBarriers = &barrier_to_general;
         vkCmdPipelineBarrier2(frame.cmd, &dep_to_general);
 
-        // -- (b-d) Bind compute pipeline, push constants, dispatch ------------
         vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compute_pipeline);
         vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 pipeline_layout, 0, 1, &desc_set, 0, nullptr);
@@ -517,7 +746,6 @@ int main()
                       (extent.height + 15) / 16,
                       1);
 
-        // -- (e) Storage image: GENERAL → TRANSFER_SRC ------------------------
         VkImageMemoryBarrier2 barrier_rt_to_src{};
         barrier_rt_to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         barrier_rt_to_src.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -529,7 +757,6 @@ int main()
         barrier_rt_to_src.image = render_target.image;
         barrier_rt_to_src.subresourceRange = color_range;
 
-        // -- (f) Swapchain image: UNDEFINED → TRANSFER_DST --------------------
         VkImageMemoryBarrier2 barrier_sc_to_dst{};
         barrier_sc_to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         barrier_sc_to_dst.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
@@ -548,7 +775,6 @@ int main()
         dep_blit.pImageMemoryBarriers = blit_barriers;
         vkCmdPipelineBarrier2(frame.cmd, &dep_blit);
 
-        // -- (g) Blit storage image → swapchain image -------------------------
         VkImageBlit2 region{};
         region.sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2;
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -572,7 +798,6 @@ int main()
 
         vkCmdBlitImage2(frame.cmd, &blit_info);
 
-        // -- (h) Swapchain image: TRANSFER_DST → PRESENT_SRC ------------------
         VkImageMemoryBarrier2 barrier_to_present{};
         barrier_to_present.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         barrier_to_present.srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
@@ -592,7 +817,6 @@ int main()
 
         VK_CHECK(vkEndCommandBuffer(frame.cmd));
 
-        // -- (i) Submit -------------------------------------------------------
         VkSemaphoreSubmitInfo wait_sem{};
         wait_sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
         wait_sem.semaphore = frame.image_available;
@@ -618,7 +842,6 @@ int main()
 
         VK_CHECK(vkQueueSubmit2(graphics_queue, 1, &submit, frame.in_flight));
 
-        // Present
         VkPresentInfoKHR present_info{};
         present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         present_info.waitSemaphoreCount = 1;
@@ -662,6 +885,11 @@ int main()
     vkDestroyShaderModule(device, shader_module, nullptr);
 
     destroy_render_target(device, allocator, render_target);
+
+    vkDestroySampler(device, sampler, nullptr);
+    vkDestroyImageView(device, heightmap_gpu.view, nullptr);
+    vmaDestroyImage(allocator, heightmap_gpu.image, heightmap_gpu.allocation);
+
     vmaDestroyAllocator(allocator);
 
     vkb::destroy_device(vkb_device);
