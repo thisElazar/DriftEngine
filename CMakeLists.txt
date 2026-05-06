@@ -17,6 +17,24 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # ---------------------------------------------------------------------------
+# Dependencies (FetchContent)
+# ---------------------------------------------------------------------------
+include(FetchContent)
+
+set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    glfw
+    GIT_REPOSITORY https://github.com/glfw/glfw.git
+    GIT_TAG        3.4
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(glfw)
+
+# ---------------------------------------------------------------------------
 # Vulkan
 # ---------------------------------------------------------------------------
 # Honors VULKAN_SDK env var. On macOS this resolves to MoltenVK under the hood.
@@ -32,7 +50,8 @@ add_executable(drift_engine
     src/main.cpp
 )
 
-target_link_libraries(drift_engine PRIVATE Vulkan::Vulkan)
+target_link_libraries(drift_engine PRIVATE Vulkan::Vulkan glfw)
+target_compile_definitions(drift_engine PRIVATE GLFW_INCLUDE_NONE)
 
 # Strict-ish warnings; expand later
 if(MSVC)

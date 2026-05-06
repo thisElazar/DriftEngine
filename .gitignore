@@ -3,9 +3,10 @@ build/
 out/
 cmake-build-*/
 
-# IDE
+# IDE / tooling caches
 .vscode/
 .idea/
+.cache/
 *.xcodeproj/
 *.xcworkspace/
 .DS_Store
