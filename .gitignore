@@ -1,0 +1,29 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# IDE
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+.DS_Store
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Compiled shaders
+*.spv
+
+# Test data (heightmaps may be large; track via LFS later if needed)
+data/heightmaps/*.r16
+data/heightmaps/*.tif
+!data/heightmaps/.gitkeep
+
+# OS
+Thumbs.db
