@@ -7,7 +7,7 @@ cbuffer PushConstants {
     float time;
     uint  width;
     uint  height;
-    uint  _pad;
+    float max_elevation;
 };
 
 float3 elevation_ramp(float h)
@@ -31,7 +31,8 @@ void main(uint3 dtid : SV_DispatchThreadID)
     float2 uv = (float2(dtid.xy) + 0.5) / float2(width, height);
 
     float h = heightmap.SampleLevel(heightmap_sampler, uv, 0).r;
+    float h_norm = saturate(h / max_elevation);
 
-    float3 color = elevation_ramp(h);
+    float3 color = elevation_ramp(h_norm);
     output[dtid.xy] = float4(color, 1.0);
 }

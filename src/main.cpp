@@ -1,8 +1,7 @@
-// Drift Engine — v0.1.6
+// Drift Engine — v0.2.1a
 //
-// Heightmap upload: loads a .r16 file via staging buffer into a R16_UNORM
-// sampled image on the GPU. Descriptor set carries it at binding 1.
-// Frame loop unchanged from v0.1.5 (procedural pattern, no heightmap viz yet).
+// Procedural Crater Lake basin (R32_SFLOAT). Compute shader visualizes
+// terrain with elevation color ramp.
 
 #include <vulkan/vulkan.h>
 #include <GLFW/glfw3.h>
@@ -11,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,11 +39,11 @@ struct PushConstants {
     float    time;
     uint32_t width;
     uint32_t height;
-    uint32_t _pad;
+    float    max_elevation;
 };
 
 struct HeightmapData {
-    std::vector<uint16_t> values;
+    std::vector<float> values;
     uint32_t width;
     uint32_t height;
 };
@@ -91,26 +91,47 @@ std::vector<uint32_t> load_spirv(const char* path)
     return buffer;
 }
 
-HeightmapData load_r16(const char* path, uint32_t w, uint32_t h)
+struct BasinParams {
+    uint32_t grid_w        = 1024;
+    uint32_t grid_h        = 1024;
+    float    cell_spacing  = 10.0f;
+    float    floor_height  = 100.0f;
+    float    rim_height    = 1500.0f;
+    float    base_height   = 800.0f;
+    float    inner_radius  = 2000.0f;
+    float    rim_radius    = 2800.0f;
+    float    initial_water = 700.0f;
+};
+
+float cpu_smoothstep(float edge0, float edge1, float x)
 {
-    std::ifstream file(path, std::ios::ate | std::ios::binary);
-    if (!file.is_open()) {
-        std::fprintf(stderr, "Failed to open heightmap: %s\n", path);
-        std::abort();
+    float t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+std::vector<float> generate_crater_basin(const BasinParams& p)
+{
+    std::vector<float> data(static_cast<size_t>(p.grid_w) * p.grid_h);
+    for (uint32_t y = 0; y < p.grid_h; ++y) {
+        for (uint32_t x = 0; x < p.grid_w; ++x) {
+            float cx = (static_cast<float>(x) - p.grid_w * 0.5f) * p.cell_spacing;
+            float cy = (static_cast<float>(y) - p.grid_h * 0.5f) * p.cell_spacing;
+            float r = std::sqrt(cx * cx + cy * cy);
+            float h;
+            if (r < p.inner_radius) {
+                h = p.floor_height;
+            } else if (r < p.rim_radius) {
+                float t = (r - p.inner_radius) / (p.rim_radius - p.inner_radius);
+                h = std::lerp(p.floor_height, p.rim_height, cpu_smoothstep(0.0f, 1.0f, t));
+            } else {
+                float t = std::clamp((r - p.rim_radius) / 1500.0f, 0.0f, 1.0f);
+                h = std::lerp(p.rim_height, p.base_height, cpu_smoothstep(0.0f, 1.0f, t));
+                h += 30.0f * std::sin(cx * 0.0003f) * std::cos(cy * 0.0004f);
+            }
+            data[static_cast<size_t>(y) * p.grid_w + x] = h;
+        }
     }
-    size_t expected = static_cast<size_t>(w) * h * sizeof(uint16_t);
-    size_t actual = static_cast<size_t>(file.tellg());
-    if (actual != expected) {
-        std::fprintf(stderr, "Heightmap size mismatch: expected %zu, got %zu\n", expected, actual);
-        std::abort();
-    }
-    HeightmapData hm{};
-    hm.width = w;
-    hm.height = h;
-    hm.values.resize(w * h);
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(hm.values.data()), static_cast<std::streamsize>(expected));
-    return hm;
+    return data;
 }
 
 RenderTarget create_render_target(VkDevice device, VmaAllocator allocator, VkExtent2D extent)
@@ -159,7 +180,7 @@ HeightmapGPU upload_heightmap(VkDevice device, VmaAllocator allocator,
                               VkQueue queue, uint32_t queue_family,
                               const HeightmapData& hm)
 {
-    VkDeviceSize buf_size = static_cast<VkDeviceSize>(hm.width) * hm.height * sizeof(uint16_t);
+    VkDeviceSize buf_size = static_cast<VkDeviceSize>(hm.width) * hm.height * sizeof(float);
 
     // Staging buffer
     VkBufferCreateInfo buf_ci{};
@@ -185,7 +206,7 @@ HeightmapGPU upload_heightmap(VkDevice device, VmaAllocator allocator,
     VkImageCreateInfo img_ci{};
     img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     img_ci.imageType = VK_IMAGE_TYPE_2D;
-    img_ci.format = VK_FORMAT_R16_UNORM;
+    img_ci.format = VK_FORMAT_R32_SFLOAT;
     img_ci.extent = {hm.width, hm.height, 1};
     img_ci.mipLevels = 1;
     img_ci.arrayLayers = 1;
@@ -300,7 +321,7 @@ HeightmapGPU upload_heightmap(VkDevice device, VmaAllocator allocator,
     view_ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     view_ci.image = gpu.image;
     view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view_ci.format = VK_FORMAT_R16_UNORM;
+    view_ci.format = VK_FORMAT_R32_SFLOAT;
     view_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VK_CHECK(vkCreateImageView(device, &view_ci, nullptr, &gpu.view));
 
@@ -465,8 +486,10 @@ int main()
     VmaAllocator allocator = VK_NULL_HANDLE;
     VK_CHECK(vmaCreateAllocator(&alloc_info, &allocator));
 
-    // ---- Heightmap load + upload --------------------------------------------
-    HeightmapData hm = load_r16("data/heightmaps/test.r16", 513, 513);
+    // ---- Procedural basin ---------------------------------------------------
+    BasinParams bp;
+    auto basin = generate_crater_basin(bp);
+    HeightmapData hm{std::move(basin), bp.grid_w, bp.grid_h};
 
     auto [hm_min, hm_max] = std::minmax_element(hm.values.begin(), hm.values.end());
 
@@ -655,7 +678,7 @@ int main()
     };
 
     // ---- Startup printout ---------------------------------------------------
-    std::printf("drift_engine v0.1.6 — Vulkan up.\n");
+    std::printf("drift_engine v0.2.1a — Vulkan up.\n");
     std::printf("Device:   %s\n", vkb_phys.name.c_str());
     std::printf("Queues:   graphics=%u  present=%u\n",
                 gfx_family,
@@ -667,8 +690,10 @@ int main()
                 vkb_swapchain.extent.width, vkb_swapchain.extent.height,
                 (vkb_swapchain.extent.width * vkb_swapchain.extent.height * 8)
                     / (1024.0 * 1024.0));
-    std::printf("Heightmap: %ux%u R16_UNORM, min=%u max=%u\n",
-                hm.width, hm.height, *hm_min, *hm_max);
+    std::printf("Terrain: %ux%u R32_SFLOAT, min=%.1f max=%.1f center=%.1f corner=%.1f m\n",
+                hm.width, hm.height, *hm_min, *hm_max,
+                hm.values[static_cast<size_t>(hm.height / 2) * hm.width + hm.width / 2],
+                hm.values[0]);
     std::printf("Compute pipeline ready. Window open.\n");
     std::fflush(stdout);
 
@@ -738,6 +763,7 @@ int main()
         pc.time = static_cast<float>(glfwGetTime());
         pc.width = extent.width;
         pc.height = extent.height;
+        pc.max_elevation = 2000.0f;
         vkCmdPushConstants(frame.cmd, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
 
