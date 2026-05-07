@@ -1,7 +1,7 @@
-// Drift Engine — v0.2.1a
+// Drift Engine — v0.2.1b
 //
-// Procedural Crater Lake basin (R32_SFLOAT). Compute shader visualizes
-// terrain with elevation color ramp.
+// Procedural Crater Lake basin (R32_SFLOAT) + SWE solver running every frame.
+// Visualization: elevation color ramp with "is wet" debug overlay.
 
 #include <vulkan/vulkan.h>
 #include <GLFW/glfw3.h>
@@ -20,6 +20,8 @@
 namespace {
 
 constexpr uint32_t FRAMES_IN_FLIGHT = 2;
+constexpr uint32_t SWE_GRID_W = 1024;
+constexpr uint32_t SWE_GRID_H = 1024;
 
 struct FrameData {
     VkCommandPool   pool;
@@ -42,6 +44,28 @@ struct PushConstants {
     float    max_elevation;
 };
 
+struct SweInitPC {
+    uint32_t grid_w;
+    uint32_t grid_h;
+    float    initial_water_level;
+    float    _pad;
+};
+
+struct SweStepPC {
+    float    time;
+    float    dt;
+    float    gravity;
+    float    friction;
+    float    dx;
+    float    sea_level;
+    float    damping;
+    float    _pad0;
+    uint32_t grid_w;
+    uint32_t grid_h;
+    uint32_t _pad1;
+    uint32_t _pad2;
+};
+
 struct HeightmapData {
     std::vector<float> values;
     uint32_t width;
@@ -49,6 +73,12 @@ struct HeightmapData {
 };
 
 struct HeightmapGPU {
+    VkImage       image;
+    VmaAllocation allocation;
+    VkImageView   view;
+};
+
+struct SweImage {
     VkImage       image;
     VmaAllocation allocation;
     VkImageView   view;
@@ -174,6 +204,45 @@ void destroy_render_target(VkDevice device, VmaAllocator allocator, RenderTarget
     vkDestroyImageView(device, rt.view, nullptr);
     vmaDestroyImage(allocator, rt.image, rt.allocation);
     rt = {};
+}
+
+SweImage create_swe_image(VkDevice device, VmaAllocator allocator, uint32_t w, uint32_t h)
+{
+    VkImageCreateInfo img_ci{};
+    img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_ci.imageType = VK_IMAGE_TYPE_2D;
+    img_ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    img_ci.extent = {w, h, 1};
+    img_ci.mipLevels = 1;
+    img_ci.arrayLayers = 1;
+    img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    img_ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VmaAllocationCreateInfo alloc_ci{};
+    alloc_ci.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_ci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+    SweImage img{};
+    VK_CHECK(vmaCreateImage(allocator, &img_ci, &alloc_ci, &img.image, &img.allocation, nullptr));
+
+    VkImageViewCreateInfo view_ci{};
+    view_ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_ci.image = img.image;
+    view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    view_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(device, &view_ci, nullptr, &img.view));
+
+    return img;
+}
+
+void destroy_swe_image(VkDevice device, VmaAllocator allocator, SweImage& img)
+{
+    vkDestroyImageView(device, img.view, nullptr);
+    vmaDestroyImage(allocator, img.image, img.allocation);
+    img = {};
 }
 
 HeightmapGPU upload_heightmap(VkDevice device, VmaAllocator allocator,
@@ -328,38 +397,6 @@ HeightmapGPU upload_heightmap(VkDevice device, VmaAllocator allocator,
     return gpu;
 }
 
-void update_descriptor_set(VkDevice device, VkDescriptorSet set,
-                           VkImageView storage_view,
-                           VkImageView heightmap_view, VkSampler sampler)
-{
-    VkDescriptorImageInfo storage_info{};
-    storage_info.imageView = storage_view;
-    storage_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-    VkDescriptorImageInfo heightmap_info{};
-    heightmap_info.imageView = heightmap_view;
-    heightmap_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    heightmap_info.sampler = sampler;
-
-    VkWriteDescriptorSet writes[2]{};
-
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = set;
-    writes[0].dstBinding = 0;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    writes[0].pImageInfo = &storage_info;
-
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = set;
-    writes[1].dstBinding = 1;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    writes[1].pImageInfo = &heightmap_info;
-
-    vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
-}
-
 } // namespace
 
 int main()
@@ -495,6 +532,11 @@ int main()
 
     HeightmapGPU heightmap_gpu = upload_heightmap(device, allocator, graphics_queue, gfx_family, hm);
 
+    // ---- SWE images (ping-pong state + output) ------------------------------
+    SweImage swe_state_a = create_swe_image(device, allocator, SWE_GRID_W, SWE_GRID_H);
+    SweImage swe_state_b = create_swe_image(device, allocator, SWE_GRID_W, SWE_GRID_H);
+    SweImage swe_output  = create_swe_image(device, allocator, SWE_GRID_W, SWE_GRID_H);
+
     // ---- Sampler ------------------------------------------------------------
     VkSamplerCreateInfo sampler_ci{};
     sampler_ci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -537,91 +579,503 @@ int main()
     // ---- Storage image (render target) --------------------------------------
     RenderTarget render_target = create_render_target(device, allocator, vkb_swapchain.extent);
 
-    // ---- Compute pipeline ---------------------------------------------------
-    auto spirv = load_spirv("shaders/visualize.spv");
+    // ---- Visualize pipeline -------------------------------------------------
+    auto viz_spirv = load_spirv("shaders/visualize.spv");
 
-    VkShaderModuleCreateInfo sm_ci{};
-    sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    sm_ci.codeSize = spirv.size() * sizeof(uint32_t);
-    sm_ci.pCode = spirv.data();
+    VkShaderModuleCreateInfo viz_sm_ci{};
+    viz_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    viz_sm_ci.codeSize = viz_spirv.size() * sizeof(uint32_t);
+    viz_sm_ci.pCode = viz_spirv.data();
 
-    VkShaderModule shader_module = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &shader_module));
+    VkShaderModule viz_shader = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateShaderModule(device, &viz_sm_ci, nullptr, &viz_shader));
 
-    VkDescriptorSetLayoutBinding bindings[2]{};
-    bindings[0].binding = 0;
-    bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding viz_bindings[3]{};
+    viz_bindings[0].binding = 0;
+    viz_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    viz_bindings[0].descriptorCount = 1;
+    viz_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-    bindings[1].binding = 1;
-    bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    viz_bindings[1].binding = 1;
+    viz_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    viz_bindings[1].descriptorCount = 1;
+    viz_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-    VkDescriptorSetLayoutCreateInfo dsl_ci{};
-    dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dsl_ci.bindingCount = 2;
-    dsl_ci.pBindings = bindings;
+    viz_bindings[2].binding = 2;
+    viz_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    viz_bindings[2].descriptorCount = 1;
+    viz_bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-    VkDescriptorSetLayout desc_set_layout = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateDescriptorSetLayout(device, &dsl_ci, nullptr, &desc_set_layout));
+    VkDescriptorSetLayoutCreateInfo viz_dsl_ci{};
+    viz_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    viz_dsl_ci.bindingCount = 3;
+    viz_dsl_ci.pBindings = viz_bindings;
 
-    VkPushConstantRange push_range{};
-    push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    push_range.offset = 0;
-    push_range.size = sizeof(PushConstants);
+    VkDescriptorSetLayout viz_desc_layout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &viz_dsl_ci, nullptr, &viz_desc_layout));
 
-    VkPipelineLayoutCreateInfo pl_ci{};
-    pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pl_ci.setLayoutCount = 1;
-    pl_ci.pSetLayouts = &desc_set_layout;
-    pl_ci.pushConstantRangeCount = 1;
-    pl_ci.pPushConstantRanges = &push_range;
+    VkPushConstantRange viz_push_range{};
+    viz_push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    viz_push_range.offset = 0;
+    viz_push_range.size = sizeof(PushConstants);
 
-    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
-    VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &pipeline_layout));
+    VkPipelineLayoutCreateInfo viz_pl_ci{};
+    viz_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    viz_pl_ci.setLayoutCount = 1;
+    viz_pl_ci.pSetLayouts = &viz_desc_layout;
+    viz_pl_ci.pushConstantRangeCount = 1;
+    viz_pl_ci.pPushConstantRanges = &viz_push_range;
 
-    VkPipelineShaderStageCreateInfo stage{};
-    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    stage.module = shader_module;
-    stage.pName = "main";
+    VkPipelineLayout viz_pipeline_layout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreatePipelineLayout(device, &viz_pl_ci, nullptr, &viz_pipeline_layout));
 
-    VkComputePipelineCreateInfo cp_ci{};
-    cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cp_ci.stage = stage;
-    cp_ci.layout = pipeline_layout;
+    VkPipelineShaderStageCreateInfo viz_stage{};
+    viz_stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    viz_stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    viz_stage.module = viz_shader;
+    viz_stage.pName = "main";
 
-    VkPipeline compute_pipeline = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &compute_pipeline));
+    VkComputePipelineCreateInfo viz_cp_ci{};
+    viz_cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    viz_cp_ci.stage = viz_stage;
+    viz_cp_ci.layout = viz_pipeline_layout;
 
-    // ---- Descriptor pool + set ----------------------------------------------
-    VkDescriptorPoolSize pool_sizes[2]{};
+    VkPipeline viz_pipeline = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &viz_cp_ci, nullptr, &viz_pipeline));
+
+    // ---- SWE init pipeline --------------------------------------------------
+    auto swe_init_spirv = load_spirv("shaders/swe_init.spv");
+
+    VkShaderModuleCreateInfo swe_init_sm_ci{};
+    swe_init_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    swe_init_sm_ci.codeSize = swe_init_spirv.size() * sizeof(uint32_t);
+    swe_init_sm_ci.pCode = swe_init_spirv.data();
+
+    VkShaderModule swe_init_shader = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateShaderModule(device, &swe_init_sm_ci, nullptr, &swe_init_shader));
+
+    VkDescriptorSetLayoutBinding swe_init_bindings[2]{};
+    swe_init_bindings[0].binding = 0;
+    swe_init_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    swe_init_bindings[0].descriptorCount = 1;
+    swe_init_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    swe_init_bindings[1].binding = 1;
+    swe_init_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    swe_init_bindings[1].descriptorCount = 1;
+    swe_init_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo swe_init_dsl_ci{};
+    swe_init_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    swe_init_dsl_ci.bindingCount = 2;
+    swe_init_dsl_ci.pBindings = swe_init_bindings;
+
+    VkDescriptorSetLayout swe_init_desc_layout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &swe_init_dsl_ci, nullptr, &swe_init_desc_layout));
+
+    VkPushConstantRange swe_init_push{};
+    swe_init_push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    swe_init_push.offset = 0;
+    swe_init_push.size = sizeof(SweInitPC);
+
+    VkPipelineLayoutCreateInfo swe_init_pl_ci{};
+    swe_init_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    swe_init_pl_ci.setLayoutCount = 1;
+    swe_init_pl_ci.pSetLayouts = &swe_init_desc_layout;
+    swe_init_pl_ci.pushConstantRangeCount = 1;
+    swe_init_pl_ci.pPushConstantRanges = &swe_init_push;
+
+    VkPipelineLayout swe_init_pipeline_layout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreatePipelineLayout(device, &swe_init_pl_ci, nullptr, &swe_init_pipeline_layout));
+
+    VkPipelineShaderStageCreateInfo swe_init_stage{};
+    swe_init_stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    swe_init_stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    swe_init_stage.module = swe_init_shader;
+    swe_init_stage.pName = "main";
+
+    VkComputePipelineCreateInfo swe_init_cp_ci{};
+    swe_init_cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    swe_init_cp_ci.stage = swe_init_stage;
+    swe_init_cp_ci.layout = swe_init_pipeline_layout;
+
+    VkPipeline swe_init_pipeline = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &swe_init_cp_ci, nullptr, &swe_init_pipeline));
+
+    // ---- SWE step pipeline --------------------------------------------------
+    auto swe_step_spirv = load_spirv("shaders/swe_step.spv");
+
+    VkShaderModuleCreateInfo swe_step_sm_ci{};
+    swe_step_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    swe_step_sm_ci.codeSize = swe_step_spirv.size() * sizeof(uint32_t);
+    swe_step_sm_ci.pCode = swe_step_spirv.data();
+
+    VkShaderModule swe_step_shader = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateShaderModule(device, &swe_step_sm_ci, nullptr, &swe_step_shader));
+
+    VkDescriptorSetLayoutBinding swe_step_bindings[4]{};
+    swe_step_bindings[0].binding = 0;
+    swe_step_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    swe_step_bindings[0].descriptorCount = 1;
+    swe_step_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    swe_step_bindings[1].binding = 1;
+    swe_step_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    swe_step_bindings[1].descriptorCount = 1;
+    swe_step_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    swe_step_bindings[2].binding = 2;
+    swe_step_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    swe_step_bindings[2].descriptorCount = 1;
+    swe_step_bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    swe_step_bindings[3].binding = 3;
+    swe_step_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    swe_step_bindings[3].descriptorCount = 1;
+    swe_step_bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo swe_step_dsl_ci{};
+    swe_step_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    swe_step_dsl_ci.bindingCount = 4;
+    swe_step_dsl_ci.pBindings = swe_step_bindings;
+
+    VkDescriptorSetLayout swe_step_desc_layout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &swe_step_dsl_ci, nullptr, &swe_step_desc_layout));
+
+    VkPushConstantRange swe_step_push{};
+    swe_step_push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    swe_step_push.offset = 0;
+    swe_step_push.size = sizeof(SweStepPC);
+
+    VkPipelineLayoutCreateInfo swe_step_pl_ci{};
+    swe_step_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    swe_step_pl_ci.setLayoutCount = 1;
+    swe_step_pl_ci.pSetLayouts = &swe_step_desc_layout;
+    swe_step_pl_ci.pushConstantRangeCount = 1;
+    swe_step_pl_ci.pPushConstantRanges = &swe_step_push;
+
+    VkPipelineLayout swe_step_pipeline_layout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreatePipelineLayout(device, &swe_step_pl_ci, nullptr, &swe_step_pipeline_layout));
+
+    VkPipelineShaderStageCreateInfo swe_step_stage{};
+    swe_step_stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    swe_step_stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    swe_step_stage.module = swe_step_shader;
+    swe_step_stage.pName = "main";
+
+    VkComputePipelineCreateInfo swe_step_cp_ci{};
+    swe_step_cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    swe_step_cp_ci.stage = swe_step_stage;
+    swe_step_cp_ci.layout = swe_step_pipeline_layout;
+
+    VkPipeline swe_step_pipeline = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &swe_step_cp_ci, nullptr, &swe_step_pipeline));
+
+    // ---- Descriptor pool + sets ---------------------------------------------
+    VkDescriptorPoolSize pool_sizes[3]{};
     pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    pool_sizes[0].descriptorCount = 1;
+    pool_sizes[0].descriptorCount = 10;
     pool_sizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    pool_sizes[1].descriptorCount = 1;
+    pool_sizes[1].descriptorCount = 4;
+    pool_sizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    pool_sizes[2].descriptorCount = 6;
 
     VkDescriptorPoolCreateInfo dp_ci{};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dp_ci.maxSets = 1;
-    dp_ci.poolSizeCount = 2;
+    dp_ci.maxSets = 4;
+    dp_ci.poolSizeCount = 3;
     dp_ci.pPoolSizes = pool_sizes;
 
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     VK_CHECK(vkCreateDescriptorPool(device, &dp_ci, nullptr, &desc_pool));
 
-    VkDescriptorSetAllocateInfo ds_ai{};
-    ds_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    ds_ai.descriptorPool = desc_pool;
-    ds_ai.descriptorSetCount = 1;
-    ds_ai.pSetLayouts = &desc_set_layout;
+    // Visualize descriptor set
+    VkDescriptorSetAllocateInfo viz_ds_ai{};
+    viz_ds_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    viz_ds_ai.descriptorPool = desc_pool;
+    viz_ds_ai.descriptorSetCount = 1;
+    viz_ds_ai.pSetLayouts = &viz_desc_layout;
 
-    VkDescriptorSet desc_set = VK_NULL_HANDLE;
-    VK_CHECK(vkAllocateDescriptorSets(device, &ds_ai, &desc_set));
+    VkDescriptorSet viz_desc_set = VK_NULL_HANDLE;
+    VK_CHECK(vkAllocateDescriptorSets(device, &viz_ds_ai, &viz_desc_set));
 
-    update_descriptor_set(device, desc_set, render_target.view, heightmap_gpu.view, sampler);
+    // SWE init descriptor set
+    VkDescriptorSetAllocateInfo swe_init_ds_ai{};
+    swe_init_ds_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    swe_init_ds_ai.descriptorPool = desc_pool;
+    swe_init_ds_ai.descriptorSetCount = 1;
+    swe_init_ds_ai.pSetLayouts = &swe_init_desc_layout;
+
+    VkDescriptorSet swe_init_desc_set = VK_NULL_HANDLE;
+    VK_CHECK(vkAllocateDescriptorSets(device, &swe_init_ds_ai, &swe_init_desc_set));
+
+    // SWE step descriptor sets (2 for ping-pong)
+    VkDescriptorSetLayout swe_step_layouts[2] = {swe_step_desc_layout, swe_step_desc_layout};
+    VkDescriptorSetAllocateInfo swe_step_ds_ai{};
+    swe_step_ds_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    swe_step_ds_ai.descriptorPool = desc_pool;
+    swe_step_ds_ai.descriptorSetCount = 2;
+    swe_step_ds_ai.pSetLayouts = swe_step_layouts;
+
+    VkDescriptorSet swe_step_desc_sets[2] = {};
+    VK_CHECK(vkAllocateDescriptorSets(device, &swe_step_ds_ai, swe_step_desc_sets));
+
+    // ---- Write descriptor sets ----------------------------------------------
+    auto write_viz_descriptors = [&](VkImageView storage_view) {
+        VkDescriptorImageInfo storage_info{};
+        storage_info.imageView = storage_view;
+        storage_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo heightmap_info{};
+        heightmap_info.imageView = heightmap_gpu.view;
+        heightmap_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        heightmap_info.sampler = sampler;
+
+        VkDescriptorImageInfo water_info{};
+        water_info.imageView = swe_state_a.view;
+        water_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        water_info.sampler = sampler;
+
+        VkWriteDescriptorSet writes[3]{};
+
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = viz_desc_set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[0].pImageInfo = &storage_info;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = viz_desc_set;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[1].pImageInfo = &heightmap_info;
+
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = viz_desc_set;
+        writes[2].dstBinding = 2;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[2].pImageInfo = &water_info;
+
+        vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+    };
+
+    write_viz_descriptors(render_target.view);
+
+    // SWE init descriptors: terrain(sampled) + state_a(storage)
+    {
+        VkDescriptorImageInfo terrain_info{};
+        terrain_info.imageView = heightmap_gpu.view;
+        terrain_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkDescriptorImageInfo state_info{};
+        state_info.imageView = swe_state_a.view;
+        state_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[2]{};
+
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = swe_init_desc_set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[0].pImageInfo = &terrain_info;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = swe_init_desc_set;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[1].pImageInfo = &state_info;
+
+        vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+    }
+
+    // SWE step descriptors: set[0] reads A writes B, set[1] reads B writes A
+    {
+        VkDescriptorImageInfo terrain_info{};
+        terrain_info.imageView = heightmap_gpu.view;
+        terrain_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkDescriptorImageInfo state_a_read{};
+        state_a_read.imageView = swe_state_a.view;
+        state_a_read.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo state_b_read{};
+        state_b_read.imageView = swe_state_b.view;
+        state_b_read.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo state_a_write{};
+        state_a_write.imageView = swe_state_a.view;
+        state_a_write.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo state_b_write{};
+        state_b_write.imageView = swe_state_b.view;
+        state_b_write.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo output_info{};
+        output_info.imageView = swe_output.view;
+        output_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        // Set 0: read A → write B
+        VkWriteDescriptorSet writes_0[4]{};
+        writes_0[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes_0[0].dstSet = swe_step_desc_sets[0];
+        writes_0[0].dstBinding = 0;
+        writes_0[0].descriptorCount = 1;
+        writes_0[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes_0[0].pImageInfo = &terrain_info;
+
+        writes_0[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes_0[1].dstSet = swe_step_desc_sets[0];
+        writes_0[1].dstBinding = 1;
+        writes_0[1].descriptorCount = 1;
+        writes_0[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes_0[1].pImageInfo = &state_a_read;
+
+        writes_0[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes_0[2].dstSet = swe_step_desc_sets[0];
+        writes_0[2].dstBinding = 2;
+        writes_0[2].descriptorCount = 1;
+        writes_0[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes_0[2].pImageInfo = &state_b_write;
+
+        writes_0[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes_0[3].dstSet = swe_step_desc_sets[0];
+        writes_0[3].dstBinding = 3;
+        writes_0[3].descriptorCount = 1;
+        writes_0[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes_0[3].pImageInfo = &output_info;
+
+        vkUpdateDescriptorSets(device, 4, writes_0, 0, nullptr);
+
+        // Set 1: read B → write A
+        VkWriteDescriptorSet writes_1[4]{};
+        writes_1[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes_1[0].dstSet = swe_step_desc_sets[1];
+        writes_1[0].dstBinding = 0;
+        writes_1[0].descriptorCount = 1;
+        writes_1[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes_1[0].pImageInfo = &terrain_info;
+
+        writes_1[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes_1[1].dstSet = swe_step_desc_sets[1];
+        writes_1[1].dstBinding = 1;
+        writes_1[1].descriptorCount = 1;
+        writes_1[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes_1[1].pImageInfo = &state_b_read;
+
+        writes_1[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes_1[2].dstSet = swe_step_desc_sets[1];
+        writes_1[2].dstBinding = 2;
+        writes_1[2].descriptorCount = 1;
+        writes_1[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes_1[2].pImageInfo = &state_a_write;
+
+        writes_1[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes_1[3].dstSet = swe_step_desc_sets[1];
+        writes_1[3].dstBinding = 3;
+        writes_1[3].descriptorCount = 1;
+        writes_1[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes_1[3].pImageInfo = &output_info;
+
+        vkUpdateDescriptorSets(device, 4, writes_1, 0, nullptr);
+    }
+
+    // ---- SWE init dispatch (one-shot) ---------------------------------------
+    {
+        VkCommandPoolCreateInfo pool_ci{};
+        pool_ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_ci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        pool_ci.queueFamilyIndex = gfx_family;
+
+        VkCommandPool tmp_pool = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateCommandPool(device, &pool_ci, nullptr, &tmp_pool));
+
+        VkCommandBufferAllocateInfo cmd_ai{};
+        cmd_ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cmd_ai.commandPool = tmp_pool;
+        cmd_ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cmd_ai.commandBufferCount = 1;
+
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateCommandBuffers(device, &cmd_ai, &cmd));
+
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
+
+        // Transition SWE images: UNDEFINED → GENERAL
+        VkImageMemoryBarrier2 init_barriers[3]{};
+        for (int i = 0; i < 3; ++i) {
+            init_barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            init_barriers[i].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+            init_barriers[i].srcAccessMask = VK_ACCESS_2_NONE;
+            init_barriers[i].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            init_barriers[i].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            init_barriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            init_barriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            init_barriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        }
+        init_barriers[0].image = swe_state_a.image;
+        init_barriers[1].image = swe_state_b.image;
+        init_barriers[2].image = swe_output.image;
+
+        VkDependencyInfo dep_init{};
+        dep_init.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep_init.imageMemoryBarrierCount = 3;
+        dep_init.pImageMemoryBarriers = init_barriers;
+        vkCmdPipelineBarrier2(cmd, &dep_init);
+
+        // Dispatch swe_init
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, swe_init_pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                swe_init_pipeline_layout, 0, 1, &swe_init_desc_set, 0, nullptr);
+
+        SweInitPC init_pc{};
+        init_pc.grid_w = SWE_GRID_W;
+        init_pc.grid_h = SWE_GRID_H;
+        init_pc.initial_water_level = bp.floor_height + bp.initial_water;
+        init_pc._pad = 0.0f;
+        vkCmdPushConstants(cmd, swe_init_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(init_pc), &init_pc);
+
+        vkCmdDispatch(cmd, (SWE_GRID_W + 7) / 8, (SWE_GRID_H + 7) / 8, 1);
+
+        // Barrier: swe_init write → swe_step read
+        VkMemoryBarrier2 mem_barrier{};
+        mem_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        mem_barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mem_barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        mem_barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mem_barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+
+        VkDependencyInfo dep_after_init{};
+        dep_after_init.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep_after_init.memoryBarrierCount = 1;
+        dep_after_init.pMemoryBarriers = &mem_barrier;
+        vkCmdPipelineBarrier2(cmd, &dep_after_init);
+
+        VK_CHECK(vkEndCommandBuffer(cmd));
+
+        VkFenceCreateInfo fence_ci{};
+        fence_ci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        VkFence fence = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateFence(device, &fence_ci, nullptr, &fence));
+
+        VkSubmitInfo submit{};
+        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &cmd;
+        VK_CHECK(vkQueueSubmit(graphics_queue, 1, &submit, fence));
+        VK_CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
+
+        vkDestroyFence(device, fence, nullptr);
+        vkDestroyCommandPool(device, tmp_pool, nullptr);
+    }
 
     // ---- Per-frame resources ------------------------------------------------
     std::array<FrameData, FRAMES_IN_FLIGHT> frames{};
@@ -672,13 +1126,13 @@ int main()
 
         destroy_render_target(device, allocator, render_target);
         render_target = create_render_target(device, allocator, vkb_swapchain.extent);
-        update_descriptor_set(device, desc_set, render_target.view, heightmap_gpu.view, sampler);
+        write_viz_descriptors(render_target.view);
 
         g_framebuffer_resized = false;
     };
 
     // ---- Startup printout ---------------------------------------------------
-    std::printf("drift_engine v0.2.1a — Vulkan up.\n");
+    std::printf("drift_engine v0.2.1b — Vulkan up.\n");
     std::printf("Device:   %s\n", vkb_phys.name.c_str());
     std::printf("Queues:   graphics=%u  present=%u\n",
                 gfx_family,
@@ -694,11 +1148,15 @@ int main()
                 hm.width, hm.height, *hm_min, *hm_max,
                 hm.values[static_cast<size_t>(hm.height / 2) * hm.width + hm.width / 2],
                 hm.values[0]);
-    std::printf("Compute pipeline ready. Window open.\n");
+    std::printf("SWE: %ux%u RGBA16F, dx=%.1f m, init water=%.0f m\n",
+                SWE_GRID_W, SWE_GRID_H, bp.cell_spacing, bp.initial_water);
+    std::printf("Compute pipelines ready. Window open.\n");
     std::fflush(stdout);
 
-    // ---- Frame loop (unchanged from v0.1.5) ---------------------------------
+    // ---- Frame loop ---------------------------------------------------------
     uint32_t current_frame = 0;
+    uint32_t swe_ping_pong = 0;
+    double last_time = glfwGetTime();
     const VkImageSubresourceRange color_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
     while (!glfwWindowShouldClose(window)) {
@@ -736,8 +1194,59 @@ int main()
         begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(frame.cmd, &begin_info));
 
+        double now = glfwGetTime();
+        float dt = static_cast<float>(now - last_time);
+        last_time = now;
+
         VkExtent2D extent = vkb_swapchain.extent;
 
+        // ---- SWE step dispatch ----
+        {
+            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, swe_step_pipeline);
+            vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    swe_step_pipeline_layout, 0, 1,
+                                    &swe_step_desc_sets[swe_ping_pong], 0, nullptr);
+
+            SweStepPC swe_pc{};
+            swe_pc.time = static_cast<float>(now);
+            swe_pc.dt = std::min(dt, 0.033f);
+            swe_pc.gravity = 9.81f;
+            swe_pc.friction = 0.01f;
+            swe_pc.dx = bp.cell_spacing;
+            swe_pc.sea_level = bp.floor_height + bp.initial_water;
+            swe_pc.damping = 0.001f;
+            swe_pc._pad0 = 0.0f;
+            swe_pc.grid_w = SWE_GRID_W;
+            swe_pc.grid_h = SWE_GRID_H;
+            swe_pc._pad1 = 0;
+            swe_pc._pad2 = 0;
+            vkCmdPushConstants(frame.cmd, swe_step_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(swe_pc), &swe_pc);
+
+            vkCmdDispatch(frame.cmd, (SWE_GRID_W + 7) / 8, (SWE_GRID_H + 7) / 8, 1);
+
+            swe_ping_pong ^= 1;
+        }
+
+        // Barrier: SWE write → visualize read
+        {
+            VkMemoryBarrier2 mem_bar{};
+            mem_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            mem_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mem_bar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            mem_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mem_bar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                                  | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                                  | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+            VkDependencyInfo dep{};
+            dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            dep.memoryBarrierCount = 1;
+            dep.pMemoryBarriers = &mem_bar;
+            vkCmdPipelineBarrier2(frame.cmd, &dep);
+        }
+
+        // ---- Visualize dispatch ----
         VkImageMemoryBarrier2 barrier_to_general{};
         barrier_to_general.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         barrier_to_general.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
@@ -755,16 +1264,16 @@ int main()
         dep_to_general.pImageMemoryBarriers = &barrier_to_general;
         vkCmdPipelineBarrier2(frame.cmd, &dep_to_general);
 
-        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compute_pipeline);
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, viz_pipeline);
         vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                pipeline_layout, 0, 1, &desc_set, 0, nullptr);
+                                viz_pipeline_layout, 0, 1, &viz_desc_set, 0, nullptr);
 
         PushConstants pc{};
-        pc.time = static_cast<float>(glfwGetTime());
+        pc.time = static_cast<float>(now);
         pc.width = extent.width;
         pc.height = extent.height;
         pc.max_elevation = 2000.0f;
-        vkCmdPushConstants(frame.cmd, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+        vkCmdPushConstants(frame.cmd, viz_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
 
         vkCmdDispatch(frame.cmd,
@@ -772,6 +1281,7 @@ int main()
                       (extent.height + 15) / 16,
                       1);
 
+        // ---- Blit to swapchain ----
         VkImageMemoryBarrier2 barrier_rt_to_src{};
         barrier_rt_to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         barrier_rt_to_src.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
@@ -904,13 +1414,27 @@ int main()
         vkDestroyImageView(device, view, nullptr);
     vkb::destroy_swapchain(vkb_swapchain);
 
-    vkDestroyPipeline(device, compute_pipeline, nullptr);
-    vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+    vkDestroyPipeline(device, swe_step_pipeline, nullptr);
+    vkDestroyPipelineLayout(device, swe_step_pipeline_layout, nullptr);
+    vkDestroyDescriptorSetLayout(device, swe_step_desc_layout, nullptr);
+    vkDestroyShaderModule(device, swe_step_shader, nullptr);
+
+    vkDestroyPipeline(device, swe_init_pipeline, nullptr);
+    vkDestroyPipelineLayout(device, swe_init_pipeline_layout, nullptr);
+    vkDestroyDescriptorSetLayout(device, swe_init_desc_layout, nullptr);
+    vkDestroyShaderModule(device, swe_init_shader, nullptr);
+
+    vkDestroyPipeline(device, viz_pipeline, nullptr);
+    vkDestroyPipelineLayout(device, viz_pipeline_layout, nullptr);
     vkDestroyDescriptorPool(device, desc_pool, nullptr);
-    vkDestroyDescriptorSetLayout(device, desc_set_layout, nullptr);
-    vkDestroyShaderModule(device, shader_module, nullptr);
+    vkDestroyDescriptorSetLayout(device, viz_desc_layout, nullptr);
+    vkDestroyShaderModule(device, viz_shader, nullptr);
 
     destroy_render_target(device, allocator, render_target);
+
+    destroy_swe_image(device, allocator, swe_output);
+    destroy_swe_image(device, allocator, swe_state_b);
+    destroy_swe_image(device, allocator, swe_state_a);
 
     vkDestroySampler(device, sampler, nullptr);
     vkDestroyImageView(device, heightmap_gpu.view, nullptr);

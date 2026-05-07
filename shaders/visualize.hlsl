@@ -1,6 +1,8 @@
 [[vk::binding(0, 0)]] RWTexture2D<float4> output;
 [[vk::combinedImageSampler]][[vk::binding(1, 0)]] Texture2D<float> heightmap;
 [[vk::combinedImageSampler]][[vk::binding(1, 0)]] SamplerState heightmap_sampler;
+[[vk::combinedImageSampler]][[vk::binding(2, 0)]] Texture2D<float4> water_state;
+[[vk::combinedImageSampler]][[vk::binding(2, 0)]] SamplerState state_sampler;
 
 [[vk::push_constant]]
 cbuffer PushConstants {
@@ -34,5 +36,12 @@ void main(uint3 dtid : SV_DispatchThreadID)
     float h_norm = saturate(h / max_elevation);
 
     float3 color = elevation_ramp(h_norm);
+
+    float depth = water_state.SampleLevel(state_sampler, uv, 0).r;
+    if (depth > 0.1)
+    {
+        color = lerp(color, float3(0.1, 0.3, 0.7), 0.85);
+    }
+
     output[dtid.xy] = float4(color, 1.0);
 }
