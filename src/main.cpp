@@ -62,8 +62,10 @@ struct SweStepPC {
     float    _pad0;
     uint32_t grid_w;
     uint32_t grid_h;
-    uint32_t _pad1;
-    uint32_t _pad2;
+    float    pulse_x;
+    float    pulse_y;
+    float    pulse_radius;
+    float    pulse_amount;
 };
 
 struct HeightmapData {
@@ -85,11 +87,14 @@ struct SweImage {
 };
 
 bool g_framebuffer_resized = false;
+bool g_pulse_pending = false;
 
 void key_callback(GLFWwindow* window, int key, int /*scancode*/, int action, int /*mods*/)
 {
     if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
         glfwSetWindowShouldClose(window, GLFW_TRUE);
+    if (key == GLFW_KEY_SPACE && action == GLFW_PRESS)
+        g_pulse_pending = true;
 }
 
 void framebuffer_resize_callback(GLFWwindow* /*window*/, int /*width*/, int /*height*/)
@@ -1218,8 +1223,11 @@ int main()
             swe_pc._pad0 = 0.0f;
             swe_pc.grid_w = SWE_GRID_W;
             swe_pc.grid_h = SWE_GRID_H;
-            swe_pc._pad1 = 0;
-            swe_pc._pad2 = 0;
+            swe_pc.pulse_x = SWE_GRID_W * 0.5f;
+            swe_pc.pulse_y = SWE_GRID_H * 0.5f;
+            swe_pc.pulse_radius = 30.0f;
+            swe_pc.pulse_amount = g_pulse_pending ? 50.0f : 0.0f;
+            g_pulse_pending = false;
             vkCmdPushConstants(frame.cmd, swe_step_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(swe_pc), &swe_pc);
 

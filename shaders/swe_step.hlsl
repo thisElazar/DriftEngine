@@ -19,8 +19,10 @@ cbuffer PushConstants {
     float _pad0;
     uint  grid_w;
     uint  grid_h;
-    uint  _pad1;
-    uint  _pad2;
+    float pulse_x;
+    float pulse_y;
+    float pulse_radius;
+    float pulse_amount;
 };
 
 #define GRAVITY   gravity
@@ -118,6 +120,15 @@ void main(uint3 ThreadId : SV_DispatchThreadID)
 
     // === Read current state ===
     float4 state = ReadState(coord);
+
+    if (pulse_amount > 0.0f)
+    {
+        float2 d = float2(coord) - float2(pulse_x, pulse_y);
+        float r2 = dot(d, d);
+        float falloff = exp(-r2 / (pulse_radius * pulse_radius));
+        state.r += pulse_amount * falloff;
+    }
+
     float h  = max(state.r, 0.0f);
     float hu = state.g;
     float hv = state.b;
