@@ -88,6 +88,10 @@ struct SweImage {
 
 bool g_framebuffer_resized = false;
 bool g_pulse_pending = false;
+bool g_lmb_held = false;
+double g_cursor_x = 0.0, g_cursor_y = 0.0;
+float g_brush_radius_grid = 30.0f;
+float g_brush_strength = 1.5f;
 
 void key_callback(GLFWwindow* window, int key, int /*scancode*/, int action, int /*mods*/)
 {
@@ -95,6 +99,24 @@ void key_callback(GLFWwindow* window, int key, int /*scancode*/, int action, int
         glfwSetWindowShouldClose(window, GLFW_TRUE);
     if (key == GLFW_KEY_SPACE && action == GLFW_PRESS)
         g_pulse_pending = true;
+}
+
+void mouse_button_callback(GLFWwindow* /*window*/, int button, int action, int /*mods*/)
+{
+    if (button == GLFW_MOUSE_BUTTON_LEFT) {
+        g_lmb_held = (action == GLFW_PRESS);
+    }
+}
+
+void cursor_pos_callback(GLFWwindow* /*window*/, double xpos, double ypos)
+{
+    g_cursor_x = xpos;
+    g_cursor_y = ypos;
+}
+
+void scroll_callback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset)
+{
+    g_brush_radius_grid = std::clamp(g_brush_radius_grid + static_cast<float>(yoffset) * 5.0f, 5.0f, 200.0f);
 }
 
 void framebuffer_resize_callback(GLFWwindow* /*window*/, int /*width*/, int /*height*/)
@@ -428,6 +450,9 @@ int main()
 
     glfwSetKeyCallback(window, key_callback);
     glfwSetFramebufferSizeCallback(window, framebuffer_resize_callback);
+    glfwSetMouseButtonCallback(window, mouse_button_callback);
+    glfwSetCursorPosCallback(window, cursor_pos_callback);
+    glfwSetScrollCallback(window, scroll_callback);
 
     // ---- Gather GLFW instance extensions ------------------------------------
     uint32_t glfw_ext_count = 0;
@@ -1258,11 +1283,29 @@ int main()
             swe_pc._pad0 = 0.0f;
             swe_pc.grid_w = SWE_GRID_W;
             swe_pc.grid_h = SWE_GRID_H;
-            swe_pc.pulse_x = SWE_GRID_W * 0.5f;
-            swe_pc.pulse_y = SWE_GRID_H * 0.5f;
-            swe_pc.pulse_radius = 30.0f;
-            swe_pc.pulse_amount = g_pulse_pending ? 50.0f : 0.0f;
-            g_pulse_pending = false;
+            if (g_pulse_pending) {
+                swe_pc.pulse_x = SWE_GRID_W * 0.5f;
+                swe_pc.pulse_y = SWE_GRID_H * 0.5f;
+                swe_pc.pulse_radius = 30.0f;
+                swe_pc.pulse_amount = 50.0f;
+                g_pulse_pending = false;
+            } else if (g_lmb_held) {
+                int win_w, win_h;
+                glfwGetWindowSize(window, &win_w, &win_h);
+                double scale_x = static_cast<double>(fb_w) / win_w;
+                double scale_y = static_cast<double>(fb_h) / win_h;
+                float grid_x = static_cast<float>((g_cursor_x * scale_x) / fb_w) * SWE_GRID_W;
+                float grid_y = static_cast<float>((g_cursor_y * scale_y) / fb_h) * SWE_GRID_H;
+                swe_pc.pulse_x = grid_x;
+                swe_pc.pulse_y = grid_y;
+                swe_pc.pulse_radius = g_brush_radius_grid;
+                swe_pc.pulse_amount = g_brush_strength;
+            } else {
+                swe_pc.pulse_x = 0.0f;
+                swe_pc.pulse_y = 0.0f;
+                swe_pc.pulse_radius = 1.0f;
+                swe_pc.pulse_amount = 0.0f;
+            }
             vkCmdPushConstants(frame.cmd, swe_step_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(swe_pc), &swe_pc);
 
