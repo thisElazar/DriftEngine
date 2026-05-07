@@ -135,7 +135,7 @@ struct BasinParams {
     float    base_height   = 800.0f;
     float    inner_radius  = 2000.0f;
     float    rim_radius    = 2800.0f;
-    float    initial_water = 700.0f;
+    float    initial_water = 50.0f;
 };
 
 float cpu_smoothstep(float edge0, float edge1, float x)
