@@ -47,7 +47,33 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 
-FetchContent_MakeAvailable(glfw vk-bootstrap VulkanMemoryAllocator)
+FetchContent_Declare(
+    glm
+    GIT_REPOSITORY https://github.com/g-truc/glm.git
+    GIT_TAG        1.0.1
+    GIT_SHALLOW    TRUE
+)
+
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG        v1.91.5
+    GIT_SHALLOW    TRUE
+)
+
+FetchContent_MakeAvailable(glfw vk-bootstrap VulkanMemoryAllocator glm imgui)
+
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+)
+target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+target_link_libraries(imgui PUBLIC glfw Vulkan::Vulkan)
 
 # ---------------------------------------------------------------------------
 # Vulkan
@@ -71,6 +97,8 @@ target_link_libraries(drift_engine PRIVATE
     glfw
     vk-bootstrap::vk-bootstrap
     GPUOpen::VulkanMemoryAllocator
+    glm::glm
+    imgui
 )
 target_compile_definitions(drift_engine PRIVATE GLFW_INCLUDE_NONE)
 
@@ -104,14 +132,28 @@ file(GLOB HLSL_SHADERS ${SHADER_DIR}/*.hlsl)
 
 set(SPV_OUTPUTS "")
 foreach(HLSL ${HLSL_SHADERS})
-    get_filename_component(NAME_WE ${HLSL} NAME_WE)
-    set(SPV ${SHADER_OUT_DIR}/${NAME_WE}.spv)
+    get_filename_component(FNAME ${HLSL} NAME)
+    string(REGEX REPLACE "\\.hlsl$" "" STEM ${FNAME})
+
+    # Detect shader stage from filename convention
+    if(STEM MATCHES "\\.vs$")
+        set(SHADER_STAGE vertex)
+    elseif(STEM MATCHES "\\.fs$")
+        set(SHADER_STAGE fragment)
+    else()
+        set(SHADER_STAGE compute)
+    endif()
+
+    # Replace dots with underscores for SPV output to avoid CMake .rule conflicts
+    string(REPLACE "." "_" SPV_NAME ${STEM})
+    set(SPV ${SHADER_OUT_DIR}/${SPV_NAME}.spv)
+
     add_custom_command(
         OUTPUT ${SPV}
-        COMMAND ${GLSLC} -x hlsl -fshader-stage=compute -fentry-point=main
+        COMMAND ${GLSLC} -x hlsl -fshader-stage=${SHADER_STAGE} -fentry-point=main
                 --target-env=vulkan1.3 ${HLSL} -o ${SPV}
         DEPENDS ${HLSL}
-        COMMENT "HLSL→SPIR-V: ${NAME_WE}.hlsl"
+        COMMENT "HLSL→SPIR-V [${SHADER_STAGE}]: ${FNAME}"
         VERBATIM
     )
     list(APPEND SPV_OUTPUTS ${SPV})

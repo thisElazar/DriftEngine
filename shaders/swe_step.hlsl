@@ -1,6 +1,6 @@
-// swe_step.hlsl — HLL Riemann SWE solver
-// Ported from Drift V2 ShallowWater.usf. Stripped: Common.ush, toroidal
-// wrap, BoundaryDataTexture, wind term (zeroed). See PORT NOTE comments.
+// swe_step.hlsl — Well-balanced HLL Riemann SWE solver
+// Based on Drift V2 ShallowWater.usf with Audusse et al. (2004)
+// hydrostatic reconstruction for stability on sloped bathymetry.
 
 [[vk::binding(0, 0)]] Texture2D<float>    terrain;
 [[vk::binding(1, 0)]] Texture2D<float4>   state_read;
@@ -32,7 +32,6 @@ cbuffer PushConstants {
 #define DAMPING   damping
 #define GRID_W    ((int)grid_w)
 #define GRID_H    ((int)grid_h)
-#define MIN_DEPTH 0.001f
 #define DRY_TOLERANCE 0.01f
 
 int2 ClampCoord(int2 c)
@@ -50,7 +49,7 @@ float ReadTerrain(int2 coord)
     return terrain[ClampCoord(coord)];
 }
 
-float3 HLLFlux(float3 UL, float3 UR, float zL, float zR, bool bXDir)
+float3 HLLFlux(float3 UL, float3 UR, bool bXDir)
 {
     float hL = max(UL.x, 0.0f);
     float hR = max(UR.x, 0.0f);
@@ -109,6 +108,15 @@ float3 HLLFlux(float3 UL, float3 UR, float zL, float zR, bool bXDir)
            / (sR - sL);
 }
 
+// Reconstruct (h, hu, hv) at a cell interface for hydrostatic balance.
+// w = surface elevation of the cell, z_star = max bed at interface.
+float3 Reconstruct(float h_orig, float hu_orig, float hv_orig, float w, float z_star)
+{
+    float h_rec = max(0.0f, w - z_star);
+    float inv_h = (h_orig > DRY_TOLERANCE) ? 1.0f / h_orig : 0.0f;
+    return float3(h_rec, h_rec * hu_orig * inv_h, h_rec * hv_orig * inv_h);
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 ThreadId : SV_DispatchThreadID)
 {
@@ -116,7 +124,7 @@ void main(uint3 ThreadId : SV_DispatchThreadID)
     if (coord.x >= GRID_W || coord.y >= GRID_H)
         return;
 
-    float step_dt = min(dt, 0.033f);
+    float step_dt = dt;
 
     // === Read current state ===
     float4 state = ReadState(coord);
@@ -136,7 +144,7 @@ void main(uint3 ThreadId : SV_DispatchThreadID)
 
     float z = ReadTerrain(coord);
 
-    // === Read neighbor states ===
+    // === Read neighbors ===
     float4 sL = ReadState(coord + int2(-1, 0));
     float4 sR = ReadState(coord + int2( 1, 0));
     float4 sD = ReadState(coord + int2( 0,-1));
@@ -147,33 +155,59 @@ void main(uint3 ThreadId : SV_DispatchThreadID)
     float zD = ReadTerrain(coord + int2( 0,-1));
     float zU = ReadTerrain(coord + int2( 0, 1));
 
-    // === Compute fluxes (HLL Riemann solver) ===
-    float3 U = float3(h, hu, hv);
+    // === Hydrostatic reconstruction (Audusse et al. 2004) ===
+    // At each interface, raise the bed to max(zL, zR) and reduce h to match
+    // the original surface elevation. This guarantees a lake at rest produces
+    // zero net flux regardless of gravity or terrain slope.
+    float wC = h + z;
+    float wL = sL.r + zL;
+    float wR = sR.r + zR;
+    float wD = sD.r + zD;
+    float wU = sU.r + zU;
 
-    float3 fxL = HLLFlux(float3(sL.r, sL.g, sL.b), U, zL, z, true);
-    float3 fxR = HLLFlux(U, float3(sR.r, sR.g, sR.b), z, zR, true);
+    float zs_xL = max(zL, z);
+    float zs_xR = max(z, zR);
+    float zs_yD = max(zD, z);
+    float zs_yU = max(z, zU);
 
-    float3 fyD = HLLFlux(float3(sD.r, sD.g, sD.b), U, zD, z, false);
-    float3 fyU = HLLFlux(U, float3(sU.r, sU.g, sU.b), z, zU, false);
+    float3 cL_rec = Reconstruct(h,    hu,   hv,   wC, zs_xL);
+    float3 nL_rec = Reconstruct(sL.r, sL.g, sL.b, wL, zs_xL);
+    float3 cR_rec = Reconstruct(h,    hu,   hv,   wC, zs_xR);
+    float3 nR_rec = Reconstruct(sR.r, sR.g, sR.b, wR, zs_xR);
+    float3 cD_rec = Reconstruct(h,    hu,   hv,   wC, zs_yD);
+    float3 nD_rec = Reconstruct(sD.r, sD.g, sD.b, wD, zs_yD);
+    float3 cU_rec = Reconstruct(h,    hu,   hv,   wC, zs_yU);
+    float3 nU_rec = Reconstruct(sU.r, sU.g, sU.b, wU, zs_yU);
+
+    // === HLL fluxes with reconstructed states ===
+    float3 fxL = HLLFlux(nL_rec, cL_rec, true);
+    float3 fxR = HLLFlux(cR_rec, nR_rec, true);
+    float3 fyD = HLLFlux(nD_rec, cD_rec, false);
+    float3 fyU = HLLFlux(cU_rec, nU_rec, false);
 
     // === Update conserved variables ===
     float dtdx = step_dt / DX;
 
-    float h_new  = h  - dtdx * (fxR.x - fxL.x) - dtdx * (fyU.x - fyD.x);
-    float hu_new = hu - dtdx * (fxR.y - fxL.y) - dtdx * (fyU.y - fyD.y);
-    float hv_new = hv - dtdx * (fxR.z - fxL.z) - dtdx * (fyU.z - fyD.z);
+    // Positivity-preserving flux limiter: scale flux so it never drains more than h
+    float h_flux = dtdx * (fxR.x - fxL.x + fyU.x - fyD.x);
+    float flux_scale = (h_flux > h && h_flux > 0.0f) ? (h / h_flux) : 1.0f;
+
+    float h_new  = h  - h_flux * flux_scale;
+    float hu_new = hu - dtdx * (fxR.y - fxL.y + fyU.y - fyD.y) * flux_scale;
+    float hv_new = hv - dtdx * (fxR.z - fxL.z + fyU.z - fyD.z) * flux_scale;
+
+    if (h_new < 0.0f)
+    {
+        h_new  = 0.0f;
+        hu_new = 0.0f;
+        hv_new = 0.0f;
+    }
 
     // === Source terms ===
 
-    // Bed slope
-    float h_avg = max(h_new, 0.0f);
-    if (h_avg > DRY_TOLERANCE)
-    {
-        float dzx = (zR - zL) / (2.0f * DX);
-        float dzy = (zU - zD) / (2.0f * DX);
-        hu_new -= step_dt * GRAVITY * h_avg * dzx;
-        hv_new -= step_dt * GRAVITY * h_avg * dzy;
-    }
+    // Well-balanced bed slope: pressure correction from reconstruction
+    hu_new += step_dt * GRAVITY / (2.0f * DX) * (cR_rec.x * cR_rec.x - cL_rec.x * cL_rec.x);
+    hv_new += step_dt * GRAVITY / (2.0f * DX) * (cU_rec.x * cU_rec.x - cD_rec.x * cD_rec.x);
 
     // Friction (Manning-style quadratic drag)
     if (h_new > DRY_TOLERANCE)
@@ -186,8 +220,6 @@ void main(uint3 ThreadId : SV_DispatchThreadID)
         hu_new *= decay;
         hv_new *= decay;
     }
-
-    // PORT NOTE: wind forcing stripped — pass zero WindParams for now
 
     // === Enforce constraints ===
     h_new = max(h_new, 0.0f);
@@ -213,19 +245,22 @@ void main(uint3 ThreadId : SV_DispatchThreadID)
         }
     }
 
-    // PORT NOTE: edge damping simplified — no toroidal grid, no boundary texture.
-    // Sponge zone at grid edges to absorb outgoing waves.
+    // Sponge layer: absorbing boundary via friction-based drain
+    float sponge_width = 64.0f;
     float2 distFromEdge = float2(
         min((float)coord.x, (float)(GRID_W - 1 - coord.x)),
         min((float)coord.y, (float)(GRID_H - 1 - coord.y))
     );
-    float edgeFade = saturate(min(distFromEdge.x, distFromEdge.y) / 32.0f);
-    hu_new *= edgeFade;
-    hv_new *= edgeFade;
+    float edge_dist = min(distFromEdge.x, distFromEdge.y);
+    float sponge_t = saturate(1.0f - edge_dist / sponge_width);
+    float sponge_str = sponge_t * sponge_t;
 
-    // PORT NOTE: boundary relaxation removed — single tile, no CPU boundary coupling.
-    // Instead, fade depth at edges toward zero (open boundary absorber).
-    h_new = lerp(0.0f, h_new, edgeFade);
+    float sponge_decay = 1.0f / (1.0f + step_dt * 20.0f * sponge_str);
+    hu_new *= sponge_decay;
+    hv_new *= sponge_decay;
+    h_new *= max(0.0f, 1.0f - step_dt * 3.0f * sponge_str);
+
+    float edgeFade = 1.0f - sponge_str;
 
     // Global damping
     hu_new *= (1.0f - DAMPING * step_dt);
