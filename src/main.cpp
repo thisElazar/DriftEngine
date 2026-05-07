@@ -1110,6 +1110,15 @@ int main()
         VK_CHECK(vkCreateFence(device, &fence_ci, nullptr, &f.in_flight));
     }
 
+    // ---- Timestamp query pool -----------------------------------------------
+    VkQueryPoolCreateInfo qp_ci{};
+    qp_ci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    qp_ci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    qp_ci.queryCount = 2 * FRAMES_IN_FLIGHT;
+
+    VkQueryPool query_pool = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateQueryPool(device, &qp_ci, nullptr, &query_pool));
+
     // ---- Swapchain rebuild helper -------------------------------------------
     auto rebuild_swapchain = [&]() {
         int w = 0, h = 0;
@@ -1137,7 +1146,7 @@ int main()
     };
 
     // ---- Startup printout ---------------------------------------------------
-    std::printf("drift_engine v0.2.1b — Vulkan up.\n");
+    std::printf("drift_engine v0.2.2 — Vulkan up.\n");
     std::printf("Device:   %s\n", vkb_phys.name.c_str());
     std::printf("Queues:   graphics=%u  present=%u\n",
                 gfx_family,
@@ -1164,6 +1173,15 @@ int main()
     double last_time = glfwGetTime();
     const VkImageSubresourceRange color_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
+    constexpr int AVG_FRAMES = 30;
+    double cpu_times[AVG_FRAMES] = {};
+    double gpu_times[AVG_FRAMES] = {};
+    int timing_index = 0;
+    int timing_count = 0;
+    double last_title_update = 0.0;
+    double ns_per_tick = static_cast<double>(vkb_phys.properties.limits.timestampPeriod);
+    bool queries_valid = false;
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
@@ -1175,6 +1193,21 @@ int main()
         FrameData& frame = frames[current_frame];
 
         VK_CHECK(vkWaitForFences(device, 1, &frame.in_flight, VK_TRUE, UINT64_MAX));
+
+        // Read back GPU timestamps from the previous submission of this frame slot
+        if (queries_valid) {
+            uint64_t timestamps[2] = {};
+            VkResult qr = vkGetQueryPoolResults(device, query_pool,
+                current_frame * 2, 2,
+                sizeof(timestamps), timestamps, sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT);
+            if (qr == VK_SUCCESS) {
+                double swe_ms = static_cast<double>(timestamps[1] - timestamps[0]) * ns_per_tick / 1e6;
+                gpu_times[timing_index] = swe_ms;
+            }
+        }
+
+        double frame_start = glfwGetTime();
 
         uint32_t image_index = 0;
         VkResult acquire_result = vkAcquireNextImageKHR(
@@ -1207,6 +1240,8 @@ int main()
 
         // ---- SWE step dispatch ----
         {
+            vkCmdResetQueryPool(frame.cmd, query_pool, current_frame * 2, 2);
+
             vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, swe_step_pipeline);
             vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                     swe_step_pipeline_layout, 0, 1,
@@ -1231,7 +1266,13 @@ int main()
             vkCmdPushConstants(frame.cmd, swe_step_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(swe_pc), &swe_pc);
 
+            vkCmdWriteTimestamp2(frame.cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                query_pool, current_frame * 2 + 0);
+
             vkCmdDispatch(frame.cmd, (SWE_GRID_W + 7) / 8, (SWE_GRID_H + 7) / 8, 1);
+
+            vkCmdWriteTimestamp2(frame.cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                query_pool, current_frame * 2 + 1);
 
             swe_ping_pong ^= 1;
         }
@@ -1405,6 +1446,29 @@ int main()
             break;
         }
 
+        // CPU frame time + title update
+        double frame_end = glfwGetTime();
+        cpu_times[timing_index] = (frame_end - frame_start) * 1000.0;
+        timing_index = (timing_index + 1) % AVG_FRAMES;
+        if (timing_count < AVG_FRAMES) timing_count++;
+        queries_valid = true;
+
+        if (frame_end - last_title_update >= 1.0) {
+            double cpu_sum = 0.0, gpu_sum = 0.0;
+            for (int i = 0; i < timing_count; ++i) {
+                cpu_sum += cpu_times[i];
+                gpu_sum += gpu_times[i];
+            }
+            double cpu_avg = cpu_sum / timing_count;
+            double gpu_avg = gpu_sum / timing_count;
+            char title[256];
+            std::snprintf(title, sizeof(title),
+                "drift_engine — 1024² SWE | CPU %.2f ms | GPU %.2f ms | %.1f fps",
+                cpu_avg, gpu_avg, 1000.0 / cpu_avg);
+            glfwSetWindowTitle(window, title);
+            last_title_update = frame_end;
+        }
+
         current_frame = (current_frame + 1) % FRAMES_IN_FLIGHT;
     }
 
@@ -1417,6 +1481,8 @@ int main()
         vkDestroySemaphore(device, f.image_available, nullptr);
         vkDestroyCommandPool(device, f.pool, nullptr);
     }
+
+    vkDestroyQueryPool(device, query_pool, nullptr);
 
     for (auto view : swapchain_views)
         vkDestroyImageView(device, view, nullptr);
