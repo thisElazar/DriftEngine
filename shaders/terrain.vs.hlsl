@@ -33,6 +33,7 @@ struct VSOutput {
     [[vk::location(1)]] float2 uv : TEXCOORD0;
     [[vk::location(2)]] float height_normalized : TEXCOORD1;
     [[vk::location(3)]] float3 world_pos : TEXCOORD2;
+    [[vk::location(4)]] float3 sphere_direction : TEXCOORD3;
 };
 
 static const float GRID_MAX = 63.0;
@@ -121,5 +122,6 @@ VSOutput main(VSInput input)
     o.uv = tile_uv;
     o.height_normalized = saturate(h / max_elevation);
     o.world_pos = world_rel;
+    o.sphere_direction = sphere_dir;
     return o;
 }

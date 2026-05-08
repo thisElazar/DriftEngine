@@ -3,6 +3,16 @@
 
 [[vk::binding(0, 0)]] RWTexture2DArray<float> tile_pool;
 
+struct TerrainStamp {
+    float3 pos;
+    float  radius;
+    float  delta_h;
+    float  cos_radius;
+    float2 _spad;
+};
+
+[[vk::binding(1, 0)]] StructuredBuffer<TerrainStamp> stamps;
+
 [[vk::push_constant]]
 cbuffer PlanetGenPC {
     float    u_min;
@@ -12,7 +22,7 @@ cbuffer PlanetGenPC {
     uint     pool_index;
     uint     tex_res;
     uint     seed;
-    float    _pad;
+    uint     stamp_count;
 };
 
 float hash31(float3 p)
@@ -160,6 +170,15 @@ void main(uint3 dtid : SV_DispatchThreadID)
     float3 sphere_dir = cube_to_sphere(cube_pt);
 
     float h = terrain_height(sphere_dir);
+
+    // Apply terrain edit stamps
+    for (uint i = 0; i < stamp_count; i++) {
+        float d = dot(sphere_dir, stamps[i].pos);
+        if (d < stamps[i].cos_radius)
+            continue;
+        float t = (d - stamps[i].cos_radius) / max(1.0 - stamps[i].cos_radius, 1e-7);
+        h += stamps[i].delta_h * exp(-4.0 * (1.0 - t) * (1.0 - t));
+    }
 
     tile_pool[uint3(dtid.xy, pool_index)] = h;
 }

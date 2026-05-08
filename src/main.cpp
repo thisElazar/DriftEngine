@@ -304,8 +304,18 @@ struct PlanetGenPC {
     uint32_t pool_index;
     uint32_t tex_res;
     uint32_t seed;
-    float    _pad;
+    uint32_t stamp_count;
 };
+
+struct TerrainStamp {
+    float    pos_x, pos_y, pos_z;
+    float    radius;
+    float    delta_h;
+    float    cos_radius;
+    float    _pad0, _pad1;
+};
+
+constexpr uint32_t MAX_STAMPS = 4096;
 
 struct QuadNode {
     uint32_t face;
@@ -363,6 +373,21 @@ Camera g_camera;
 BrushMode g_brush_mode = BrushMode::Water;
 double g_terrain_height_at_cam = 0.0;
 double g_altitude_above_terrain = 100000.0;
+std::vector<TerrainStamp> g_stamps;
+bool g_stamps_dirty = false;
+float g_stamp_angular_scale = 0.0001f;
+
+float cpu_terrain_height_with_stamps(glm::vec3 sphere_dir) {
+    float h = cpu_terrain_height(sphere_dir);
+    for (const auto& s : g_stamps) {
+        glm::vec3 sp(s.pos_x, s.pos_y, s.pos_z);
+        float d = glm::dot(sphere_dir, sp);
+        if (d < s.cos_radius) continue;
+        float t = (d - s.cos_radius) / std::max(1.0f - s.cos_radius, 1e-7f);
+        h += s.delta_h * std::exp(-4.0f * (1.0f - t) * (1.0f - t));
+    }
+    return h;
+}
 
 bool g_show_menu = true;
 float g_gravity = 9.81f;
@@ -1192,6 +1217,23 @@ int main()
     VmaAllocationInfo camera_ubo_info{};
     VK_CHECK(vmaCreateBuffer(allocator, &ubo_ci, &ubo_ai, &camera_ubo, &camera_ubo_alloc, &camera_ubo_info));
 
+    // ---- Stamp buffer (SSBO for terrain edit stamps) ------------------------
+    VkBufferCreateInfo stamp_buf_ci{};
+    stamp_buf_ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    stamp_buf_ci.size = MAX_STAMPS * sizeof(TerrainStamp);
+    stamp_buf_ci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
+    VmaAllocationCreateInfo stamp_buf_ai{};
+    stamp_buf_ai.usage = VMA_MEMORY_USAGE_AUTO;
+    stamp_buf_ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+                       | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+    VkBuffer stamp_buf = VK_NULL_HANDLE;
+    VmaAllocation stamp_buf_alloc = VK_NULL_HANDLE;
+    VmaAllocationInfo stamp_buf_info{};
+    VK_CHECK(vmaCreateBuffer(allocator, &stamp_buf_ci, &stamp_buf_ai,
+        &stamp_buf, &stamp_buf_alloc, &stamp_buf_info));
+
     // ---- SWE images (ping-pong state + output) ------------------------------
     SweImage swe_state_a = create_swe_image(device, allocator, SWE_GRID_W, SWE_GRID_H);
     SweImage swe_state_b = create_swe_image(device, allocator, SWE_GRID_W, SWE_GRID_H);
@@ -1964,16 +2006,20 @@ int main()
     VK_CHECK(vkCreateDescriptorSetLayout(device, &atmo_dsl_ci, nullptr, &atmo_desc_layout));
 
     // ---- Terrain gen compute descriptor set layout + pipeline layout -----------
-    VkDescriptorSetLayoutBinding tgen_binding{};
-    tgen_binding.binding = 0;
-    tgen_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    tgen_binding.descriptorCount = 1;
-    tgen_binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutBinding tgen_bindings[2]{};
+    tgen_bindings[0].binding = 0;
+    tgen_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    tgen_bindings[0].descriptorCount = 1;
+    tgen_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    tgen_bindings[1].binding = 1;
+    tgen_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    tgen_bindings[1].descriptorCount = 1;
+    tgen_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     VkDescriptorSetLayoutCreateInfo tgen_dsl_ci{};
     tgen_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    tgen_dsl_ci.bindingCount = 1;
-    tgen_dsl_ci.pBindings = &tgen_binding;
+    tgen_dsl_ci.bindingCount = 2;
+    tgen_dsl_ci.pBindings = tgen_bindings;
 
     VkDescriptorSetLayout terrain_gen_desc_layout = VK_NULL_HANDLE;
     VK_CHECK(vkCreateDescriptorSetLayout(device, &tgen_dsl_ci, nullptr, &terrain_gen_desc_layout));
@@ -2249,7 +2295,7 @@ int main()
     pool_sizes[3].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     pool_sizes[3].descriptorCount = 42;
     pool_sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_sizes[4].descriptorCount = 4;
+    pool_sizes[4].descriptorCount = 5;
 
     VkDescriptorPoolCreateInfo dp_ci{};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -2963,15 +3009,27 @@ int main()
         tgen_img_info.imageView = clipmap_hm_view;
         tgen_img_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet tgen_write{};
-        tgen_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        tgen_write.dstSet = terrain_gen_desc_set;
-        tgen_write.dstBinding = 0;
-        tgen_write.descriptorCount = 1;
-        tgen_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        tgen_write.pImageInfo = &tgen_img_info;
+        VkDescriptorBufferInfo stamp_desc_info{};
+        stamp_desc_info.buffer = stamp_buf;
+        stamp_desc_info.offset = 0;
+        stamp_desc_info.range = MAX_STAMPS * sizeof(TerrainStamp);
 
-        vkUpdateDescriptorSets(device, 1, &tgen_write, 0, nullptr);
+        VkWriteDescriptorSet tgen_writes[2]{};
+        tgen_writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        tgen_writes[0].dstSet = terrain_gen_desc_set;
+        tgen_writes[0].dstBinding = 0;
+        tgen_writes[0].descriptorCount = 1;
+        tgen_writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        tgen_writes[0].pImageInfo = &tgen_img_info;
+
+        tgen_writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        tgen_writes[1].dstSet = terrain_gen_desc_set;
+        tgen_writes[1].dstBinding = 1;
+        tgen_writes[1].descriptorCount = 1;
+        tgen_writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        tgen_writes[1].pBufferInfo = &stamp_desc_info;
+
+        vkUpdateDescriptorSets(device, 2, tgen_writes, 0, nullptr);
     }
 
     // Clipmap graphics descriptor sets (2 for atmosphere ping-pong)
@@ -4204,8 +4262,19 @@ int main()
                 ImGui::SliderFloat("Brush radius (cells)", &g_brush_radius_grid, 2.0f, 300.0f);
                 ImGui::SliderFloat("Water strength", &g_brush_strength, 0.0f, 20.0f);
                 ImGui::SliderFloat("Terrain strength m/s", &g_terrain_strength, 1.0f, 500.0f);
+                ImGui::SliderFloat("Stamp angular scale", &g_stamp_angular_scale, 0.00001f, 0.01f, "%.5f");
                 ImGui::SliderFloat("Pulse amount (m)", &g_pulse_amount, 1.0f, 200.0f);
                 ImGui::SliderFloat("Pulse radius (cells)", &g_pulse_radius_cells, 5.0f, 200.0f);
+                ImGui::Text("Stamps: %u / %u", static_cast<uint32_t>(g_stamps.size()), MAX_STAMPS);
+                if (ImGui::Button("Undo stamp") && !g_stamps.empty()) {
+                    g_stamps.pop_back();
+                    g_stamps_dirty = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Clear stamps") && !g_stamps.empty()) {
+                    g_stamps.clear();
+                    g_stamps_dirty = true;
+                }
             }
 
             if (ImGui::CollapsingHeader("Erosion", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -4477,7 +4546,7 @@ int main()
             glm::dvec3 cam_pos_d(g_camera.pos_x, g_camera.pos_y, g_camera.pos_z);
             double cam_dist = glm::length(cam_pos_d);
             glm::vec3 cam_dir_f = glm::normalize(glm::vec3(cam_pos_d));
-            g_terrain_height_at_cam = static_cast<double>(cpu_terrain_height(cam_dir_f));
+            g_terrain_height_at_cam = static_cast<double>(cpu_terrain_height_with_stamps(cam_dir_f));
             double terrain_radius = static_cast<double>(PLANET_RADIUS) + g_terrain_height_at_cam;
             g_altitude_above_terrain = cam_dist - terrain_radius;
 
@@ -4516,7 +4585,7 @@ int main()
             cam_pos_d = glm::dvec3(g_camera.pos_x, g_camera.pos_y, g_camera.pos_z);
             cam_dist = glm::length(cam_pos_d);
             cam_dir_f = glm::normalize(glm::vec3(cam_pos_d));
-            double h_at_new_pos = static_cast<double>(cpu_terrain_height(cam_dir_f));
+            double h_at_new_pos = static_cast<double>(cpu_terrain_height_with_stamps(cam_dir_f));
             double min_radius = static_cast<double>(PLANET_RADIUS) + h_at_new_pos + 2.0;
             if (cam_dist < min_radius) {
                 glm::dvec3 cam_dir_d = cam_pos_d / cam_dist;
@@ -4551,11 +4620,67 @@ int main()
             cam_view = glm::lookAtRH(glm::vec3(0.0f), forward, glm::vec3(0.0f, 1.0f, 0.0f));
         }
 
-        // ---- Ray-pick cursor (disabled for planet mode) ----
+        // ---- Ray-pick cursor on sphere surface ----
         float grid_x = 0.0f, grid_y = 0.0f;
+        glm::vec3 stamp_sphere_dir(0.0f);
         g_cursor_on_world = false;
+        {
+            int win_w, win_h;
+            glfwGetWindowSize(window, &win_w, &win_h);
+            float ndc_x = static_cast<float>(g_cursor_x) / win_w * 2.0f - 1.0f;
+            float ndc_y = static_cast<float>(g_cursor_y) / win_h * 2.0f - 1.0f;
+
+            glm::mat4 inv_vp = glm::inverse(cam_proj * cam_view);
+            glm::vec4 near_clip = inv_vp * glm::vec4(ndc_x, ndc_y, 1.0f, 1.0f);
+            glm::vec4 far_clip  = inv_vp * glm::vec4(ndc_x, ndc_y, 0.0f, 1.0f);
+            near_clip /= near_clip.w;
+            far_clip /= far_clip.w;
+
+            glm::dvec3 ray_origin(g_camera.pos_x, g_camera.pos_y, g_camera.pos_z);
+            glm::dvec3 ray_dir = glm::normalize(glm::dvec3(far_clip) - glm::dvec3(near_clip));
+
+            double sphere_r = static_cast<double>(PLANET_RADIUS) + g_terrain_height_at_cam;
+            double a = glm::dot(ray_dir, ray_dir);
+            double b = 2.0 * glm::dot(ray_origin, ray_dir);
+            double c = glm::dot(ray_origin, ray_origin) - sphere_r * sphere_r;
+            double disc = b * b - 4.0 * a * c;
+
+            if (disc >= 0.0) {
+                double t = (-b - std::sqrt(disc)) / (2.0 * a);
+                if (t > 0.0) {
+                    glm::dvec3 hit = ray_origin + t * ray_dir;
+                    stamp_sphere_dir = glm::normalize(glm::vec3(hit));
+                    g_cursor_on_world = true;
+                }
+            }
+        }
         bool brush_active = g_lmb_held && !g_rmb_held;
         bool brush_hit = brush_active && g_cursor_on_world;
+
+        // ---- Place terrain stamp on LMB ----
+        if (brush_hit &&
+            (g_brush_mode == BrushMode::Raise || g_brush_mode == BrushMode::Lower) &&
+            g_stamps.size() < MAX_STAMPS)
+        {
+            static double last_stamp_time = 0.0;
+            double now_s = glfwGetTime();
+            if (now_s - last_stamp_time > 0.1) {
+                float sign = (g_brush_mode == BrushMode::Raise) ? 1.0f : -1.0f;
+                float angular_radius = g_brush_radius_grid * g_stamp_angular_scale;
+                angular_radius = std::clamp(angular_radius, 0.0001f, 0.2f);
+
+                TerrainStamp stamp{};
+                stamp.pos_x = stamp_sphere_dir.x;
+                stamp.pos_y = stamp_sphere_dir.y;
+                stamp.pos_z = stamp_sphere_dir.z;
+                stamp.radius = angular_radius;
+                stamp.delta_h = sign * g_terrain_strength;
+                stamp.cos_radius = std::cos(angular_radius);
+                g_stamps.push_back(stamp);
+                g_stamps_dirty = true;
+                last_stamp_time = now_s;
+            }
+        }
 
         // ---- Camera UBO update (perspective + brush ring) ----
         {
@@ -4579,10 +4704,10 @@ int main()
             cam._pad1 = 0.0f;
             cam.cam_pos = glm::vec3(0.0f);  // camera-relative rendering
             cam._pad2 = g_mud_visibility;
+            float angular_r = g_brush_radius_grid * g_stamp_angular_scale;
             cam.brush_world = glm::vec4(
-                g_cursor_world_x, g_cursor_world_z,
-                brush_radius_world,
-                g_cursor_on_world ? 1.0f : 0.0f);
+                stamp_sphere_dir.x, stamp_sphere_dir.y, stamp_sphere_dir.z,
+                g_cursor_on_world ? angular_r : 0.0f);
             cam.brush_color = brush_color;
             cam.inv_view_proj = glm::inverse(cam_proj * cam_view);
             std::memcpy(camera_ubo_info.pMappedData, &cam, sizeof(cam));
@@ -4710,6 +4835,14 @@ int main()
 
             g_visible_tile_count = static_cast<uint32_t>(visible_tiles.size());
 
+            // Upload stamps to GPU if changed
+            if (g_stamps_dirty && !g_stamps.empty()) {
+                size_t copy_size = g_stamps.size() * sizeof(TerrainStamp);
+                std::memcpy(stamp_buf_info.pMappedData, g_stamps.data(), copy_size);
+                vmaFlushAllocation(allocator, stamp_buf_alloc, 0, copy_size);
+                g_stamps_dirty = false;
+            }
+
             // Dispatch planet_gen compute for each visible tile
             vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, terrain_gen_pipeline);
             vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -4727,6 +4860,7 @@ int main()
                 gen_pc.pool_index = i;
                 gen_pc.tex_res = PLANET_TILE_RES;
                 gen_pc.seed = 42;
+                gen_pc.stamp_count = static_cast<uint32_t>(g_stamps.size());
 
                 vkCmdPushConstants(frame.cmd, terrain_gen_pipeline_layout,
                     VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gen_pc), &gen_pc);
@@ -5375,6 +5509,7 @@ int main()
     vmaDestroyBuffer(allocator, index_buffer, index_alloc);
     vmaDestroyBuffer(allocator, vertex_buffer, vertex_alloc);
     vmaDestroyBuffer(allocator, camera_ubo, camera_ubo_alloc);
+    vmaDestroyBuffer(allocator, stamp_buf, stamp_buf_alloc);
 
     vkDestroySampler(device, terrain_linear_sampler, nullptr);
     vkDestroySampler(device, sampler, nullptr);

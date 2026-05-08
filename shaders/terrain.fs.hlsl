@@ -26,6 +26,7 @@ struct PSInput {
     [[vk::location(1)]] float2 uv : TEXCOORD0;
     [[vk::location(2)]] float height_normalized : TEXCOORD1;
     [[vk::location(3)]] float3 world_pos : TEXCOORD2;
+    [[vk::location(4)]] float3 sphere_direction : TEXCOORD3;
 };
 
 float3 elevation_ramp(float h)
@@ -49,6 +50,17 @@ float4 main(PSInput input) : SV_Target
     float ambient = 0.3;
     float lighting = ambient + (1.0 - ambient) * NdotL;
     color *= lighting;
+
+    // Brush cursor ring
+    float brush_radius = brush_world.w;
+    if (brush_radius > 0.0) {
+        float3 brush_dir = normalize(brush_world.xyz);
+        float3 frag_dir = normalize(input.sphere_direction);
+        float angular_dist = acos(clamp(dot(frag_dir, brush_dir), -1.0, 1.0));
+        float ring = smoothstep(brush_radius * 0.9, brush_radius, angular_dist)
+                   * smoothstep(brush_radius * 1.15, brush_radius, angular_dist);
+        color = lerp(color, brush_color.rgb, ring * 0.8);
+    }
 
     // Subtle distance fade (atmospheric scattering will replace this)
     float dist = length(input.world_pos);
