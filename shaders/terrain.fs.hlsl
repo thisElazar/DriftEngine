@@ -9,11 +9,15 @@
 };
 
 [[vk::push_constant]]
-cbuffer PushConstants {
-    float terrain_size;
-    float heightmap_texel;
+cbuffer PlanetTilePC {
+    float rel_x, rel_y, rel_z;
+    float u_min, v_min, tile_size;
+    uint  face;
+    uint  pool_index;
+    float planet_radius;
     float max_elevation;
-    float _pc_pad;
+    float heightmap_texel;
+    float cloud_opacity;
 };
 
 struct PSInput {
@@ -46,13 +50,11 @@ float4 main(PSInput input) : SV_Target
     float lighting = ambient + (1.0 - ambient) * NdotL;
     color *= lighting;
 
-    if (brush_world.w > 0.5) {
-        float2 to_cursor = input.world_pos.xz - brush_world.xy;
-        float d = length(to_cursor);
-        float ring_thickness = 4.0;
-        float ring = exp(-pow((d - brush_world.z) / ring_thickness, 2.0));
-        color = lerp(color, brush_color.rgb, saturate(ring) * 0.85);
-    }
+    // Subtle distance fade (atmospheric scattering will replace this)
+    float dist = length(input.world_pos);
+    float fog = saturate(dist / 50000000.0);
+    float3 fog_color = float3(0.65, 0.75, 0.90);
+    color = lerp(color, fog_color, fog);
 
     return float4(color, 1.0);
 }
