@@ -4632,12 +4632,10 @@ int main()
 
             glm::mat4 inv_vp = glm::inverse(cam_proj * cam_view);
             glm::vec4 near_clip = inv_vp * glm::vec4(ndc_x, ndc_y, 1.0f, 1.0f);
-            glm::vec4 far_clip  = inv_vp * glm::vec4(ndc_x, ndc_y, 0.0f, 1.0f);
             near_clip /= near_clip.w;
-            far_clip /= far_clip.w;
 
             glm::dvec3 ray_origin(g_camera.pos_x, g_camera.pos_y, g_camera.pos_z);
-            glm::dvec3 ray_dir = glm::normalize(glm::dvec3(far_clip) - glm::dvec3(near_clip));
+            glm::dvec3 ray_dir = glm::normalize(glm::dvec3(near_clip));
 
             double sphere_r = static_cast<double>(PLANET_RADIUS) + g_terrain_height_at_cam;
             double a = glm::dot(ray_dir, ray_dir);

@@ -12,15 +12,13 @@
 [[vk::combinedImageSampler]][[vk::binding(2, 0)]] SamplerState swe_sampler;
 [[vk::combinedImageSampler]][[vk::binding(3, 0)]] Texture2D<float> sediment_tex;
 [[vk::combinedImageSampler]][[vk::binding(3, 0)]] SamplerState sediment_sampler;
-[[vk::combinedImageSampler]][[vk::binding(4, 0)]] Texture2D<float4> atmo_render;
-[[vk::combinedImageSampler]][[vk::binding(4, 0)]] SamplerState atmo_sampler;
 
 [[vk::push_constant]]
 cbuffer PushConstants {
     float terrain_size;
     float heightmap_texel;
     float max_elevation;
-    float cloud_opacity;
+    float _pc_pad;
 };
 
 struct PSInput {
@@ -88,10 +86,6 @@ float4 main(PSInput input) : SV_Target
         float ring = exp(-pow((d - brush_world.z) / ring_thickness, 2.0));
         color = lerp(color, brush_color.rgb, saturate(ring) * 0.85);
     }
-
-    float cloud_shadow = atmo_render.SampleLevel(atmo_sampler, input.uv, 0).r;
-    float shadow = 1.0 - saturate(cloud_shadow * cloud_opacity) * 0.6;
-    color *= shadow;
 
     return float4(color, alpha);
 }

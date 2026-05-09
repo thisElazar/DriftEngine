@@ -18,7 +18,7 @@ cbuffer PushConstants {
     float terrain_size;
     float heightmap_texel;
     float max_elevation;
-    float _pc_pad;
+    float cloud_opacity;
 };
 
 struct VSInput {
