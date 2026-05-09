@@ -1,10 +1,10 @@
-#include "bush.h"
+#include "tree.h"
 #include <algorithm>
 #include <cmath>
 
 namespace bestiary {
 
-static uint32_t bhash(uint32_t x)
+static uint32_t thash(uint32_t x)
 {
     x ^= x >> 16;
     x *= 0x45d9f3bu;
@@ -14,33 +14,34 @@ static uint32_t bhash(uint32_t x)
     return x;
 }
 
-static float bhash_float(uint32_t seed, uint32_t index)
+static float thash_float(uint32_t seed, uint32_t index)
 {
-    return static_cast<float>(bhash(seed ^ (index * 2654435761u))) /
+    return static_cast<float>(thash(seed ^ (index * 2654435761u))) /
            static_cast<float>(0xFFFFFFFFu);
 }
 
-static float blerp(float a, float b, float t) { return a + (b - a) * t; }
+static float tlerp(float a, float b, float t) { return a + (b - a) * t; }
 
 // -----------------------------------------------------------------------
-// Space colonization internals
+// Space colonization (shared structure with bush, adapted for trees)
 // -----------------------------------------------------------------------
 
-struct ColNode {
+struct TreeNode {
     float pos[3];
     int   parent;
     float width;
     int   child_count;
     int   depth;
+    bool  is_trunk;
 };
 
-struct Attractor {
+struct TreeAttractor {
     float pos[3];
     bool  alive;
 };
 
-static bool inside_envelope(int shape, float lx, float ly, float lz,
-                            float R, float H)
+static bool inside_crown(int shape, float lx, float ly, float lz,
+                         float R, float H)
 {
     float rx = lx / R;
     float rz = lz / R;
@@ -66,35 +67,42 @@ static bool inside_envelope(int shape, float lx, float ly, float lz,
     }
 }
 
-static void seed_attractors(std::vector<Attractor>& attractors,
-                            int count, int shape,
-                            float R, float H,
-                            float surface_bias,
-                            float ox, float oy, float oz,
-                            uint32_t seed)
+static float dist3(const float* a, const float* b)
+{
+    float dx = a[0] - b[0];
+    float dy = a[1] - b[1];
+    float dz = a[2] - b[2];
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+static void seed_crown_attractors(std::vector<TreeAttractor>& attractors,
+                                  int count, int shape,
+                                  float R, float H,
+                                  float surface_bias,
+                                  float cx, float cy, float cz,
+                                  uint32_t seed)
 {
     attractors.reserve(static_cast<size_t>(count));
     uint32_t attempts = 0;
     int placed = 0;
 
     while (placed < count && attempts < static_cast<uint32_t>(count) * 20u) {
-        float u = bhash_float(seed, attempts * 3u);
-        float v = bhash_float(seed, attempts * 3u + 1u);
-        float w = bhash_float(seed, attempts * 3u + 2u);
+        float u = thash_float(seed, attempts * 3u + 1000u);
+        float v = thash_float(seed, attempts * 3u + 1001u);
+        float w = thash_float(seed, attempts * 3u + 1002u);
         ++attempts;
 
         float lx = (u * 2.0f - 1.0f) * R;
         float ly = v * H;
         float lz = (w * 2.0f - 1.0f) * R;
 
-        if (!inside_envelope(shape, lx, ly, lz, R, H))
+        if (!inside_crown(shape, lx, ly, lz, R, H))
             continue;
 
-        // Surface bias: push radially outward
         if (surface_bias > 0.001f) {
             float dist = std::sqrt(lx * lx + lz * lz);
             float max_r = R;
-            if (shape == 3) { // cone narrows with height
+            if (shape == 3) {
                 float t = (H - ly) / H;
                 max_r = R * t;
             }
@@ -104,54 +112,66 @@ static void seed_attractors(std::vector<Attractor>& attractors,
                 float scale = biased / norm_r;
                 lx *= scale;
                 lz *= scale;
-                if (!inside_envelope(shape, lx, ly, lz, R, H))
+                if (!inside_crown(shape, lx, ly, lz, R, H))
                     continue;
             }
         }
 
-        Attractor a{};
-        a.pos[0] = ox + lx;
-        a.pos[1] = oy + ly;
-        a.pos[2] = oz + lz;
+        TreeAttractor a{};
+        a.pos[0] = cx + lx;
+        a.pos[1] = cy + ly;
+        a.pos[2] = cz + lz;
         a.alive  = true;
         attractors.push_back(a);
         ++placed;
     }
 }
 
-static float dist3(const float* a, const float* b)
+static void build_trunk(std::vector<TreeNode>& nodes,
+                        float ox, float oz,
+                        float trunk_height, float trunk_width,
+                        float step_d, uint32_t seed)
 {
-    float dx = a[0] - b[0];
-    float dy = a[1] - b[1];
-    float dz = a[2] - b[2];
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
-}
+    int trunk_steps = std::max(static_cast<int>(trunk_height / step_d), 1);
+    float actual_step = trunk_height / static_cast<float>(trunk_steps);
 
-static void grow_skeleton(std::vector<ColNode>& nodes,
-                          std::vector<Attractor>& attractors,
-                          int n_stems, float D, float d_k, float d_i,
-                          float tropism, float gravity, float wobble,
-                          int shape, float R, float H,
-                          float ox, float oy, float oz,
-                          uint32_t seed)
-{
-    constexpr float pi = 3.14159265f;
+    TreeNode root{};
+    root.pos[0] = ox;
+    root.pos[1] = 0.0f;
+    root.pos[2] = oz;
+    root.parent = -1;
+    root.width  = trunk_width;
+    root.child_count = 0;
+    root.depth  = 0;
+    root.is_trunk = true;
+    nodes.push_back(root);
 
-    for (int s = 0; s < n_stems; ++s) {
-        float angle = static_cast<float>(s) * (2.0f * pi / static_cast<float>(n_stems))
-                    + bhash_float(seed, static_cast<uint32_t>(s) + 500u) * 0.5f;
-        float sr = 0.015f;
-        ColNode n{};
-        n.pos[0] = ox + sr * std::cos(angle);
-        n.pos[1] = oy;
-        n.pos[2] = oz + sr * std::sin(angle);
-        n.parent = -1;
-        n.width  = 0.0f;
+    for (int i = 1; i <= trunk_steps; ++i) {
+        float wobble_x = (thash_float(seed, static_cast<uint32_t>(i) * 2u + 300u) - 0.5f) * step_d * 0.1f;
+        float wobble_z = (thash_float(seed, static_cast<uint32_t>(i) * 2u + 301u) - 0.5f) * step_d * 0.1f;
+
+        TreeNode n{};
+        n.pos[0] = ox + wobble_x;
+        n.pos[1] = static_cast<float>(i) * actual_step;
+        n.pos[2] = oz + wobble_z;
+        n.parent = static_cast<int>(nodes.size()) - 1;
+        n.width  = trunk_width * (1.0f - 0.3f * static_cast<float>(i) / static_cast<float>(trunk_steps));
         n.child_count = 0;
-        n.depth  = 0;
+        n.depth  = i;
+        n.is_trunk = true;
+        nodes.back().child_count += 1;
         nodes.push_back(n);
     }
+}
 
+static void grow_crown(std::vector<TreeNode>& nodes,
+                       std::vector<TreeAttractor>& attractors,
+                       float D, float d_k, float d_i,
+                       float tropism, float gravity, float wobble,
+                       int shape, float R, float H,
+                       float cx, float cy, float cz,
+                       uint32_t seed)
+{
     struct GrowDir { float dx, dy, dz; int count; };
     std::vector<GrowDir> dirs;
     float min_sep = D * 0.5f;
@@ -203,17 +223,15 @@ static void grow_skeleton(std::vector<ColNode>& nodes,
             float dy = g.dy + tropism * 0.3f;
             float dz = g.dz;
 
-            // Gravity droop proportional to depth
             float depth_frac = static_cast<float>(nodes[ni].depth) /
                                std::max(static_cast<float>(iter + 5), 1.0f);
             dy -= gravity * depth_frac * 0.5f;
 
-            // Wobble: random perturbation
             if (wobble > 0.001f) {
                 uint32_t wi = static_cast<uint32_t>(iter * 1000 + ni);
-                dx += (bhash_float(seed, wi * 3u + 700u) - 0.5f) * wobble;
-                dy += (bhash_float(seed, wi * 3u + 701u) - 0.5f) * wobble * 0.5f;
-                dz += (bhash_float(seed, wi * 3u + 702u) - 0.5f) * wobble;
+                dx += (thash_float(seed, wi * 3u + 700u) - 0.5f) * wobble;
+                dy += (thash_float(seed, wi * 3u + 701u) - 0.5f) * wobble * 0.5f;
+                dz += (thash_float(seed, wi * 3u + 702u) - 0.5f) * wobble;
             }
 
             float len = std::sqrt(dx * dx + dy * dy + dz * dz);
@@ -226,12 +244,10 @@ static void grow_skeleton(std::vector<ColNode>& nodes,
                 nodes[ni].pos[2] + dz * D
             };
 
-            // Reject if outside envelope
-            float lx = np[0] - ox, ly = np[1] - oy, lz = np[2] - oz;
-            if (!inside_envelope(shape, lx, ly, lz, R, H))
+            float lx = np[0] - cx, ly = np[1] - cy, lz_local = np[2] - cz;
+            if (!inside_crown(shape, lx, ly, lz_local, R, H))
                 continue;
 
-            // Reject if too close to existing node
             bool too_close = false;
             for (size_t mi = 0; mi < nodes.size(); ++mi) {
                 if (dist3(np, nodes[mi].pos) < min_sep) {
@@ -241,12 +257,13 @@ static void grow_skeleton(std::vector<ColNode>& nodes,
             }
             if (too_close) continue;
 
-            ColNode cn{};
+            TreeNode cn{};
             cn.pos[0] = np[0]; cn.pos[1] = np[1]; cn.pos[2] = np[2];
             cn.parent = static_cast<int>(ni);
             cn.width  = 0.0f;
             cn.child_count = 0;
             cn.depth  = nodes[ni].depth + 1;
+            cn.is_trunk = false;
             nodes[ni].child_count += 1;
             nodes.push_back(cn);
         }
@@ -255,20 +272,24 @@ static void grow_skeleton(std::vector<ColNode>& nodes,
     }
 }
 
-static void compute_widths(std::vector<ColNode>& nodes, float taper_exp,
-                           float min_w, float max_w)
+static void compute_tree_widths(std::vector<TreeNode>& nodes, float taper_exp,
+                                float min_w, float max_w)
 {
 
-    for (auto& n : nodes)
+    for (auto& n : nodes) {
+        if (n.is_trunk) continue;
         n.width = (n.child_count == 0) ? min_w : 0.0f;
+    }
 
     for (int i = static_cast<int>(nodes.size()) - 1; i >= 0; --i) {
         auto& n = nodes[static_cast<size_t>(i)];
-        if (n.parent >= 0) {
+        if (n.parent >= 0 && !n.is_trunk) {
             auto& p = nodes[static_cast<size_t>(n.parent)];
-            p.width = std::pow(
-                std::pow(p.width, taper_exp) + std::pow(n.width, taper_exp),
-                1.0f / taper_exp);
+            if (!p.is_trunk) {
+                p.width = std::pow(
+                    std::pow(p.width, taper_exp) + std::pow(n.width, taper_exp),
+                    1.0f / taper_exp);
+            }
         }
     }
 
@@ -280,47 +301,10 @@ static void compute_widths(std::vector<ColNode>& nodes, float taper_exp,
 // Mesh emission
 // -----------------------------------------------------------------------
 
-static void emit_stem(VegetationMesh& mesh, const BushParams& params,
-                      float ox, float oz)
+static void emit_trunk_and_branches(VegetationMesh& mesh,
+                                    const std::vector<TreeNode>& nodes,
+                                    const float trunk_color[3])
 {
-    if (params.stem_height < 0.001f) return;
-
-    float sw = 0.012f;
-    float sh = params.stem_height;
-    const float sc[3] = {0.35f, 0.25f, 0.15f};
-
-    for (int q = 0; q < 2; ++q) {
-        float dx = (q == 0) ? sw : 0.0f;
-        float dz = (q == 0) ? 0.0f : sw;
-        auto si = static_cast<uint32_t>(mesh.vertices.size());
-
-        float corners[4][3] = {
-            {ox - dx, 0.0f, oz - dz},
-            {ox + dx, 0.0f, oz + dz},
-            {ox + dx, sh,   oz + dz},
-            {ox - dx, sh,   oz - dz},
-        };
-        float nx = (q == 0) ? 0.0f : 1.0f;
-        float nz = (q == 0) ? 1.0f : 0.0f;
-
-        for (auto& c : corners) {
-            VegetationVertex v{};
-            v.position[0] = c[0]; v.position[1] = c[1]; v.position[2] = c[2];
-            v.normal[0] = nx; v.normal[1] = 0.0f; v.normal[2] = nz;
-            v.color[0] = sc[0]; v.color[1] = sc[1]; v.color[2] = sc[2];
-            mesh.vertices.push_back(v);
-        }
-        mesh.indices.push_back(si);     mesh.indices.push_back(si + 1); mesh.indices.push_back(si + 2);
-        mesh.indices.push_back(si);     mesh.indices.push_back(si + 2); mesh.indices.push_back(si + 3);
-        mesh.indices.push_back(si);     mesh.indices.push_back(si + 2); mesh.indices.push_back(si + 1);
-        mesh.indices.push_back(si);     mesh.indices.push_back(si + 3); mesh.indices.push_back(si + 2);
-    }
-}
-
-static void emit_branches(VegetationMesh& mesh, const std::vector<ColNode>& nodes)
-{
-    const float bc[3] = {0.35f, 0.25f, 0.15f};
-
     for (size_t i = 0; i < nodes.size(); ++i) {
         const auto& n = nodes[i];
         if (n.parent < 0) continue;
@@ -333,7 +317,6 @@ static void emit_branches(VegetationMesh& mesh, const std::vector<ColNode>& node
         if (len < 0.0001f) continue;
         dx /= len; dy /= len; dz /= len;
 
-        // Tangent frame
         float ref_x = 0.0f, ref_y = 1.0f, ref_z = 0.0f;
         if (std::abs(dy) > 0.95f) { ref_x = 1.0f; ref_y = 0.0f; }
 
@@ -350,6 +333,14 @@ static void emit_branches(VegetationMesh& mesh, const std::vector<ColNode>& node
 
         float w0 = p.width;
         float w1 = n.width;
+
+        // Darken branch color for smaller branches
+        float branch_dark = n.is_trunk ? 1.0f : 0.8f;
+        float bc[3] = {
+            trunk_color[0] * branch_dark,
+            trunk_color[1] * branch_dark,
+            trunk_color[2] * branch_dark
+        };
 
         for (int q = 0; q < 2; ++q) {
             float px = (q == 0) ? rx : ux;
@@ -383,8 +374,11 @@ static void emit_branches(VegetationMesh& mesh, const std::vector<ColNode>& node
     }
 }
 
-static void place_leaves(VegetationMesh& mesh, const std::vector<ColNode>& nodes,
-                         const BushParams& params, uint32_t seed)
+static void place_tree_leaves(VegetationMesh& mesh,
+                              const std::vector<TreeNode>& nodes,
+                              const TreeParams& params,
+                              float /*crown_base_y*/,
+                              uint32_t seed)
 {
     constexpr float pi = 3.14159265f;
     constexpr float golden_angle = 2.39996323f;
@@ -396,12 +390,12 @@ static void place_leaves(VegetationMesh& mesh, const std::vector<ColNode>& nodes
         if (n.depth > max_depth) max_depth = n.depth;
     if (max_depth == 0) max_depth = 1;
 
-    // Collect leaf placement sites: terminal nodes and outer interior nodes
     std::vector<size_t> tip_sites;
     std::vector<size_t> interior_sites;
     int depth_thresh = max_depth / 2;
 
     for (size_t i = 0; i < nodes.size(); ++i) {
+        if (nodes[i].is_trunk) continue;
         if (nodes[i].child_count == 0)
             tip_sites.push_back(i);
         else if (nodes[i].depth >= depth_thresh)
@@ -414,7 +408,8 @@ static void place_leaves(VegetationMesh& mesh, const std::vector<ColNode>& nodes
         static_cast<float>(params.leaf_count) * params.tip_leaf_bias));
     int n_interior = params.leaf_count - n_tip;
 
-    // Distribute leaves across sites
+    float total_height = params.trunk_height + params.crown_height;
+
     auto emit_leaves_at_sites = [&](const std::vector<size_t>& sites, int total_leaves, int leaf_offset) {
         if (sites.empty() || total_leaves <= 0) return;
 
@@ -425,7 +420,6 @@ static void place_leaves(VegetationMesh& mesh, const std::vector<ColNode>& nodes
         for (size_t si = 0; si < sites.size() && remaining > 0; ++si) {
             const auto& node = nodes[sites[si]];
             int count = std::min(per_site, remaining);
-            // Last site gets all remaining
             if (si == sites.size() - 1) count = remaining;
 
             for (int li = 0; li < count; ++li) {
@@ -435,26 +429,22 @@ static void place_leaves(VegetationMesh& mesh, const std::vector<ColNode>& nodes
                 float size_scale = 1.0f - 0.4f * depth_frac;
 
                 float leaf_azimuth = static_cast<float>(global_i) * golden_angle;
-                float spread = params.bush_radius * 0.15f;
-                float jitter_r = spread * (0.3f + 0.7f * bhash_float(seed, ui * 4u + 200u));
+                float spread = params.crown_radius * 0.1f;
+                float jitter_r = spread * (0.3f + 0.7f * thash_float(seed, ui * 4u + 200u));
 
                 float lx = node.pos[0] + std::cos(leaf_azimuth) * jitter_r;
                 float lz = node.pos[2] + std::sin(leaf_azimuth) * jitter_r;
-                float ly = node.pos[1] + (bhash_float(seed, ui * 4u + 201u) - 0.3f) * params.bush_height * 0.1f;
+                float ly = node.pos[1] + (thash_float(seed, ui * 4u + 201u) - 0.3f) * params.crown_height * 0.05f;
 
-                // Outward direction from bush center
                 float out_x = lx - node.pos[0];
                 float out_y = 0.3f;
                 float out_z = lz - node.pos[2];
-
-                // Droop: tilt downward
                 out_y -= params.leaf_droop * 0.5f;
 
                 float olen = std::sqrt(out_x * out_x + out_y * out_y + out_z * out_z);
                 if (olen < 0.001f) { out_x = 0.0f; out_y = 1.0f; out_z = 0.0f; olen = 1.0f; }
                 out_x /= olen; out_y /= olen; out_z /= olen;
 
-                // Build leaf tangent frame
                 float ref_x = 0.0f, ref_y = 1.0f, ref_z = 0.0f;
                 if (std::abs(out_y) > 0.95f) { ref_x = 1.0f; ref_y = 0.0f; }
 
@@ -469,7 +459,7 @@ static void place_leaves(VegetationMesh& mesh, const std::vector<ColNode>& nodes
                 float uuy = out_z * rrx - out_x * rrz;
                 float uuz = out_x * rry - out_y * rrx;
 
-                float twist = bhash_float(seed, ui * 4u + 202u) * pi;
+                float twist = thash_float(seed, ui * 4u + 202u) * pi;
                 float cos_t = std::cos(twist);
                 float sin_t = std::sin(twist);
                 float tr_x = rrx * cos_t + uux * sin_t;
@@ -482,7 +472,7 @@ static void place_leaves(VegetationMesh& mesh, const std::vector<ColNode>& nodes
                 float hl = params.leaf_length * 0.5f * size_scale;
                 float hw = params.leaf_width * 0.5f * size_scale;
 
-                float height_frac = (ly - params.stem_height) / std::max(params.bush_height, 0.01f);
+                float height_frac = ly / std::max(total_height, 0.01f);
                 float base_ht = std::clamp(height_frac, 0.0f, 1.0f);
 
                 auto vi_base = static_cast<uint32_t>(mesh.vertices.size());
@@ -495,7 +485,7 @@ static void place_leaves(VegetationMesh& mesh, const std::vector<ColNode>& nodes
                     { -hw,  0.0f, 0.5f},
                 };
 
-                float color_var = 0.9f + 0.2f * bhash_float(seed, ui * 4u + 203u);
+                float color_var = 0.9f + 0.2f * thash_float(seed, ui * 4u + 203u);
 
                 for (auto& pt : pts) {
                     VegetationVertex v{};
@@ -529,97 +519,104 @@ static void place_leaves(VegetationMesh& mesh, const std::vector<ColNode>& nodes
 // Public API
 // -----------------------------------------------------------------------
 
-BushParams evaluate_bush_expression(const BushParams& base,
-                                    const BushExpression& expr,
+TreeParams evaluate_tree_expression(const TreeParams& base,
+                                    const TreeExpression& expr,
                                     float moisture)
 {
     float t = std::clamp(moisture, 0.0f, 1.0f);
-    BushParams out = base;
+    TreeParams out = base;
 
+    if (expr.tree_height.enabled)
+        out.tree_height = tlerp(expr.tree_height.low, expr.tree_height.high, t);
+    if (expr.trunk_height.enabled)
+        out.trunk_height = tlerp(expr.trunk_height.low, expr.trunk_height.high, t);
+    if (expr.crown_radius.enabled)
+        out.crown_radius = tlerp(expr.crown_radius.low, expr.crown_radius.high, t);
+    if (expr.crown_height.enabled)
+        out.crown_height = tlerp(expr.crown_height.low, expr.crown_height.high, t);
+    if (expr.trunk_width.enabled)
+        out.trunk_width = tlerp(expr.trunk_width.low, expr.trunk_width.high, t);
     if (expr.leaf_count.enabled)
-        out.leaf_count = std::clamp(static_cast<int>(std::round(blerp(expr.leaf_count.low, expr.leaf_count.high, t))), 1, 80);
+        out.leaf_count = std::clamp(static_cast<int>(std::round(tlerp(expr.leaf_count.low, expr.leaf_count.high, t))), 1, 2000);
     if (expr.leaf_length.enabled)
-        out.leaf_length = blerp(expr.leaf_length.low, expr.leaf_length.high, t);
+        out.leaf_length = tlerp(expr.leaf_length.low, expr.leaf_length.high, t);
     if (expr.leaf_width.enabled)
-        out.leaf_width = blerp(expr.leaf_width.low, expr.leaf_width.high, t);
-    if (expr.bush_height.enabled)
-        out.bush_height = blerp(expr.bush_height.low, expr.bush_height.high, t);
-    if (expr.bush_radius.enabled)
-        out.bush_radius = blerp(expr.bush_radius.low, expr.bush_radius.high, t);
-    if (expr.stem_height.enabled)
-        out.stem_height = blerp(expr.stem_height.low, expr.stem_height.high, t);
-
-    if (expr.n_stems.enabled)
-        out.n_stems = std::clamp(static_cast<int>(std::round(blerp(expr.n_stems.low, expr.n_stems.high, t))), 1, 8);
+        out.leaf_width = tlerp(expr.leaf_width.low, expr.leaf_width.high, t);
     if (expr.attractor_count.enabled)
-        out.attractor_count = std::clamp(static_cast<int>(std::round(blerp(expr.attractor_count.low, expr.attractor_count.high, t))), 50, 2000);
+        out.attractor_count = std::clamp(static_cast<int>(std::round(tlerp(expr.attractor_count.low, expr.attractor_count.high, t))), 100, 3000);
     if (expr.kill_ratio.enabled)
-        out.kill_ratio = blerp(expr.kill_ratio.low, expr.kill_ratio.high, t);
+        out.kill_ratio = tlerp(expr.kill_ratio.low, expr.kill_ratio.high, t);
     if (expr.influence_ratio.enabled)
-        out.influence_ratio = blerp(expr.influence_ratio.low, expr.influence_ratio.high, t);
+        out.influence_ratio = tlerp(expr.influence_ratio.low, expr.influence_ratio.high, t);
     if (expr.tropism.enabled)
-        out.tropism = blerp(expr.tropism.low, expr.tropism.high, t);
+        out.tropism = tlerp(expr.tropism.low, expr.tropism.high, t);
     if (expr.surface_bias.enabled)
-        out.surface_bias = blerp(expr.surface_bias.low, expr.surface_bias.high, t);
+        out.surface_bias = tlerp(expr.surface_bias.low, expr.surface_bias.high, t);
     if (expr.branch_width_min.enabled)
-        out.branch_width_min = blerp(expr.branch_width_min.low, expr.branch_width_min.high, t);
+        out.branch_width_min = tlerp(expr.branch_width_min.low, expr.branch_width_min.high, t);
     if (expr.branch_width_max.enabled)
-        out.branch_width_max = blerp(expr.branch_width_max.low, expr.branch_width_max.high, t);
+        out.branch_width_max = tlerp(expr.branch_width_max.low, expr.branch_width_max.high, t);
     if (expr.branch_gravity.enabled)
-        out.branch_gravity = blerp(expr.branch_gravity.low, expr.branch_gravity.high, t);
+        out.branch_gravity = tlerp(expr.branch_gravity.low, expr.branch_gravity.high, t);
     if (expr.branch_wobble.enabled)
-        out.branch_wobble = blerp(expr.branch_wobble.low, expr.branch_wobble.high, t);
+        out.branch_wobble = tlerp(expr.branch_wobble.low, expr.branch_wobble.high, t);
+    if (expr.branch_taper.enabled)
+        out.branch_taper = tlerp(expr.branch_taper.low, expr.branch_taper.high, t);
     if (expr.tip_leaf_bias.enabled)
-        out.tip_leaf_bias = blerp(expr.tip_leaf_bias.low, expr.tip_leaf_bias.high, t);
+        out.tip_leaf_bias = tlerp(expr.tip_leaf_bias.low, expr.tip_leaf_bias.high, t);
     if (expr.leaf_droop.enabled)
-        out.leaf_droop = blerp(expr.leaf_droop.low, expr.leaf_droop.high, t);
+        out.leaf_droop = tlerp(expr.leaf_droop.low, expr.leaf_droop.high, t);
 
     if (expr.vary_color) {
         for (int i = 0; i < 3; ++i)
-            out.base_color[i] = blerp(expr.dry_color[i], expr.wet_color[i], t);
+            out.base_color[i] = tlerp(expr.dry_color[i], expr.wet_color[i], t);
     }
 
     return out;
 }
 
-VegetationMesh generate_bush(const BushParams& params, uint32_t seed,
-                        bool include_ground,
-                        float offset_x, float offset_z)
+VegetationMesh generate_tree(const TreeParams& params, uint32_t seed,
+                             bool include_ground,
+                             float offset_x, float offset_z)
 {
     VegetationMesh mesh;
 
-    float R = params.bush_radius;
-    float H = params.bush_height;
-    float D = std::max(std::max(H, R * 2.0f) / 20.0f, 0.005f);
+    float R = params.crown_radius;
+    float H = params.crown_height;
+    float D = std::max(std::max(H, R * 2.0f) / 20.0f, 0.01f);
     float d_k = D * params.kill_ratio;
     float d_i = D * params.influence_ratio;
 
-    float oy = params.stem_height;
+    // Crown center is at the top of the trunk
+    float crown_base_y = params.trunk_height;
 
-    // 1. Seed attraction points
-    std::vector<Attractor> attractors;
-    seed_attractors(attractors, params.attractor_count, params.envelope_shape,
-                    R, H, params.surface_bias,
-                    offset_x, oy, offset_z, seed);
+    // 1. Build trunk
+    std::vector<TreeNode> nodes;
+    build_trunk(nodes, offset_x, offset_z,
+                params.trunk_height, params.trunk_width, D, seed);
 
-    // 2. Grow branch skeleton
-    std::vector<ColNode> nodes;
-    grow_skeleton(nodes, attractors, params.n_stems, D, d_k, d_i,
-                  params.tropism, params.branch_gravity, params.branch_wobble,
-                  params.envelope_shape,
-                  R, H, offset_x, oy, offset_z, seed);
+    // 2. Seed attractors in crown volume
+    std::vector<TreeAttractor> attractors;
+    seed_crown_attractors(attractors, params.attractor_count, params.crown_shape,
+                          R, H, params.surface_bias,
+                          offset_x, crown_base_y, offset_z, seed);
 
-    // 3. Compute branch widths
-    compute_widths(nodes, params.branch_taper,
-                   params.branch_width_min, params.branch_width_max);
+    // 3. Grow crown branches from trunk top
+    grow_crown(nodes, attractors, D, d_k, d_i,
+               params.tropism, params.branch_gravity, params.branch_wobble,
+               params.crown_shape,
+               R, H, offset_x, crown_base_y, offset_z, seed);
 
-    // 4. Emit geometry
-    emit_stem(mesh, params, offset_x, offset_z);
-    emit_branches(mesh, nodes);
-    place_leaves(mesh, nodes, params, seed);
+    // 4. Compute branch widths (crown only; trunk widths are set during build)
+    compute_tree_widths(nodes, params.branch_taper,
+                        params.branch_width_min, params.branch_width_max);
+
+    // 5. Emit geometry
+    emit_trunk_and_branches(mesh, nodes, params.trunk_color);
+    place_tree_leaves(mesh, nodes, params, crown_base_y, seed);
 
     if (include_ground) {
-        float gs = std::max(params.bush_radius * 2.0f, 0.2f) + 0.1f;
+        float gs = std::max(params.crown_radius * 2.0f, 1.0f) + 0.5f;
         auto gi = static_cast<uint32_t>(mesh.vertices.size());
 
         const float gc[3] = {0.25f, 0.20f, 0.15f};
@@ -643,10 +640,10 @@ VegetationMesh generate_bush(const BushParams& params, uint32_t seed,
     return mesh;
 }
 
-VegetationMesh generate_bush_field(const BushParams& base,
-                              const BushExpression& expr,
-                              const FieldParams& field,
-                              uint32_t base_seed)
+VegetationMesh generate_tree_field(const TreeParams& base,
+                                   const TreeExpression& expr,
+                                   const FieldParams& field,
+                                   uint32_t base_seed)
 {
     VegetationMesh mesh;
     float extent = static_cast<float>(field.grid_n - 1) * field.spacing;
@@ -659,10 +656,10 @@ VegetationMesh generate_bush_field(const BushParams& base,
                 ? static_cast<float>(ix) / static_cast<float>(field.grid_n - 1)
                 : 0.5f;
 
-            BushParams resolved = evaluate_bush_expression(base, expr, moisture);
+            TreeParams resolved = evaluate_tree_expression(base, expr, moisture);
             uint32_t seed = base_seed + static_cast<uint32_t>(iz * field.grid_n + ix);
 
-            auto cell = generate_bush(resolved, seed, false, x, z);
+            auto cell = generate_tree(resolved, seed, false, x, z);
 
             auto vert_offset = static_cast<uint32_t>(mesh.vertices.size());
             mesh.vertices.insert(mesh.vertices.end(),

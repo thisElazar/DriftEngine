@@ -48,11 +48,11 @@ ClumpParams evaluate_expression(const ClumpParams& base,
     return out;
 }
 
-ClumpMesh generate_clump(const ClumpParams& params, uint32_t seed,
+VegetationMesh generate_clump(const ClumpParams& params, uint32_t seed,
                          bool include_ground,
                          float offset_x, float offset_z)
 {
-    ClumpMesh mesh;
+    VegetationMesh mesh;
 
     constexpr int   segments        = 5;
     constexpr float tip_width_ratio = 0.1f;
@@ -103,7 +103,7 @@ ClumpMesh generate_clump(const ClumpParams& params, uint32_t seed,
             float cy =          blade_up_y * height;
             float cz = base_z + blade_up_z * height;
 
-            ClumpVertex left{};
+            VegetationVertex left{};
             left.position[0] = cx - tan_x * hw;
             left.position[1] = cy;
             left.position[2] = cz - tan_z * hw;
@@ -113,7 +113,7 @@ ClumpMesh generate_clump(const ClumpParams& params, uint32_t seed,
             left.color[2] = params.base_color[2];
             left.height_t = t;
 
-            ClumpVertex right{};
+            VegetationVertex right{};
             right.position[0] = cx + tan_x * hw;
             right.position[1] = cy;
             right.position[2] = cz + tan_z * hw;
@@ -157,7 +157,7 @@ ClumpMesh generate_clump(const ClumpParams& params, uint32_t seed,
             {offset_x - gs, 0.0f, offset_z + gs}
         };
         for (auto& c : corners) {
-            ClumpVertex v{};
+            VegetationVertex v{};
             v.position[0] = c[0]; v.position[1] = c[1]; v.position[2] = c[2];
             v.normal[0] = gn[0];  v.normal[1] = gn[1];  v.normal[2] = gn[2];
             v.color[0]  = gc[0];  v.color[1]  = gc[1];  v.color[2]  = gc[2];
@@ -170,12 +170,12 @@ ClumpMesh generate_clump(const ClumpParams& params, uint32_t seed,
     return mesh;
 }
 
-ClumpMesh generate_field(const ClumpParams& base,
+VegetationMesh generate_field(const ClumpParams& base,
                          const ClumpExpression& expr,
                          const FieldParams& field,
                          uint32_t base_seed)
 {
-    ClumpMesh mesh;
+    VegetationMesh mesh;
     float extent = static_cast<float>(field.grid_n - 1) * field.spacing;
 
     for (int iz = 0; iz < field.grid_n; ++iz) {
@@ -211,7 +211,7 @@ ClumpMesh generate_field(const ClumpParams& base,
         { half, 0.0f,  half}, {-half, 0.0f,  half}
     };
     for (auto& c : corners) {
-        ClumpVertex v{};
+        VegetationVertex v{};
         v.position[0] = c[0]; v.position[1] = c[1]; v.position[2] = c[2];
         v.normal[0] = gn[0];  v.normal[1] = gn[1];  v.normal[2] = gn[2];
         v.color[0]  = gc[0];  v.color[1]  = gc[1];  v.color[2]  = gc[2];

@@ -16,7 +16,10 @@
 
 #include "morphology/clump.h"
 #include "morphology/bush.h"
+#include "morphology/tree.h"
 #include "species_file.h"
+#include "environment.h"
+#include "distribution.h"
 
 #include <filesystem>
 #include <fstream>
@@ -190,18 +193,18 @@ ClumpPipeline create_clump_pipeline(VkDevice device)
 
     VkVertexInputBindingDescription vb{};
     vb.binding   = 0;
-    vb.stride    = sizeof(bestiary::ClumpVertex);
+    vb.stride    = sizeof(bestiary::VegetationVertex);
     vb.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
     VkVertexInputAttributeDescription attrs[4]{};
     attrs[0].location = 0;  attrs[0].binding = 0;
-    attrs[0].format   = VK_FORMAT_R32G32B32_SFLOAT;  attrs[0].offset = offsetof(bestiary::ClumpVertex, position);
+    attrs[0].format   = VK_FORMAT_R32G32B32_SFLOAT;  attrs[0].offset = offsetof(bestiary::VegetationVertex, position);
     attrs[1].location = 1;  attrs[1].binding = 0;
-    attrs[1].format   = VK_FORMAT_R32G32B32_SFLOAT;  attrs[1].offset = offsetof(bestiary::ClumpVertex, normal);
+    attrs[1].format   = VK_FORMAT_R32G32B32_SFLOAT;  attrs[1].offset = offsetof(bestiary::VegetationVertex, normal);
     attrs[2].location = 2;  attrs[2].binding = 0;
-    attrs[2].format   = VK_FORMAT_R32G32B32_SFLOAT;  attrs[2].offset = offsetof(bestiary::ClumpVertex, color);
+    attrs[2].format   = VK_FORMAT_R32G32B32_SFLOAT;  attrs[2].offset = offsetof(bestiary::VegetationVertex, color);
     attrs[3].location = 3;  attrs[3].binding = 0;
-    attrs[3].format   = VK_FORMAT_R32_SFLOAT;         attrs[3].offset = offsetof(bestiary::ClumpVertex, height_t);
+    attrs[3].format   = VK_FORMAT_R32_SFLOAT;         attrs[3].offset = offsetof(bestiary::VegetationVertex, height_t);
 
     VkPipelineVertexInputStateCreateInfo vi{};
     vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -298,12 +301,12 @@ struct MeshState {
     uint32_t  vertex_count = 0;
 };
 
-void upload_mesh(VmaAllocator allocator, MeshState& ms, const bestiary::ClumpMesh& mesh)
+void upload_mesh(VmaAllocator allocator, MeshState& ms, const bestiary::VegetationMesh& mesh)
 {
     ms.vertex_count = static_cast<uint32_t>(mesh.vertices.size());
     ms.index_count  = static_cast<uint32_t>(mesh.indices.size());
 
-    VkDeviceSize vb_size = mesh.vertices.size() * sizeof(bestiary::ClumpVertex);
+    VkDeviceSize vb_size = mesh.vertices.size() * sizeof(bestiary::VegetationVertex);
     VkDeviceSize ib_size = mesh.indices.size()  * sizeof(uint32_t);
 
     ms.vertex_buf = create_buffer(allocator, vb_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
@@ -374,7 +377,11 @@ struct LabSnapshot {
     bestiary::ClumpExpression  clump_expr;
     bestiary::BushParams       bush_params;
     bestiary::BushExpression   bush_expr;
+    bestiary::TreeParams       tree_params;
+    bestiary::TreeExpression   tree_expr;
     bestiary::FieldParams      field;
+    bestiary::EcosystemParams  eco_params;
+    bestiary::NoiseFieldParams noise_params;
 };
 
 // ---------------------------------------------------------------------------
@@ -383,7 +390,9 @@ struct LabSnapshot {
 void draw_lab_panel(int& species_kind, int& view_mode,
                     bestiary::ClumpParams& clump_params, bestiary::ClumpExpression& clump_expr,
                     bestiary::BushParams& bush_params, bestiary::BushExpression& bush_expr,
+                    bestiary::TreeParams& tree_params, bestiary::TreeExpression& tree_expr,
                     bestiary::FieldParams& field_params,
+                    bestiary::EcosystemParams& eco_params, bestiary::NoiseFieldParams& noise_params,
                     const MeshState& ms, FileIOState& fio, WindState& wind, float dt)
 {
     ImGui_ImplVulkan_NewFrame();
@@ -394,11 +403,11 @@ void draw_lab_panel(int& species_kind, int& view_mode,
     ImGui::SetNextWindowSize(ImVec2(360, 780), ImGuiCond_FirstUseEver);
     ImGui::Begin("Species Lab v0.0.5");
 
-    const char* kinds[] = {"Grass Clump", "Bush"};
-    ImGui::Combo("species", &species_kind, kinds, 2);
+    const char* kinds[] = {"Grass Clump", "Bush", "Tree"};
+    ImGui::Combo("species", &species_kind, kinds, 3);
 
-    const char* modes[] = {"Single", "Field"};
-    ImGui::Combo("mode", &view_mode, modes, 2);
+    const char* modes[] = {"Single", "Field", "Ecosystem"};
+    ImGui::Combo("mode", &view_mode, modes, 3);
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Morphology (base)");
@@ -415,7 +424,7 @@ void draw_lab_panel(int& species_kind, int& view_mode,
         ImGui::TextUnformatted("Appearance");
         ImGui::Separator();
         ImGui::ColorEdit3("base_color", clump_params.base_color);
-    } else {
+    } else if (species_kind == 1) {
         ImGui::SliderInt  ("leaf_count",  &bush_params.leaf_count,  10,    80);
         ImGui::SliderFloat("leaf_length", &bush_params.leaf_length, 0.05f, 0.3f,  "%.3f m");
         ImGui::SliderFloat("leaf_width",  &bush_params.leaf_width,  0.02f, 0.15f, "%.3f m");
@@ -423,10 +432,71 @@ void draw_lab_panel(int& species_kind, int& view_mode,
         ImGui::SliderFloat("bush_radius", &bush_params.bush_radius, 0.05f, 0.5f,  "%.3f m");
         ImGui::SliderFloat("stem_height", &bush_params.stem_height, 0.0f,  0.3f,  "%.3f m");
 
+        if (ImGui::TreeNode("Branching")) {
+            ImGui::SliderInt  ("n_stems",         &bush_params.n_stems,         1,     8);
+            ImGui::SliderInt  ("attractor_count", &bush_params.attractor_count, 50,    2000);
+            ImGui::SliderFloat("kill_ratio",      &bush_params.kill_ratio,      0.5f,  5.0f,  "%.2f");
+            ImGui::SliderFloat("influence_ratio", &bush_params.influence_ratio, 2.0f,  30.0f, "%.1f");
+            ImGui::SliderFloat("tropism",         &bush_params.tropism,        -1.0f,  1.0f,  "%.2f");
+            ImGui::SliderFloat("surface_bias",    &bush_params.surface_bias,    0.0f,  1.0f,  "%.2f");
+            const char* shapes[] = {"Ellipsoid", "Hemisphere", "Cylinder", "Cone"};
+            ImGui::Combo("envelope_shape", &bush_params.envelope_shape, shapes, 4);
+            ImGui::SliderFloat("branch_taper",     &bush_params.branch_taper,     1.5f,   3.5f,  "%.2f");
+            ImGui::SliderFloat("branch_width_min", &bush_params.branch_width_min, 0.001f, 0.02f, "%.3f m");
+            ImGui::SliderFloat("branch_width_max", &bush_params.branch_width_max, 0.01f,  0.1f,  "%.3f m");
+            ImGui::SliderFloat("branch_gravity",   &bush_params.branch_gravity,   0.0f,   1.0f,  "%.2f");
+            ImGui::SliderFloat("branch_wobble",    &bush_params.branch_wobble,    0.0f,   1.0f,  "%.2f");
+            ImGui::TreePop();
+        }
+
+        if (ImGui::TreeNode("Leaf Placement")) {
+            ImGui::SliderFloat("tip_leaf_bias",   &bush_params.tip_leaf_bias,   0.0f,  1.0f,  "%.2f");
+            ImGui::SliderFloat("leaf_droop",      &bush_params.leaf_droop,      0.0f,  1.0f,  "%.2f");
+            ImGui::TreePop();
+        }
+
         ImGui::Spacing();
         ImGui::TextUnformatted("Appearance");
         ImGui::Separator();
         ImGui::ColorEdit3("base_color", bush_params.base_color);
+    } else {
+        ImGui::SliderFloat("tree_height",  &tree_params.tree_height,  1.0f,  15.0f, "%.1f m");
+        ImGui::SliderFloat("trunk_height", &tree_params.trunk_height, 0.5f,  10.0f, "%.1f m");
+        ImGui::SliderFloat("crown_radius", &tree_params.crown_radius, 0.5f,  5.0f,  "%.2f m");
+        ImGui::SliderFloat("crown_height", &tree_params.crown_height, 0.5f,  8.0f,  "%.1f m");
+        ImGui::SliderFloat("trunk_width",  &tree_params.trunk_width,  0.02f, 0.3f,  "%.3f m");
+
+        ImGui::SliderInt  ("leaf_count",   &tree_params.leaf_count,   20,    2000);
+        ImGui::SliderFloat("leaf_length",  &tree_params.leaf_length,  0.03f, 0.3f,  "%.3f m");
+        ImGui::SliderFloat("leaf_width",   &tree_params.leaf_width,   0.02f, 0.15f, "%.3f m");
+
+        if (ImGui::TreeNode("Branching")) {
+            ImGui::SliderInt  ("attractor_count",  &tree_params.attractor_count,  100,    3000);
+            ImGui::SliderFloat("kill_ratio",       &tree_params.kill_ratio,       0.5f,   5.0f,  "%.2f");
+            ImGui::SliderFloat("influence_ratio",  &tree_params.influence_ratio,  2.0f,   30.0f, "%.1f");
+            ImGui::SliderFloat("tropism",          &tree_params.tropism,         -1.0f,   1.0f,  "%.2f");
+            ImGui::SliderFloat("surface_bias",     &tree_params.surface_bias,     0.0f,   1.0f,  "%.2f");
+            const char* shapes[] = {"Ellipsoid", "Hemisphere", "Cylinder", "Cone"};
+            ImGui::Combo("crown_shape", &tree_params.crown_shape, shapes, 4);
+            ImGui::SliderFloat("branch_taper",     &tree_params.branch_taper,     1.5f,   3.5f,  "%.2f");
+            ImGui::SliderFloat("branch_width_min", &tree_params.branch_width_min, 0.001f, 0.03f, "%.3f m");
+            ImGui::SliderFloat("branch_width_max", &tree_params.branch_width_max, 0.02f,  0.3f,  "%.3f m");
+            ImGui::SliderFloat("branch_gravity",   &tree_params.branch_gravity,   0.0f,   1.0f,  "%.2f");
+            ImGui::SliderFloat("branch_wobble",    &tree_params.branch_wobble,    0.0f,   1.0f,  "%.2f");
+            ImGui::TreePop();
+        }
+
+        if (ImGui::TreeNode("Leaf Placement")) {
+            ImGui::SliderFloat("tip_leaf_bias",   &tree_params.tip_leaf_bias,   0.0f,  1.0f,  "%.2f");
+            ImGui::SliderFloat("leaf_droop",      &tree_params.leaf_droop,      0.0f,  1.0f,  "%.2f");
+            ImGui::TreePop();
+        }
+
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Appearance");
+        ImGui::Separator();
+        ImGui::ColorEdit3("base_color",  tree_params.base_color);
+        ImGui::ColorEdit3("trunk_color", tree_params.trunk_color);
     }
 
     auto range_ui = [](const char* label, bestiary::ParamRange& r,
@@ -465,13 +535,25 @@ void draw_lab_panel(int& species_kind, int& view_mode,
                 ImGui::ColorEdit3("wet_color", clump_expr.wet_color);
                 ImGui::Unindent();
             }
-        } else {
-            range_ui("leaf_count",  bush_expr.leaf_count,  10.0f, 80.0f, "%.0f");
-            range_ui("leaf_length", bush_expr.leaf_length, 0.05f, 0.3f,  "%.3f m");
-            range_ui("leaf_width",  bush_expr.leaf_width,  0.02f, 0.15f, "%.3f m");
-            range_ui("bush_height", bush_expr.bush_height, 0.1f,  1.5f,  "%.2f m");
-            range_ui("bush_radius", bush_expr.bush_radius, 0.05f, 0.5f,  "%.3f m");
-            range_ui("stem_height", bush_expr.stem_height, 0.0f,  0.3f,  "%.3f m");
+        } else if (species_kind == 1) {
+            range_ui("leaf_count",      bush_expr.leaf_count,      10.0f, 80.0f,   "%.0f");
+            range_ui("leaf_length",    bush_expr.leaf_length,    0.05f, 0.3f,    "%.3f m");
+            range_ui("leaf_width",     bush_expr.leaf_width,     0.02f, 0.15f,   "%.3f m");
+            range_ui("bush_height",    bush_expr.bush_height,    0.1f,  1.5f,    "%.2f m");
+            range_ui("bush_radius",    bush_expr.bush_radius,    0.05f, 0.5f,    "%.3f m");
+            range_ui("stem_height",    bush_expr.stem_height,    0.0f,  0.3f,    "%.3f m");
+            range_ui("n_stems",        bush_expr.n_stems,        1.0f,  8.0f,    "%.0f");
+            range_ui("attractor_count",bush_expr.attractor_count,50.0f, 2000.0f, "%.0f");
+            range_ui("kill_ratio",     bush_expr.kill_ratio,     0.5f,  5.0f,    "%.2f");
+            range_ui("influence_ratio",bush_expr.influence_ratio,2.0f,  30.0f,   "%.1f");
+            range_ui("tropism",        bush_expr.tropism,       -1.0f,  1.0f,    "%.2f");
+            range_ui("surface_bias",    bush_expr.surface_bias,    0.0f,   1.0f,    "%.2f");
+            range_ui("branch_width_min",bush_expr.branch_width_min,0.001f,0.02f, "%.3f m");
+            range_ui("branch_width_max",bush_expr.branch_width_max,0.01f, 0.1f,  "%.3f m");
+            range_ui("branch_gravity", bush_expr.branch_gravity,  0.0f,   1.0f,   "%.2f");
+            range_ui("branch_wobble",  bush_expr.branch_wobble,   0.0f,   1.0f,   "%.2f");
+            range_ui("tip_leaf_bias",  bush_expr.tip_leaf_bias,   0.0f,   1.0f,   "%.2f");
+            range_ui("leaf_droop",     bush_expr.leaf_droop,      0.0f,   1.0f,   "%.2f");
 
             ImGui::Spacing();
             ImGui::Checkbox("vary_color", &bush_expr.vary_color);
@@ -481,13 +563,85 @@ void draw_lab_panel(int& species_kind, int& view_mode,
                 ImGui::ColorEdit3("wet_color", bush_expr.wet_color);
                 ImGui::Unindent();
             }
+        } else {
+            range_ui("tree_height",     tree_expr.tree_height,     1.0f,  15.0f,   "%.1f m");
+            range_ui("trunk_height",    tree_expr.trunk_height,    0.5f,  10.0f,   "%.1f m");
+            range_ui("crown_radius",    tree_expr.crown_radius,    0.5f,  5.0f,    "%.2f m");
+            range_ui("crown_height",    tree_expr.crown_height,    0.5f,  8.0f,    "%.1f m");
+            range_ui("trunk_width",     tree_expr.trunk_width,     0.02f, 0.3f,    "%.3f m");
+            range_ui("leaf_count",      tree_expr.leaf_count,      20.0f, 400.0f,  "%.0f");
+            range_ui("leaf_length",     tree_expr.leaf_length,     0.03f, 0.3f,    "%.3f m");
+            range_ui("leaf_width",      tree_expr.leaf_width,      0.02f, 0.15f,   "%.3f m");
+            range_ui("attractor_count", tree_expr.attractor_count, 100.0f,3000.0f, "%.0f");
+            range_ui("kill_ratio",      tree_expr.kill_ratio,      0.5f,  5.0f,    "%.2f");
+            range_ui("influence_ratio", tree_expr.influence_ratio, 2.0f,  30.0f,   "%.1f");
+            range_ui("tropism",         tree_expr.tropism,        -1.0f,  1.0f,    "%.2f");
+            range_ui("surface_bias",     tree_expr.surface_bias,     0.0f,   1.0f,    "%.2f");
+            range_ui("branch_width_min",tree_expr.branch_width_min, 0.001f,0.03f,  "%.3f m");
+            range_ui("branch_width_max",tree_expr.branch_width_max, 0.02f, 0.3f,   "%.3f m");
+            range_ui("branch_gravity",  tree_expr.branch_gravity,   0.0f,  1.0f,    "%.2f");
+            range_ui("branch_wobble",   tree_expr.branch_wobble,    0.0f,  1.0f,    "%.2f");
+            range_ui("tip_leaf_bias",   tree_expr.tip_leaf_bias,    0.0f,  1.0f,    "%.2f");
+            range_ui("leaf_droop",      tree_expr.leaf_droop,       0.0f,  1.0f,    "%.2f");
+
+            ImGui::Spacing();
+            ImGui::Checkbox("vary_color", &tree_expr.vary_color);
+            if (tree_expr.vary_color) {
+                ImGui::Indent();
+                ImGui::ColorEdit3("dry_color", tree_expr.dry_color);
+                ImGui::ColorEdit3("wet_color", tree_expr.wet_color);
+                ImGui::Unindent();
+            }
         }
 
+        if (view_mode == 1) {
+            ImGui::Spacing();
+            ImGui::TextUnformatted("Field Settings");
+            ImGui::Separator();
+            ImGui::SliderInt("grid_n",    &field_params.grid_n,  2,    16);
+            float max_spacing = (species_kind == 2) ? 8.0f : 1.0f;
+            ImGui::SliderFloat("spacing", &field_params.spacing, 0.1f, max_spacing, "%.2f m");
+        }
+    }
+
+    if (view_mode == 2) {
         ImGui::Spacing();
-        ImGui::TextUnformatted("Field Settings");
+        ImGui::TextUnformatted("Environment");
         ImGui::Separator();
-        ImGui::SliderInt("grid_n",    &field_params.grid_n,  2,    16);
-        ImGui::SliderFloat("spacing", &field_params.spacing, 0.1f, 1.0f, "%.2f m");
+        ImGui::SliderFloat("region_size",   &eco_params.region_size,   5.0f, 40.0f, "%.0f m");
+        ImGui::SliderFloat("density_scale", &eco_params.density_scale, 0.1f, 3.0f,  "%.2f");
+        ImGui::SliderFloat("r_min",         &eco_params.r_min,         0.1f, 2.0f,  "%.2f m");
+        ImGui::SliderFloat("r_max",         &eco_params.r_max,         1.0f, 8.0f,  "%.1f m");
+        int seed_int = static_cast<int>(eco_params.seed);
+        if (ImGui::SliderInt("seed", &seed_int, 0, 999))
+            eco_params.seed = static_cast<uint32_t>(seed_int);
+        ImGui::SliderFloat("moisture_freq", &noise_params.moisture_freq, 0.5f, 5.0f, "%.2f");
+        ImGui::SliderFloat("temp_freq",     &noise_params.temp_freq,     0.5f, 5.0f, "%.2f");
+
+        auto suit_ui = [](const char* label, bool& enabled, bestiary::SpeciesSuitability& s) {
+            ImGui::PushID(label);
+            ImGui::Checkbox(label, &enabled);
+            if (enabled && ImGui::TreeNode("##suit")) {
+                ImGui::SliderFloat("moisture min/max", &s.moisture_min, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("moisture opt lo",  &s.moisture_opt_lo, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("moisture opt hi",  &s.moisture_opt_hi, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("moisture max",     &s.moisture_max, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("temp min",         &s.temp_min, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("temp opt lo",      &s.temp_opt_lo, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("temp opt hi",      &s.temp_opt_hi, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("temp max",         &s.temp_max, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("base_density",     &s.base_density, 0.01f, 10.0f, "%.2f");
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        };
+
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Species");
+        ImGui::Separator();
+        suit_ui("Grass", eco_params.grass_enabled, eco_params.grass_suit);
+        suit_ui("Bush",  eco_params.bush_enabled,  eco_params.bush_suit);
+        suit_ui("Tree",  eco_params.tree_enabled,  eco_params.tree_suit);
     }
 
     ImGui::Spacing();
@@ -508,8 +662,10 @@ void draw_lab_panel(int& species_kind, int& view_mode,
         bool ok = false;
         if (species_kind == 0)
             ok = bestiary::save_clump(path, clump_params, fio.name_buf, &clump_expr);
-        else
+        else if (species_kind == 1)
             ok = bestiary::save_bush(path, bush_params, fio.name_buf, &bush_expr);
+        else
+            ok = bestiary::save_tree(path, tree_params, fio.name_buf, &tree_expr);
         fio.set_status(ok ? "Saved." : "Save failed.");
         if (ok) fio.refresh_files();
     }
@@ -525,6 +681,9 @@ void draw_lab_panel(int& species_kind, int& view_mode,
         } else if (kind == "bush") {
             ok = bestiary::load_bush(path, bush_params, loaded_name, &bush_expr);
             if (ok) species_kind = 1;
+        } else if (kind == "tree") {
+            ok = bestiary::load_tree(path, tree_params, loaded_name, &tree_expr);
+            if (ok) species_kind = 2;
         }
         if (ok) {
             std::snprintf(fio.name_buf, sizeof(fio.name_buf), "%s", loaded_name.c_str());
@@ -720,7 +879,11 @@ int main()
     bestiary::ClumpExpression  clump_expr{};
     bestiary::BushParams       bush_params{};
     bestiary::BushExpression   bush_expr{};
+    bestiary::TreeParams       tree_params{};
+    bestiary::TreeExpression   tree_expr{};
     bestiary::FieldParams      field_params{};
+    bestiary::EcosystemParams  eco_params{};
+    bestiary::NoiseFieldParams noise_params{};
     int species_kind = 0;
     int view_mode = 0;
     int last_view_mode = -1;
@@ -742,11 +905,15 @@ int main()
         last_time = now;
 
         glfwPollEvents();
-        float max_zoom = (view_mode == 1) ? 20.0f : 5.0f;
+        float max_zoom = (view_mode == 2) ? 60.0f : (view_mode == 1) ? 40.0f : (species_kind == 2 ? 25.0f : 5.0f);
         update_orbit(camera, renderer.window, max_zoom);
 
         if (view_mode != last_view_mode) {
-            if (view_mode == 1) {
+            if (view_mode == 2) {
+                camera.distance = eco_params.region_size * 0.8f;
+                camera.target   = {0.0f, 0.5f, 0.0f};
+                camera.pitch    = 0.7f;
+            } else if (view_mode == 1) {
                 float field_extent = static_cast<float>(field_params.grid_n - 1) * field_params.spacing;
                 camera.distance = field_extent * 1.2f;
                 camera.target   = {0.0f, 0.1f, 0.0f};
@@ -767,13 +934,25 @@ int main()
         current.clump_expr   = clump_expr;
         current.bush_params  = bush_params;
         current.bush_expr    = bush_expr;
+        current.tree_params  = tree_params;
+        current.tree_expr    = tree_expr;
         current.field        = field_params;
+        current.eco_params   = eco_params;
+        current.noise_params = noise_params;
 
         if (std::memcmp(&current, &last_snapshot, sizeof(LabSnapshot)) != 0) {
             vkDeviceWaitIdle(renderer.device);
             destroy_mesh(renderer.allocator, mesh);
 
-            if (species_kind == 0) {
+            if (view_mode == 2) {
+                auto env = bestiary::make_noise_field(noise_params);
+                auto m = bestiary::generate_ecosystem(
+                    eco_params, env,
+                    clump_params, clump_expr,
+                    bush_params, bush_expr,
+                    tree_params, tree_expr);
+                upload_mesh(renderer.allocator, mesh, m);
+            } else if (species_kind == 0) {
                 if (view_mode == 0) {
                     auto m = bestiary::generate_clump(clump_params);
                     upload_mesh(renderer.allocator, mesh, m);
@@ -781,12 +960,20 @@ int main()
                     auto m = bestiary::generate_field(clump_params, clump_expr, field_params);
                     upload_mesh(renderer.allocator, mesh, m);
                 }
-            } else {
+            } else if (species_kind == 1) {
                 if (view_mode == 0) {
                     auto m = bestiary::generate_bush(bush_params);
                     upload_mesh(renderer.allocator, mesh, m);
                 } else {
                     auto m = bestiary::generate_bush_field(bush_params, bush_expr, field_params);
+                    upload_mesh(renderer.allocator, mesh, m);
+                }
+            } else {
+                if (view_mode == 0) {
+                    auto m = bestiary::generate_tree(tree_params);
+                    upload_mesh(renderer.allocator, mesh, m);
+                } else {
+                    auto m = bestiary::generate_tree_field(tree_params, tree_expr, field_params);
                     upload_mesh(renderer.allocator, mesh, m);
                 }
             }
@@ -795,7 +982,9 @@ int main()
 
         draw_lab_panel(species_kind, view_mode,
                        clump_params, clump_expr, bush_params, bush_expr,
-                       field_params, mesh, fio, wind, dt);
+                       tree_params, tree_expr,
+                       field_params, eco_params, noise_params,
+                       mesh, fio, wind, dt);
 
         FrameData* frame = nullptr;
         uint32_t   image_index = 0;

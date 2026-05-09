@@ -24,16 +24,16 @@ struct ClumpParams {
     float base_color[3] = {0.42f, 0.55f, 0.22f};
 };
 
-struct ClumpVertex {
+struct VegetationVertex {
     float position[3];
     float normal[3];
     float color[3];
     float height_t;
 };
 
-struct ClumpMesh {
-    std::vector<ClumpVertex> vertices;
-    std::vector<uint32_t>    indices;
+struct VegetationMesh {
+    std::vector<VegetationVertex> vertices;
+    std::vector<uint32_t>         indices;
 };
 
 struct ParamRange {
@@ -63,11 +63,11 @@ ClumpParams evaluate_expression(const ClumpParams& base,
                                 const ClumpExpression& expr,
                                 float moisture);
 
-ClumpMesh generate_clump(const ClumpParams& params, uint32_t seed = 0,
+VegetationMesh generate_clump(const ClumpParams& params, uint32_t seed = 0,
                          bool include_ground = true,
                          float offset_x = 0.0f, float offset_z = 0.0f);
 
-ClumpMesh generate_field(const ClumpParams& base,
+VegetationMesh generate_field(const ClumpParams& base,
                          const ClumpExpression& expr,
                          const FieldParams& field,
                          uint32_t base_seed = 0);
