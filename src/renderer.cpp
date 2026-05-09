@@ -156,7 +156,7 @@ void renderer_init(Renderer& r, int width, int height, const char* title)
     VK_CHECK(vkCreateQueryPool(r.device, &qp_ci, nullptr, &r.query_pool));
 
     ImGui::CreateContext();
-    ImGui_ImplGlfw_InitForVulkan(r.window, true);
+    ImGui_ImplGlfw_InitForVulkan(r.window, false);
 
     VkDescriptorPoolSize imgui_pool_sizes[] = {
         {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000}

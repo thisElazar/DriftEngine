@@ -359,6 +359,7 @@ int main()
     glfwSetMouseButtonCallback(window, mouse_button_callback);
     glfwSetCursorPosCallback(window, cursor_pos_callback);
     glfwSetScrollCallback(window, scroll_callback);
+    ImGui_ImplGlfw_InstallCallbacks(window);
 
     // ---- Procedural basin ---------------------------------------------------
     BasinParams bp;
