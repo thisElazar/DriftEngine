@@ -113,6 +113,30 @@ struct SandRenderPC {
     float    _pad;
 };
 
+struct PlanetSweInitPC {
+    uint32_t grid_w;
+    uint32_t grid_h;
+    float    sea_level;
+    uint32_t pool_index;
+};
+
+struct PlanetSweStepPC {
+    float    time;
+    float    dt;
+    float    gravity;
+    float    friction;
+    float    dx;
+    float    sea_level;
+    float    damping;
+    uint32_t pool_index;
+    uint32_t grid_w;
+    uint32_t grid_h;
+    float    pulse_x;
+    float    pulse_y;
+    float    pulse_radius;
+    float    pulse_amount;
+};
+
 struct PlanetTilePC {
     float    rel_x, rel_y, rel_z;
     float    u_min, v_min, tile_size;
@@ -122,6 +146,7 @@ struct PlanetTilePC {
     float    max_elevation;
     float    heightmap_texel;
     float    cloud_opacity;
+    float    sea_level;
 };
 
 struct PlanetGenPC {
@@ -161,6 +186,8 @@ struct Pipelines {
     VkShaderModule sand_render_vs = VK_NULL_HANDLE;
     VkShaderModule sand_render_fs = VK_NULL_HANDLE;
     VkShaderModule terrain_gen_shader = VK_NULL_HANDLE;
+    VkShaderModule planet_swe_init_shader = VK_NULL_HANDLE;
+    VkShaderModule planet_swe_step_shader = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout swe_init_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout swe_step_desc_layout = VK_NULL_HANDLE;
@@ -171,6 +198,8 @@ struct Pipelines {
     VkDescriptorSetLayout terrain_gen_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout sand_sim_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout sand_render_desc_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout planet_swe_init_desc_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout planet_swe_step_desc_layout = VK_NULL_HANDLE;
 
     VkPipelineLayout swe_init_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout swe_step_pipeline_layout = VK_NULL_HANDLE;
@@ -183,6 +212,8 @@ struct Pipelines {
     VkPipelineLayout atmo_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout sand_sim_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout sand_render_pipeline_layout = VK_NULL_HANDLE;
+    VkPipelineLayout planet_swe_init_pipeline_layout = VK_NULL_HANDLE;
+    VkPipelineLayout planet_swe_step_pipeline_layout = VK_NULL_HANDLE;
 
     VkPipeline swe_init_pipeline = VK_NULL_HANDLE;
     VkPipeline swe_step_pipeline = VK_NULL_HANDLE;
@@ -196,6 +227,8 @@ struct Pipelines {
     VkPipeline atmo_pipeline = VK_NULL_HANDLE;
     VkPipeline sand_sim_pipeline = VK_NULL_HANDLE;
     VkPipeline sand_render_pipeline = VK_NULL_HANDLE;
+    VkPipeline planet_swe_init_pipeline = VK_NULL_HANDLE;
+    VkPipeline planet_swe_step_pipeline = VK_NULL_HANDLE;
 };
 
 std::vector<uint32_t> load_spirv(const char* path);

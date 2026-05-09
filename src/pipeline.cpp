@@ -660,6 +660,120 @@ void pipelines_create(Pipelines& p, VkDevice device)
         VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.terrain_gen_pipeline));
     }
 
+    // ---- Planet SWE init pipeline -----------------------------------------------
+    {
+        VkDescriptorSetLayoutBinding bindings[2]{};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        VkDescriptorSetLayoutCreateInfo dsl_ci{};
+        dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dsl_ci.bindingCount = 2;
+        dsl_ci.pBindings = bindings;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &dsl_ci, nullptr, &p.planet_swe_init_desc_layout));
+
+        VkPushConstantRange push{};
+        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        push.offset = 0;
+        push.size = sizeof(PlanetSweInitPC);
+
+        VkPipelineLayoutCreateInfo pl_ci{};
+        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pl_ci.setLayoutCount = 1;
+        pl_ci.pSetLayouts = &p.planet_swe_init_desc_layout;
+        pl_ci.pushConstantRangeCount = 1;
+        pl_ci.pPushConstantRanges = &push;
+        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.planet_swe_init_pipeline_layout));
+
+        auto spv = load_spirv("shaders/planet_swe_init_cs.spv");
+        VkShaderModuleCreateInfo sm_ci{};
+        sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        sm_ci.codeSize = spv.size() * sizeof(uint32_t);
+        sm_ci.pCode = spv.data();
+        VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &p.planet_swe_init_shader));
+
+        VkPipelineShaderStageCreateInfo stage{};
+        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = p.planet_swe_init_shader;
+        stage.pName = "main";
+
+        VkComputePipelineCreateInfo cp_ci{};
+        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cp_ci.stage = stage;
+        cp_ci.layout = p.planet_swe_init_pipeline_layout;
+        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.planet_swe_init_pipeline));
+    }
+
+    // ---- Planet SWE step pipeline -----------------------------------------------
+    {
+        VkDescriptorSetLayoutBinding bindings[4]{};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        bindings[2].binding = 2;
+        bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[2].descriptorCount = 1;
+        bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        bindings[3].binding = 3;
+        bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[3].descriptorCount = 1;
+        bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        VkDescriptorSetLayoutCreateInfo dsl_ci{};
+        dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dsl_ci.bindingCount = 4;
+        dsl_ci.pBindings = bindings;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &dsl_ci, nullptr, &p.planet_swe_step_desc_layout));
+
+        VkPushConstantRange push{};
+        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        push.offset = 0;
+        push.size = sizeof(PlanetSweStepPC);
+
+        VkPipelineLayoutCreateInfo pl_ci{};
+        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pl_ci.setLayoutCount = 1;
+        pl_ci.pSetLayouts = &p.planet_swe_step_desc_layout;
+        pl_ci.pushConstantRangeCount = 1;
+        pl_ci.pPushConstantRanges = &push;
+        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.planet_swe_step_pipeline_layout));
+
+        auto spv = load_spirv("shaders/planet_swe_step_cs.spv");
+        VkShaderModuleCreateInfo sm_ci{};
+        sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        sm_ci.codeSize = spv.size() * sizeof(uint32_t);
+        sm_ci.pCode = spv.data();
+        VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &p.planet_swe_step_shader));
+
+        VkPipelineShaderStageCreateInfo stage{};
+        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = p.planet_swe_step_shader;
+        stage.pName = "main";
+
+        VkComputePipelineCreateInfo cp_ci{};
+        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cp_ci.stage = stage;
+        cp_ci.layout = p.planet_swe_step_pipeline_layout;
+        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.planet_swe_step_pipeline));
+    }
+
     // ---- Atmosphere pipeline layout + pipeline ---------------------------------
     VkPushConstantRange atmo_push{};
     atmo_push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -895,8 +1009,10 @@ void pipelines_reload(Pipelines& p, VkDevice device)
         {"../shaders/sand_render.vs.hlsl",   "shaders/sand_render_vs.spv",   "vertex"},
         {"../shaders/sand_render.fs.hlsl",   "shaders/sand_render_fs.spv",   "fragment"},
         {"../shaders/planet_gen.cs.hlsl",    "shaders/planet_gen_cs.spv",    "compute"},
+        {"../shaders/planet_swe_init.cs.hlsl", "shaders/planet_swe_init_cs.spv", "compute"},
+        {"../shaders/planet_swe_step.cs.hlsl", "shaders/planet_swe_step_cs.spv", "compute"},
     };
-    constexpr int NUM_SHADERS = 15;
+    constexpr int NUM_SHADERS = 17;
 
     // Compile all shaders first; abort on any failure
     for (int i = 0; i < NUM_SHADERS; ++i) {
@@ -946,6 +1062,8 @@ void pipelines_reload(Pipelines& p, VkDevice device)
     vkDestroyShaderModule(device, p.sand_render_vs, nullptr);
     vkDestroyShaderModule(device, p.sand_render_fs, nullptr);
     vkDestroyShaderModule(device, p.terrain_gen_shader, nullptr);
+    vkDestroyShaderModule(device, p.planet_swe_init_shader, nullptr);
+    vkDestroyShaderModule(device, p.planet_swe_step_shader, nullptr);
 
     // Destroy old pipelines
     vkDestroyPipeline(device, p.swe_init_pipeline, nullptr);
@@ -960,6 +1078,8 @@ void pipelines_reload(Pipelines& p, VkDevice device)
     vkDestroyPipeline(device, p.sand_render_pipeline, nullptr);
     vkDestroyPipeline(device, p.terrain_gen_pipeline, nullptr);
     vkDestroyPipeline(device, p.clipmap_terrain_pipeline, nullptr);
+    vkDestroyPipeline(device, p.planet_swe_init_pipeline, nullptr);
+    vkDestroyPipeline(device, p.planet_swe_step_pipeline, nullptr);
 
     // Destroy old pipeline layouts
     vkDestroyPipelineLayout(device, p.swe_init_pipeline_layout, nullptr);
@@ -973,6 +1093,8 @@ void pipelines_reload(Pipelines& p, VkDevice device)
     vkDestroyPipelineLayout(device, p.sand_render_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.terrain_gen_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.clipmap_gfx_pipeline_layout, nullptr);
+    vkDestroyPipelineLayout(device, p.planet_swe_init_pipeline_layout, nullptr);
+    vkDestroyPipelineLayout(device, p.planet_swe_step_pipeline_layout, nullptr);
 
     // Reload SPIR-V and recreate shader modules
     {
@@ -1094,6 +1216,22 @@ void pipelines_reload(Pipelines& p, VkDevice device)
         ci.codeSize = spv.size() * sizeof(uint32_t);
         ci.pCode = spv.data();
         VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.terrain_gen_shader));
+    }
+    {
+        auto spv = load_spirv("shaders/planet_swe_init_cs.spv");
+        VkShaderModuleCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        ci.codeSize = spv.size() * sizeof(uint32_t);
+        ci.pCode = spv.data();
+        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.planet_swe_init_shader));
+    }
+    {
+        auto spv = load_spirv("shaders/planet_swe_step_cs.spv");
+        VkShaderModuleCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        ci.codeSize = spv.size() * sizeof(uint32_t);
+        ci.pCode = spv.data();
+        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.planet_swe_step_shader));
     }
 
     // Recreate pipeline layouts
@@ -1252,6 +1390,34 @@ void pipelines_reload(Pipelines& p, VkDevice device)
         pl_ci.pPushConstantRanges = &push;
         VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.clipmap_gfx_pipeline_layout));
     }
+    {
+        VkPushConstantRange push{};
+        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        push.offset = 0;
+        push.size = sizeof(PlanetSweInitPC);
+
+        VkPipelineLayoutCreateInfo pl_ci{};
+        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pl_ci.setLayoutCount = 1;
+        pl_ci.pSetLayouts = &p.planet_swe_init_desc_layout;
+        pl_ci.pushConstantRangeCount = 1;
+        pl_ci.pPushConstantRanges = &push;
+        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.planet_swe_init_pipeline_layout));
+    }
+    {
+        VkPushConstantRange push{};
+        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        push.offset = 0;
+        push.size = sizeof(PlanetSweStepPC);
+
+        VkPipelineLayoutCreateInfo pl_ci{};
+        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pl_ci.setLayoutCount = 1;
+        pl_ci.pSetLayouts = &p.planet_swe_step_desc_layout;
+        pl_ci.pushConstantRangeCount = 1;
+        pl_ci.pPushConstantRanges = &push;
+        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.planet_swe_step_pipeline_layout));
+    }
 
     // Recreate compute pipelines
     {
@@ -1344,6 +1510,32 @@ void pipelines_reload(Pipelines& p, VkDevice device)
         cp_ci.stage = stage;
         cp_ci.layout = p.terrain_gen_pipeline_layout;
         VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.terrain_gen_pipeline));
+    }
+    {
+        VkPipelineShaderStageCreateInfo stage{};
+        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = p.planet_swe_init_shader;
+        stage.pName = "main";
+
+        VkComputePipelineCreateInfo cp_ci{};
+        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cp_ci.stage = stage;
+        cp_ci.layout = p.planet_swe_init_pipeline_layout;
+        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.planet_swe_init_pipeline));
+    }
+    {
+        VkPipelineShaderStageCreateInfo stage{};
+        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = p.planet_swe_step_shader;
+        stage.pName = "main";
+
+        VkComputePipelineCreateInfo cp_ci{};
+        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cp_ci.stage = stage;
+        cp_ci.layout = p.planet_swe_step_pipeline_layout;
+        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.planet_swe_step_pipeline));
     }
 
     // Recreate graphics pipelines (terrain + water)
@@ -1585,6 +1777,8 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
     vkDestroyPipeline(device, p.gfx_pipeline, nullptr);
     vkDestroyPipeline(device, p.swe_step_pipeline, nullptr);
     vkDestroyPipeline(device, p.swe_init_pipeline, nullptr);
+    vkDestroyPipeline(device, p.planet_swe_init_pipeline, nullptr);
+    vkDestroyPipeline(device, p.planet_swe_step_pipeline, nullptr);
 
     // Destroy pipeline layouts
     vkDestroyPipelineLayout(device, p.clipmap_gfx_pipeline_layout, nullptr);
@@ -1598,6 +1792,8 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
     vkDestroyPipelineLayout(device, p.gfx_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.swe_step_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.swe_init_pipeline_layout, nullptr);
+    vkDestroyPipelineLayout(device, p.planet_swe_init_pipeline_layout, nullptr);
+    vkDestroyPipelineLayout(device, p.planet_swe_step_pipeline_layout, nullptr);
 
     // Destroy descriptor set layouts
     vkDestroyDescriptorSetLayout(device, p.sand_render_desc_layout, nullptr);
@@ -1609,6 +1805,8 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
     vkDestroyDescriptorSetLayout(device, p.gfx_desc_layout, nullptr);
     vkDestroyDescriptorSetLayout(device, p.swe_step_desc_layout, nullptr);
     vkDestroyDescriptorSetLayout(device, p.swe_init_desc_layout, nullptr);
+    vkDestroyDescriptorSetLayout(device, p.planet_swe_init_desc_layout, nullptr);
+    vkDestroyDescriptorSetLayout(device, p.planet_swe_step_desc_layout, nullptr);
 
     // Destroy shader modules
     vkDestroyShaderModule(device, p.terrain_gen_shader, nullptr);
@@ -1626,4 +1824,6 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
     vkDestroyShaderModule(device, p.terrain_vs, nullptr);
     vkDestroyShaderModule(device, p.swe_step_shader, nullptr);
     vkDestroyShaderModule(device, p.swe_init_shader, nullptr);
+    vkDestroyShaderModule(device, p.planet_swe_init_shader, nullptr);
+    vkDestroyShaderModule(device, p.planet_swe_step_shader, nullptr);
 }

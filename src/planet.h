@@ -8,6 +8,11 @@ struct QuadNode {
     uint32_t face;
     uint32_t level;
     uint32_t x, y;
+
+    bool operator==(const QuadNode& o) const {
+        return face == o.face && level == o.level && x == o.x && y == o.y;
+    }
+    bool operator!=(const QuadNode& o) const { return !(*this == o); }
 };
 
 glm::vec3  planet_face_uv_to_cube(float u, float v, uint32_t face);

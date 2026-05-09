@@ -335,6 +335,44 @@ int main()
     VkImageView clipmap_hm_view = VK_NULL_HANDLE;
     VK_CHECK(vkCreateImageView(device, &clip_hm_view_ci, nullptr, &clipmap_hm_view));
 
+    // ---- Water state tile pools (per-tile SWE) ---------------------------------
+    auto create_water_array = [&](VkImage& img, VmaAllocation& alloc, VkImageView& view) {
+        VkImageCreateInfo ci{};
+        ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ci.imageType = VK_IMAGE_TYPE_2D;
+        ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ci.extent = {PLANET_TILE_RES, PLANET_TILE_RES, 1};
+        ci.mipLevels = 1;
+        ci.arrayLayers = PLANET_TILE_POOL;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                 | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        VmaAllocationCreateInfo ai{};
+        ai.usage = VMA_MEMORY_USAGE_AUTO;
+        ai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+        VK_CHECK(vmaCreateImage(allocator, &ci, &ai, &img, &alloc, nullptr));
+
+        VkImageViewCreateInfo v_ci{};
+        v_ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        v_ci.image = img;
+        v_ci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        v_ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        v_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PLANET_TILE_POOL};
+        VK_CHECK(vkCreateImageView(device, &v_ci, nullptr, &view));
+    };
+
+    VkImage water_state_a_img = VK_NULL_HANDLE, water_state_b_img = VK_NULL_HANDLE, water_output_img = VK_NULL_HANDLE;
+    VmaAllocation water_state_a_alloc = VK_NULL_HANDLE, water_state_b_alloc = VK_NULL_HANDLE, water_output_alloc = VK_NULL_HANDLE;
+    VkImageView water_state_a_view = VK_NULL_HANDLE, water_state_b_view = VK_NULL_HANDLE, water_output_view = VK_NULL_HANDLE;
+
+    create_water_array(water_state_a_img, water_state_a_alloc, water_state_a_view);
+    create_water_array(water_state_b_img, water_state_b_alloc, water_state_b_view);
+    create_water_array(water_output_img, water_output_alloc, water_output_view);
+
     // ---- Sand particle buffer --------------------------------------------------
     VkBufferCreateInfo sand_buf_ci{};
     sand_buf_ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -380,19 +418,19 @@ int main()
     // Counts: SWE init(2) + SWE step×2(8) + terrain brush(1) + gfx(4 incl sediment) + erosion×2(8) = needs ~23 descriptors
     VkDescriptorPoolSize pool_sizes[5]{};
     pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    pool_sizes[0].descriptorCount = 25;
+    pool_sizes[0].descriptorCount = 35;
     pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    pool_sizes[1].descriptorCount = 16;
+    pool_sizes[1].descriptorCount = 22;
     pool_sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     pool_sizes[2].descriptorCount = 4;
     pool_sizes[3].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    pool_sizes[3].descriptorCount = 42;
+    pool_sizes[3].descriptorCount = 48;
     pool_sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     pool_sizes[4].descriptorCount = 5;
 
     VkDescriptorPoolCreateInfo dp_ci{};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dp_ci.maxSets = 20;
+    dp_ci.maxSets = 25;
     dp_ci.poolSizeCount = 5;
     dp_ci.pPoolSizes = pool_sizes;
 
@@ -1149,7 +1187,7 @@ int main()
         clip_heightmap_info.sampler = sampler;
 
         VkDescriptorImageInfo swe_out_info{};
-        swe_out_info.imageView = swe_output.view;
+        swe_out_info.imageView = water_output_view;
         swe_out_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         swe_out_info.sampler = sampler;
 
@@ -1255,6 +1293,127 @@ int main()
         }
     }
 
+    // ---- Planet SWE descriptor sets -------------------------------------------
+    VkDescriptorSet planet_swe_init_desc_set = VK_NULL_HANDLE;
+    {
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = desc_pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &pipelines.planet_swe_init_desc_layout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &ai, &planet_swe_init_desc_set));
+
+        VkDescriptorImageInfo terrain_info{};
+        terrain_info.imageView = clipmap_hm_view;
+        terrain_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo state_info{};
+        state_info.imageView = water_state_a_view;
+        state_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[2]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = planet_swe_init_desc_set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[0].pImageInfo = &terrain_info;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = planet_swe_init_desc_set;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[1].pImageInfo = &state_info;
+
+        vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+    }
+
+    VkDescriptorSet planet_swe_step_desc_sets[2] = {};
+    {
+        VkDescriptorSetLayout layouts[2] = {pipelines.planet_swe_step_desc_layout, pipelines.planet_swe_step_desc_layout};
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = desc_pool;
+        ai.descriptorSetCount = 2;
+        ai.pSetLayouts = layouts;
+        VK_CHECK(vkAllocateDescriptorSets(device, &ai, planet_swe_step_desc_sets));
+
+        VkDescriptorImageInfo terrain_info{};
+        terrain_info.imageView = clipmap_hm_view;
+        terrain_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo state_a_info{};
+        state_a_info.imageView = water_state_a_view;
+        state_a_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo state_b_info{};
+        state_b_info.imageView = water_state_b_view;
+        state_b_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo output_info{};
+        output_info.imageView = water_output_view;
+        output_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        // Set 0: read A -> write B
+        VkWriteDescriptorSet w0[4]{};
+        w0[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w0[0].dstSet = planet_swe_step_desc_sets[0];
+        w0[0].dstBinding = 0;
+        w0[0].descriptorCount = 1;
+        w0[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        w0[0].pImageInfo = &terrain_info;
+        w0[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w0[1].dstSet = planet_swe_step_desc_sets[0];
+        w0[1].dstBinding = 1;
+        w0[1].descriptorCount = 1;
+        w0[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        w0[1].pImageInfo = &state_a_info;
+        w0[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w0[2].dstSet = planet_swe_step_desc_sets[0];
+        w0[2].dstBinding = 2;
+        w0[2].descriptorCount = 1;
+        w0[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w0[2].pImageInfo = &state_b_info;
+        w0[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w0[3].dstSet = planet_swe_step_desc_sets[0];
+        w0[3].dstBinding = 3;
+        w0[3].descriptorCount = 1;
+        w0[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w0[3].pImageInfo = &output_info;
+        vkUpdateDescriptorSets(device, 4, w0, 0, nullptr);
+
+        // Set 1: read B -> write A
+        VkWriteDescriptorSet w1[4]{};
+        w1[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w1[0].dstSet = planet_swe_step_desc_sets[1];
+        w1[0].dstBinding = 0;
+        w1[0].descriptorCount = 1;
+        w1[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        w1[0].pImageInfo = &terrain_info;
+        w1[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w1[1].dstSet = planet_swe_step_desc_sets[1];
+        w1[1].dstBinding = 1;
+        w1[1].descriptorCount = 1;
+        w1[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        w1[1].pImageInfo = &state_b_info;
+        w1[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w1[2].dstSet = planet_swe_step_desc_sets[1];
+        w1[2].dstBinding = 2;
+        w1[2].descriptorCount = 1;
+        w1[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w1[2].pImageInfo = &state_a_info;
+        w1[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w1[3].dstSet = planet_swe_step_desc_sets[1];
+        w1[3].dstBinding = 3;
+        w1[3].descriptorCount = 1;
+        w1[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w1[3].pImageInfo = &output_info;
+        vkUpdateDescriptorSets(device, 4, w1, 0, nullptr);
+    }
+
+    uint32_t planet_swe_ping_pong = 0;
+
     // ---- SWE init dispatch (one-shot) ---------------------------------------
     {
         VkCommandPoolCreateInfo pool_ci{};
@@ -1279,7 +1438,7 @@ int main()
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
 
-        VkImageMemoryBarrier2 init_barriers[12]{};
+        VkImageMemoryBarrier2 init_barriers[15]{};
         for (int i = 0; i < 12; ++i) {
             init_barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
             init_barriers[i].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
@@ -1323,9 +1482,19 @@ int main()
         init_barriers[11].image = clipmap_hm_image;
         init_barriers[11].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PLANET_TILE_POOL};
 
+        // Water tile pools (UNDEFINED -> GENERAL)
+        for (int i = 12; i < 15; ++i) {
+            init_barriers[i].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            init_barriers[i].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            init_barriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PLANET_TILE_POOL};
+        }
+        init_barriers[12].image = water_state_a_img;
+        init_barriers[13].image = water_state_b_img;
+        init_barriers[14].image = water_output_img;
+
         VkDependencyInfo dep_init{};
         dep_init.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        dep_init.imageMemoryBarrierCount = 12;
+        dep_init.imageMemoryBarrierCount = 15;
         dep_init.pImageMemoryBarriers = init_barriers;
         vkCmdPipelineBarrier2(cmd, &dep_init);
 
@@ -1335,6 +1504,11 @@ int main()
         vkCmdClearColorImage(cmd, sediment_a.image, VK_IMAGE_LAYOUT_GENERAL, &clear_zero, 1, &clear_range);
         vkCmdClearColorImage(cmd, sediment_b.image, VK_IMAGE_LAYOUT_GENERAL, &clear_zero, 1, &clear_range);
         vkCmdClearColorImage(cmd, sand_deposit.image, VK_IMAGE_LAYOUT_GENERAL, &clear_zero, 1, &clear_range);
+
+        VkImageSubresourceRange water_clear_range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PLANET_TILE_POOL};
+        vkCmdClearColorImage(cmd, water_state_a_img, VK_IMAGE_LAYOUT_GENERAL, &clear_zero, 1, &water_clear_range);
+        vkCmdClearColorImage(cmd, water_state_b_img, VK_IMAGE_LAYOUT_GENERAL, &clear_zero, 1, &water_clear_range);
+        vkCmdClearColorImage(cmd, water_output_img, VK_IMAGE_LAYOUT_GENERAL, &clear_zero, 1, &water_clear_range);
         vkCmdFillBuffer(cmd, sand_particle_buf, 0, SAND_MAX_PARTICLES * 32, 0);
 
         VkImageMemoryBarrier2 sed_after_clear[2]{};
@@ -1430,6 +1604,8 @@ int main()
     uint32_t sediment_ping_pong = 0;
     uint32_t atmo_ping_pong = 0;
     bool atmo_needs_init = true;
+    std::vector<QuadNode> prev_visible_tiles;
+    bool planet_swe_needs_full_init = true;
     double last_time = glfwGetTime();
 
     constexpr int AVG_FRAMES = 30;
@@ -1741,8 +1917,10 @@ int main()
         {
             auto cam_result = camera_update(g_camera, window, dt, PLANET_RADIUS,
                 [](glm::vec3 dir) {
-                    return cpu_terrain_height_with_stamps(dir, g_stamps.data(),
+                    float h = cpu_terrain_height_with_stamps(dir, g_stamps.data(),
                         static_cast<uint32_t>(g_stamps.size()));
+                    if (g_ui.ocean_enabled) h = std::max(h, g_ui.sea_level);
+                    return h;
                 });
             g_terrain_height_at_cam = cam_result.terrain_height_at_cam;
             g_altitude_above_terrain = cam_result.altitude_above_terrain;
@@ -1926,6 +2104,12 @@ int main()
         tp.max_tiles = PLANET_TILE_POOL;
         tp.altitude_above_terrain = g_altitude_above_terrain;
         auto visible_tiles = planet_select_visible_tiles(tp);
+        std::sort(visible_tiles.begin(), visible_tiles.end(), [](const QuadNode& a, const QuadNode& b) {
+            if (a.face != b.face) return a.face < b.face;
+            if (a.level != b.level) return a.level < b.level;
+            if (a.x != b.x) return a.x < b.x;
+            return a.y < b.y;
+        });
         g_ui.visible_tile_count = static_cast<uint32_t>(visible_tiles.size());
         {
 
@@ -1961,18 +2145,129 @@ int main()
                 vkCmdDispatch(frame.cmd, (PLANET_TILE_RES + 7) / 8, (PLANET_TILE_RES + 7) / 8, 1);
             }
 
-            // Barrier: compute -> vertex shader
+            // Barrier: compute -> compute+vertex (SWE reads heightmap, then VS reads both)
             VkMemoryBarrier2 gen_bar{};
             gen_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
             gen_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             gen_bar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            gen_bar.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+            gen_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                 | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
             gen_bar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
             VkDependencyInfo gen_dep{};
             gen_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
             gen_dep.memoryBarrierCount = 1;
             gen_dep.pMemoryBarriers = &gen_bar;
             vkCmdPipelineBarrier2(frame.cmd, &gen_dep);
+        }
+
+        // ---- Planet SWE init + step (disabled until water brush is wired) ----
+        if (false && g_ui.ocean_enabled) {
+            // Detect changed tiles and reinitialize water state
+            bool any_init = false;
+            for (uint32_t i = 0; i < visible_tiles.size(); i++) {
+                bool needs_init = planet_swe_needs_full_init
+                    || (i >= prev_visible_tiles.size())
+                    || (visible_tiles[i] != prev_visible_tiles[i]);
+                if (needs_init) {
+                    if (!any_init) {
+                        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipelines.planet_swe_init_pipeline);
+                        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipelines.planet_swe_init_pipeline_layout, 0, 1,
+                            &planet_swe_init_desc_set, 0, nullptr);
+                        any_init = true;
+                    }
+                    PlanetSweInitPC ipc{};
+                    ipc.grid_w = PLANET_TILE_RES;
+                    ipc.grid_h = PLANET_TILE_RES;
+                    ipc.sea_level = g_ui.sea_level;
+                    ipc.pool_index = i;
+                    vkCmdPushConstants(frame.cmd, pipelines.planet_swe_init_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ipc), &ipc);
+                    vkCmdDispatch(frame.cmd, (PLANET_TILE_RES + 7) / 8, (PLANET_TILE_RES + 7) / 8, 1);
+                }
+            }
+            planet_swe_needs_full_init = false;
+            prev_visible_tiles.assign(visible_tiles.begin(), visible_tiles.end());
+
+            if (any_init) {
+                VkMemoryBarrier2 init_bar{};
+                init_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                init_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                init_bar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                init_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                init_bar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                                       | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                VkDependencyInfo dep{};
+                dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                dep.memoryBarrierCount = 1;
+                dep.pMemoryBarriers = &init_bar;
+                vkCmdPipelineBarrier2(frame.cmd, &dep);
+            }
+
+            // SWE step with CFL sub-stepping
+            float swe_total_dt = std::min(dt, 0.033f) * g_ui.time_scale;
+            float min_dx = 1e30f;
+            for (uint32_t i = 0; i < visible_tiles.size(); i++) {
+                float ts = 2.0f / static_cast<float>(1u << visible_tiles[i].level);
+                float tile_dx = ts * PLANET_RADIUS / static_cast<float>(PLANET_TILE_RES - 1);
+                min_dx = std::min(min_dx, tile_dx);
+            }
+            if (min_dx < 1.0f) min_dx = 1.0f;
+
+            float c_max = std::sqrt(g_ui.gravity * 200.0f);
+            float cfl_dt = min_dx / (c_max * 6.0f);
+            int substeps = std::max(1, static_cast<int>(std::ceil(swe_total_dt / cfl_dt)));
+            substeps = std::min(substeps, 16);
+            float sub_dt = swe_total_dt / substeps;
+
+            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipelines.planet_swe_step_pipeline);
+
+            for (int step = 0; step < substeps; ++step) {
+                if (step > 0) {
+                    VkMemoryBarrier2 sub_bar{};
+                    sub_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                    sub_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    sub_bar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    sub_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    sub_bar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                                         | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                    VkDependencyInfo sub_dep{};
+                    sub_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                    sub_dep.memoryBarrierCount = 1;
+                    sub_dep.pMemoryBarriers = &sub_bar;
+                    vkCmdPipelineBarrier2(frame.cmd, &sub_dep);
+                }
+
+                vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    pipelines.planet_swe_step_pipeline_layout, 0, 1,
+                    &planet_swe_step_desc_sets[planet_swe_ping_pong], 0, nullptr);
+
+                for (uint32_t i = 0; i < visible_tiles.size(); i++) {
+                    float ts = 2.0f / static_cast<float>(1u << visible_tiles[i].level);
+                    float tile_dx = ts * PLANET_RADIUS / static_cast<float>(PLANET_TILE_RES - 1);
+
+                    PlanetSweStepPC spc{};
+                    spc.time = static_cast<float>(now);
+                    spc.dt = sub_dt;
+                    spc.gravity = g_ui.gravity;
+                    spc.friction = g_ui.friction;
+                    spc.dx = tile_dx;
+                    spc.sea_level = g_ui.sea_level;
+                    spc.damping = g_ui.damping;
+                    spc.pool_index = i;
+                    spc.grid_w = PLANET_TILE_RES;
+                    spc.grid_h = PLANET_TILE_RES;
+                    spc.pulse_amount = 0.0f;
+
+                    vkCmdPushConstants(frame.cmd, pipelines.planet_swe_step_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(spc), &spc);
+                    vkCmdDispatch(frame.cmd, (PLANET_TILE_RES + 7) / 8, (PLANET_TILE_RES + 7) / 8, 1);
+                }
+
+                planet_swe_ping_pong ^= 1;
+            }
         }
 
         // ---- Atmosphere 3D dispatch ----
@@ -2068,8 +2363,8 @@ int main()
             sand_emit_offset = (sand_emit_offset + SAND_EMIT_PER_FRAME) % SAND_MAX_PARTICLES;
         }
 
-        // ---- SWE step dispatch (CFL sub-stepping) ----
-        {
+        // ---- SWE step dispatch (CFL sub-stepping) — flat grid, disabled when ocean is on ----
+        if (!g_ui.ocean_enabled) {
             vkCmdResetQueryPool(frame.cmd, renderer.query_pool, current_frame * 2, 2);
 
             float swe_total_dt = std::min(dt, 0.033f) * g_ui.time_scale;
@@ -2310,6 +2605,7 @@ int main()
                 tpc.max_elevation = PLANET_MAX_ELEVATION;
                 tpc.heightmap_texel = 1.0f / static_cast<float>(PLANET_TILE_RES);
                 tpc.cloud_opacity = 0.0f;
+                tpc.sea_level = g_ui.ocean_enabled ? g_ui.sea_level : -1.0f;
 
                 vkCmdPushConstants(frame.cmd, pipelines.clipmap_gfx_pipeline_layout,
                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,

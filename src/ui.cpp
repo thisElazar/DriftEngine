@@ -81,6 +81,13 @@ void ui_draw(UIState& s)
             }
         }
 
+        if (ImGui::CollapsingHeader("Ocean", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("Ocean enabled", &s.ocean_enabled);
+            if (s.ocean_enabled) {
+                ImGui::SliderFloat("Sea level (m)", &s.sea_level, 0.0f, 4000.0f, "%.0f m");
+            }
+        }
+
         if (ImGui::CollapsingHeader("Scene")) {
             if (ImGui::Button("Regenerate basin")) s.request_basin_reset = true;
             ImGui::TextDisabled("Pulse: SPACE | Modes: 1=raise 2=lower 3=water 4=sand");

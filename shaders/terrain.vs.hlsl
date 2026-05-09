@@ -11,6 +11,9 @@
 [[vk::combinedImageSampler]][[vk::binding(1, 0)]] Texture2DArray<float> heightmap;
 [[vk::combinedImageSampler]][[vk::binding(1, 0)]] SamplerState heightmap_sampler;
 
+[[vk::combinedImageSampler]][[vk::binding(2, 0)]] Texture2DArray<float4> water_output;
+[[vk::combinedImageSampler]][[vk::binding(2, 0)]] SamplerState water_sampler;
+
 [[vk::push_constant]]
 cbuffer PlanetTilePC {
     float rel_x, rel_y, rel_z;
@@ -21,6 +24,7 @@ cbuffer PlanetTilePC {
     float max_elevation;
     float heightmap_texel;
     float cloud_opacity;
+    float sea_level;
 };
 
 struct VSInput {
@@ -34,6 +38,8 @@ struct VSOutput {
     [[vk::location(2)]] float height_normalized : TEXCOORD1;
     [[vk::location(3)]] float3 world_pos : TEXCOORD2;
     [[vk::location(4)]] float3 sphere_direction : TEXCOORD3;
+    [[vk::location(5)]] float  water_depth : TEXCOORD4;
+    [[vk::location(6)]] float  foam : TEXCOORD5;
 };
 
 static const float GRID_MAX = 63.0;
@@ -66,7 +72,6 @@ float3 cube_to_sphere(float3 p)
 
 VSOutput main(VSInput input)
 {
-    // Detect skirt vertices (grid_pos outside [0, GRID_MAX]) and clamp
     float2 grid = clamp(input.grid_pos, 0.0, GRID_MAX);
     bool is_skirt = any(input.grid_pos != grid);
 
@@ -78,26 +83,35 @@ VSOutput main(VSInput input)
 
     float3 sphere_dir = cube_to_sphere(face_uv_to_cube(face_uv, face));
 
-    // Tile center direction on sphere (for camera-relative precision)
     float2 center_fuv = float2(u_min + 0.5 * tile_size, v_min + 0.5 * tile_size);
     float3 center_dir = cube_to_sphere(face_uv_to_cube(center_fuv, face));
 
-    // Sample heightmap at texel centers aligned with vertex positions
     float2 hm_uv = (grid + 0.5) * heightmap_texel;
 
     float3 uvw = float3(hm_uv, float(pool_index));
-    float h = heightmap.SampleLevel(heightmap_sampler, uvw, 0).r;
+    float terrain_h = heightmap.SampleLevel(heightmap_sampler, uvw, 0).r;
 
-    if (is_skirt) h -= SKIRT_DROP;
+    // Static sea-level depth (smooth, consistent across tiles)
+    float static_depth = (sea_level > 0.0) ? max(sea_level - terrain_h, 0.0) : 0.0;
 
-    // Vertex displacement from tile center (small float, preserves precision)
+    // SWE dynamic depth (per-tile simulation)
+    float4 ws = water_output.SampleLevel(water_sampler, uvw, 0);
+    float swe_depth = ws.r;
+
+    // Use static sea_level as floor — SWE can only add above it
+    float water_depth_val = max(static_depth, swe_depth);
+    bool swe_active = (swe_depth > static_depth + 0.1);
+    float foam_val = swe_active ? ws.a : 0.0;
+
+    bool is_water = (water_depth_val > 0.01) && !is_skirt;
+
+    float h = is_water ? (terrain_h + water_depth_val) : terrain_h;
+    if (is_skirt) h = terrain_h - SKIRT_DROP;
+
     float3 delta_dir = sphere_dir - center_dir;
     float3 displacement = delta_dir * planet_radius + sphere_dir * h;
-
-    // Camera-relative position: displacement + (tile_center - camera)
     float3 world_rel = displacement + float3(rel_x, rel_y, rel_z);
 
-    // Normal: perturb sphere normal by height gradient in tangent space
     float3 ref = abs(sphere_dir.y) > 0.999 ? float3(1, 0, 0) : float3(0, 1, 0);
     float3 east = normalize(cross(ref, sphere_dir));
     float3 north = normalize(cross(sphere_dir, east));
@@ -113,15 +127,22 @@ VSOutput main(VSInput input)
     float hU = heightmap.SampleLevel(heightmap_sampler, uvw_U, 0).r;
 
     float cell_world = tile_size * planet_radius / GRID_MAX;
-    float3 normal = normalize(sphere_dir - ((hR - hL) / (2.0 * cell_world)) * east
-                                         - ((hU - hD) / (2.0 * cell_world)) * north);
+    float3 terrain_normal = normalize(sphere_dir - ((hR - hL) / (2.0 * cell_world)) * east
+                                                  - ((hU - hD) / (2.0 * cell_world)) * north);
+
+    // Water normal: flat sphere normal for static ocean, SWE-perturbed when active
+    float3 water_normal = swe_active
+        ? normalize(sphere_dir - ws.g * east - ws.b * north)
+        : sphere_dir;
 
     VSOutput o;
     o.position = mul(proj, mul(view, float4(world_rel, 1.0)));
-    o.world_normal = normal;
+    o.world_normal = is_water ? water_normal : terrain_normal;
     o.uv = tile_uv;
-    o.height_normalized = saturate(h / max_elevation);
+    o.height_normalized = saturate(terrain_h / max_elevation);
     o.world_pos = world_rel;
     o.sphere_direction = sphere_dir;
+    o.water_depth = is_water ? water_depth_val : 0.0;
+    o.foam = is_water ? foam_val : 0.0;
     return o;
 }

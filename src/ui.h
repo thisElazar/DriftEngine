@@ -64,6 +64,10 @@ struct UIState {
     float sand_bounce = 0.3f;
     float sand_gravity = 9.81f;
 
+    // Ocean
+    bool ocean_enabled = true;
+    float sea_level = 800.0f;
+
     // Scene
     bool request_basin_reset = false;
 };
