@@ -91,6 +91,7 @@ add_executable(drift_engine
     src/main.cpp
     src/camera.cpp
     src/pipeline.cpp
+    src/renderer.cpp
     src/resources.cpp
     src/ui.cpp
     src/vma_impl.cpp
