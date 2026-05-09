@@ -3,6 +3,7 @@
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 #include <functional>
 
@@ -12,11 +13,12 @@ struct Camera {
     double pos_x = (6371000.0 + 20000.0) * 0.7071;
     double pos_y = (6371000.0 + 20000.0) * 0.7071;
     double pos_z = 0.0;
-    float yaw   = 0.0f;
-    float pitch = -0.3f;
+
+    glm::quat orientation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    double arm_length = 5000.0;
+
     float fov_y = glm::radians(60.0f);
     float near_plane = 0.5f;
-    float far_plane  = 100000000.0f;
 };
 
 struct CameraUpdateResult {
@@ -24,10 +26,28 @@ struct CameraUpdateResult {
     double altitude_above_terrain;
 };
 
+struct CameraData {
+    glm::mat4 view;
+    glm::mat4 proj;
+    glm::vec3 sun_dir;   float _pad0;
+    glm::vec3 sun_color; float _pad1;
+    glm::vec3 cam_pos;   float _pad2;
+    glm::vec4 brush_world;
+    glm::vec4 brush_color;
+    glm::mat4 inv_view_proj;
+};
+
 glm::vec3 camera_forward(const Camera& cam);
+glm::vec3 camera_up(const Camera& cam);
+glm::vec3 camera_right(const Camera& cam);
+glm::dvec3 camera_eye_position(const Camera& cam);
+
+void camera_initialize_orientation(Camera& cam);
 
 void camera_apply_mouse_look(Camera& cam, float dx, float dy,
                              float sensitivity = 0.002f);
+
+void camera_zoom(Camera& cam, double amount);
 
 CameraUpdateResult camera_update(Camera& cam, GLFWwindow* window, float dt,
                                  float planet_radius,

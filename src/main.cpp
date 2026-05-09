@@ -16,9 +16,12 @@
 #include <imgui_impl_vulkan.h>
 
 #include "camera.h"
+#include "input.h"
 #include "pipeline.h"
+#include "planet.h"
 #include "renderer.h"
 #include "resources.h"
+#include "terrain.h"
 #include "ui.h"
 
 #include <algorithm>
@@ -27,9 +30,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
-#include <functional>
-#include <queue>
 #include <vector>
 
 namespace {
@@ -50,293 +50,14 @@ constexpr float    PLANET_RADIUS        = 6371000.0f;
 constexpr float    PLANET_MAX_ELEVATION = 8000.0f;
 constexpr float    TILE_SUBDIVIDE_PX    = 512.0f;
 
-// ---- CPU-side terrain height (mirrors planet_gen.cs.hlsl) ------------------
-
-float cpu_hash31(glm::vec3 p) {
-    p = glm::fract(p * glm::vec3(0.1031f, 0.1030f, 0.0973f));
-    p += glm::dot(p, glm::vec3(p.y, p.x, p.z) + 31.32f);
-    return glm::fract((p.x + p.y) * p.z);
-}
-
-float cpu_gradient_noise_3d(glm::vec3 p) {
-    glm::vec3 i = glm::floor(p);
-    glm::vec3 f = glm::fract(p);
-    glm::vec3 u = f * f * (3.0f - 2.0f * f);
-
-    float n = glm::mix(
-        glm::mix(glm::mix(cpu_hash31(i + glm::vec3(0,0,0)), cpu_hash31(i + glm::vec3(1,0,0)), u.x),
-                 glm::mix(cpu_hash31(i + glm::vec3(0,1,0)), cpu_hash31(i + glm::vec3(1,1,0)), u.x), u.y),
-        glm::mix(glm::mix(cpu_hash31(i + glm::vec3(0,0,1)), cpu_hash31(i + glm::vec3(1,0,1)), u.x),
-                 glm::mix(cpu_hash31(i + glm::vec3(0,1,1)), cpu_hash31(i + glm::vec3(1,1,1)), u.x), u.y),
-        u.z);
-    return n;
-}
-
-float cpu_fbm3d(glm::vec3 p, int octaves, float lacunarity, float gain) {
-    float sum = 0.0f, amp = 1.0f, freq = 1.0f, norm = 0.0f;
-    for (int i = 0; i < octaves; i++) {
-        sum += cpu_gradient_noise_3d(p * freq + glm::vec3(42 * 0.17f, 0, 0)) * amp;
-        norm += amp;
-        freq *= lacunarity;
-        amp *= gain;
-    }
-    return sum / norm;
-}
-
-float cpu_ridged3d(glm::vec3 p, int octaves) {
-    float sum = 0.0f, amp = 1.0f, freq = 1.0f, prev = 1.0f;
-    for (int i = 0; i < octaves; i++) {
-        float n = cpu_gradient_noise_3d(p * freq + glm::vec3(42 * 0.13f, 0, 0));
-        n = 1.0f - std::abs(n * 2.0f - 1.0f);
-        n = n * n;
-        sum += n * amp * prev;
-        prev = n;
-        freq *= 2.1f;
-        amp *= 0.5f;
-    }
-    return sum;
-}
-
-float cpu_terrain_height(glm::vec3 sphere_dir) {
-    glm::vec3 sp = sphere_dir * 1000.0f;
-    float latitude = std::abs(sphere_dir.y);
-
-    float base = 200.0f + cpu_fbm3d(sp * 0.0003f, 5, 2.0f, 0.5f) * 1500.0f;
-
-    float biome = cpu_fbm3d(sp * 0.0005f + glm::vec3(7.7f, 0, 0), 3, 2.0f, 0.5f);
-
-    float mtn_w    = glm::smoothstep(0.55f, 0.70f, biome);
-    float desert_w = glm::smoothstep(0.35f, 0.50f, biome) * glm::smoothstep(0.55f, 0.40f, biome)
-                   * glm::smoothstep(0.65f, 0.15f, latitude);
-    float plains_w = glm::smoothstep(0.45f, 0.25f, biome);
-    float polar_w  = glm::smoothstep(0.55f, 0.80f, latitude);
-
-    float mountain = cpu_ridged3d(sp * 0.006f, 7) * 4500.0f;
-    mountain += cpu_fbm3d(sp * 0.003f, 5, 2.0f, 0.55f) * 2000.0f;
-
-    float desert = cpu_fbm3d(sp * 0.005f, 5, 2.0f, 0.5f) * 500.0f;
-    desert += std::abs(cpu_gradient_noise_3d(sp * 0.03f)) * 250.0f;
-    desert += (cpu_gradient_noise_3d(sp * 0.1f) - 0.5f) * 80.0f;
-
-    float plains = cpu_fbm3d(sp * 0.004f, 5, 2.0f, 0.5f) * 400.0f;
-    plains += cpu_fbm3d(sp * 0.02f, 3, 2.0f, 0.4f) * 100.0f;
-
-    float polar = cpu_fbm3d(sp * 0.003f, 4, 2.0f, 0.5f) * 800.0f;
-    polar += std::abs(cpu_gradient_noise_3d(sp * 0.02f) - 0.5f) * 200.0f;
-
-    float total_w = std::max(mtn_w + desert_w + plains_w + polar_w, 0.01f);
-    float biome_h = (mountain * mtn_w + desert * desert_w + plains * plains_w + polar * polar_w) / total_w;
-
-    float h = base + biome_h;
-    h += (cpu_gradient_noise_3d(sp * 0.15f) - 0.5f) * 40.0f;
-
-    return h;
-}
-
-// ---- Cube-sphere mapping helpers (CPU, float) ------------------------------
-
-glm::vec3 cpu_face_uv_to_cube(float u, float v, uint32_t face) {
-    switch (face) {
-        case 0: return {1.0f, v, -u};
-        case 1: return {-1.0f, v, u};
-        case 2: return {u, 1.0f, -v};
-        case 3: return {u, -1.0f, v};
-        case 4: return {u, v, 1.0f};
-        case 5: return {-u, v, -1.0f};
-        default: return {0, 0, 0};
-    }
-}
-
-glm::vec3 cpu_cube_to_sphere(glm::vec3 p) {
-    float x2 = p.x*p.x, y2 = p.y*p.y, z2 = p.z*p.z;
-    return {
-        p.x * std::sqrt(std::max(0.0f, 1.0f - y2*0.5f - z2*0.5f + y2*z2/3.0f)),
-        p.y * std::sqrt(std::max(0.0f, 1.0f - x2*0.5f - z2*0.5f + x2*z2/3.0f)),
-        p.z * std::sqrt(std::max(0.0f, 1.0f - x2*0.5f - y2*0.5f + x2*y2/3.0f))
-    };
-}
-
-struct CameraData {
-    glm::mat4 view;
-    glm::mat4 proj;
-    glm::vec3 sun_dir;   float _pad0;
-    glm::vec3 sun_color; float _pad1;
-    glm::vec3 cam_pos;   float _pad2;
-    glm::vec4 brush_world;
-    glm::vec4 brush_color;
-    glm::mat4 inv_view_proj;
-};
-
-struct QuadNode {
-    uint32_t face;
-    uint32_t level;
-    uint32_t x, y;
-};
-
-
-enum class BrushMode { Raise, Lower, Water, Sand };
-
-bool g_framebuffer_resized = false;
-bool g_reload_shaders = false;
-bool g_pulse_pending = false;
-bool g_lmb_held = false;
-bool g_rmb_held = false;
-bool g_first_mouse = true;
-double g_cursor_x = 0.0, g_cursor_y = 0.0;
-double g_last_cursor_x = 0.0, g_last_cursor_y = 0.0;
-bool g_cursor_on_world = false;
-float g_cursor_world_x = 0.0f;
-float g_cursor_world_z = 0.0f;
+bool cursor_on_world = false;
 Camera g_camera;
-BrushMode g_brush_mode = BrushMode::Water;
 double g_terrain_height_at_cam = 0.0;
 double g_altitude_above_terrain = 100000.0;
 std::vector<TerrainStamp> g_stamps;
 bool g_stamps_dirty = false;
-
-float cpu_terrain_height_with_stamps(glm::vec3 sphere_dir) {
-    float h = cpu_terrain_height(sphere_dir);
-    for (const auto& s : g_stamps) {
-        glm::vec3 sp(s.pos_x, s.pos_y, s.pos_z);
-        float d = glm::dot(sphere_dir, sp);
-        if (d < s.cos_radius) continue;
-        float t = (d - s.cos_radius) / std::max(1.0f - s.cos_radius, 1e-7f);
-        h += s.delta_h * std::exp(-4.0f * (1.0f - t) * (1.0f - t));
-    }
-    return h;
-}
-
 UIState g_ui;
 float g_accumulated_atmo_time = 0.0f;
-
-void key_callback(GLFWwindow* window, int key, int /*scancode*/, int action, int /*mods*/)
-{
-    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
-        glfwSetWindowShouldClose(window, GLFW_TRUE);
-    if (key == GLFW_KEY_GRAVE_ACCENT && action == GLFW_PRESS)
-        g_ui.show_menu = !g_ui.show_menu;
-    if (key == GLFW_KEY_F5 && action == GLFW_PRESS)
-        g_reload_shaders = true;
-    if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureKeyboard)
-        return;
-    if (key == GLFW_KEY_SPACE && action == GLFW_PRESS)
-        g_pulse_pending = true;
-    if (action == GLFW_PRESS) {
-        if (key == GLFW_KEY_1) g_brush_mode = BrushMode::Raise;
-        if (key == GLFW_KEY_2) g_brush_mode = BrushMode::Lower;
-        if (key == GLFW_KEY_3) g_brush_mode = BrushMode::Water;
-        if (key == GLFW_KEY_4) g_brush_mode = BrushMode::Sand;
-    }
-    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
-        if (key == GLFW_KEY_LEFT_BRACKET)
-            g_ui.brush_radius_grid = std::max(2.0f, g_ui.brush_radius_grid * 0.85f);
-        if (key == GLFW_KEY_RIGHT_BRACKET)
-            g_ui.brush_radius_grid = std::min(300.0f, g_ui.brush_radius_grid * 1.18f);
-        if (key == GLFW_KEY_MINUS) {
-            if (g_brush_mode == BrushMode::Water)
-                g_ui.brush_strength = std::max(0.05f, g_ui.brush_strength * 0.85f);
-            else
-                g_ui.terrain_strength = std::max(2.0f, g_ui.terrain_strength * 0.85f);
-        }
-        if (key == GLFW_KEY_EQUAL) {
-            if (g_brush_mode == BrushMode::Water)
-                g_ui.brush_strength = std::min(20.0f, g_ui.brush_strength * 1.18f);
-            else
-                g_ui.terrain_strength = std::min(500.0f, g_ui.terrain_strength * 1.18f);
-        }
-    }
-}
-
-void mouse_button_callback(GLFWwindow* window, int button, int action, int /*mods*/)
-{
-    if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse)
-        return;
-    if (button == GLFW_MOUSE_BUTTON_LEFT) {
-        g_lmb_held = (action == GLFW_PRESS);
-    }
-    if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-        g_rmb_held = (action == GLFW_PRESS);
-        if (g_rmb_held) {
-            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-            g_first_mouse = true;
-        } else {
-            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-        }
-    }
-}
-
-void cursor_pos_callback(GLFWwindow* /*window*/, double xpos, double ypos)
-{
-    g_cursor_x = xpos;
-    g_cursor_y = ypos;
-
-    if (g_rmb_held) {
-        if (g_first_mouse) {
-            g_last_cursor_x = xpos;
-            g_last_cursor_y = ypos;
-            g_first_mouse = false;
-            return;
-        }
-        float dx = static_cast<float>(xpos - g_last_cursor_x);
-        float dy = static_cast<float>(ypos - g_last_cursor_y);
-        camera_apply_mouse_look(g_camera, dx, dy);
-    }
-    g_last_cursor_x = xpos;
-    g_last_cursor_y = ypos;
-}
-
-void scroll_callback(GLFWwindow* /*window*/, double /*xoffset*/, double /*yoffset*/)
-{
-}
-
-void framebuffer_resize_callback(GLFWwindow* /*window*/, int /*width*/, int /*height*/)
-{
-    g_framebuffer_resized = true;
-}
-
-
-struct BasinParams {
-    uint32_t grid_w        = 1024;
-    uint32_t grid_h        = 1024;
-    float    cell_spacing  = 10.0f;
-    float    floor_height  = 100.0f;
-    float    rim_height    = 1500.0f;
-    float    base_height   = 800.0f;
-    float    inner_radius  = 2000.0f;
-    float    rim_radius    = 2800.0f;
-    float    initial_water = 50.0f;
-};
-
-float cpu_smoothstep(float edge0, float edge1, float x)
-{
-    float t = std::clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
-    return t * t * (3.0f - 2.0f * t);
-}
-
-std::vector<float> generate_crater_basin(const BasinParams& p)
-{
-    std::vector<float> data(static_cast<size_t>(p.grid_w) * p.grid_h);
-    for (uint32_t y = 0; y < p.grid_h; ++y) {
-        for (uint32_t x = 0; x < p.grid_w; ++x) {
-            float cx = (static_cast<float>(x) - p.grid_w * 0.5f) * p.cell_spacing;
-            float cy = (static_cast<float>(y) - p.grid_h * 0.5f) * p.cell_spacing;
-            float r = std::sqrt(cx * cx + cy * cy);
-            float h;
-            if (r < p.inner_radius) {
-                h = p.floor_height;
-            } else if (r < p.rim_radius) {
-                float t = (r - p.inner_radius) / (p.rim_radius - p.inner_radius);
-                h = std::lerp(p.floor_height, p.rim_height, cpu_smoothstep(0.0f, 1.0f, t));
-            } else {
-                float t = std::clamp((r - p.rim_radius) / 1500.0f, 0.0f, 1.0f);
-                h = std::lerp(p.rim_height, p.base_height, cpu_smoothstep(0.0f, 1.0f, t));
-                h += 30.0f * std::sin(cx * 0.0003f) * std::cos(cy * 0.0004f);
-            }
-            data[static_cast<size_t>(y) * p.grid_w + x] = h;
-        }
-    }
-    return data;
-}
 
 } // namespace
 
@@ -354,11 +75,11 @@ int main()
     uint32_t gfx_family = renderer.gfx_family;
     GLFWwindow* window = renderer.window;
 
-    glfwSetKeyCallback(window, key_callback);
-    glfwSetFramebufferSizeCallback(window, framebuffer_resize_callback);
-    glfwSetMouseButtonCallback(window, mouse_button_callback);
-    glfwSetCursorPosCallback(window, cursor_pos_callback);
-    glfwSetScrollCallback(window, scroll_callback);
+    camera_initialize_orientation(g_camera);
+
+    InputState input{};
+    CallbackContext cb_ctx{&input, &g_camera, &g_ui};
+    input_install_callbacks(window, &cb_ctx);
     ImGui_ImplGlfw_InstallCallbacks(window);
 
     // ---- Procedural basin ---------------------------------------------------
@@ -1701,68 +1422,7 @@ int main()
     std::printf("Shaders: press F5 to hot-reload all shaders\n");
     std::fflush(stdout);
 
-    // ---- Planet quadtree helpers ---------------------------------------------
-    auto face_uv_to_cube = [](double u, double v, uint32_t face) -> glm::dvec3 {
-        switch (face) {
-            case 0: return {1.0, v, -u};
-            case 1: return {-1.0, v, u};
-            case 2: return {u, 1.0, -v};
-            case 3: return {u, -1.0, v};
-            case 4: return {u, v, 1.0};
-            case 5: return {-u, v, -1.0};
-            default: return {0, 0, 0};
-        }
-    };
-
-    auto cube_to_sphere_d = [](glm::dvec3 p) -> glm::dvec3 {
-        double x2 = p.x*p.x, y2 = p.y*p.y, z2 = p.z*p.z;
-        return {
-            p.x * std::sqrt(std::max(0.0, 1.0 - y2*0.5 - z2*0.5 + y2*z2/3.0)),
-            p.y * std::sqrt(std::max(0.0, 1.0 - x2*0.5 - z2*0.5 + x2*z2/3.0)),
-            p.z * std::sqrt(std::max(0.0, 1.0 - x2*0.5 - y2*0.5 + x2*y2/3.0))
-        };
-    };
-
-    auto tile_center_dir = [&](const QuadNode& node) -> glm::dvec3 {
-        double ts = 2.0 / (1 << node.level);
-        double u = -1.0 + (node.x + 0.5) * ts;
-        double v = -1.0 + (node.y + 0.5) * ts;
-        glm::dvec3 cube_pt = face_uv_to_cube(u, v, node.face);
-        return glm::normalize(cube_to_sphere_d(cube_pt));
-    };
-
-    auto tile_center_on_sphere = [&](const QuadNode& node) -> glm::dvec3 {
-        return tile_center_dir(node) * static_cast<double>(PLANET_RADIUS);
-    };
-
-    struct TileCandidate {
-        QuadNode node;
-        double screen_error;
-        bool operator<(const TileCandidate& o) const { return screen_error < o.screen_error; }
-    };
-
-    auto compute_tile_error = [&](const QuadNode& node, const glm::dvec3& cam_pos_d,
-                                   const glm::dvec3& cam_fwd_d, float screen_height,
-                                   float fov_y) -> double {
-        glm::dvec3 center = tile_center_on_sphere(node);
-        glm::dvec3 rel = center - cam_pos_d;
-        double dist = glm::length(rel);
-
-        // Horizon cull
-        double cam_height = glm::length(cam_pos_d);
-        if (cam_height > PLANET_RADIUS * 1.01) {
-            glm::dvec3 cam_dir = glm::normalize(cam_pos_d);
-            glm::dvec3 tile_dir = glm::normalize(center);
-            double angle = std::acos(std::clamp(glm::dot(cam_dir, tile_dir), -1.0, 1.0));
-            double horizon = std::acos(static_cast<double>(PLANET_RADIUS) / cam_height);
-            double tile_angular_size = 2.0 / (1 << node.level) * 1.5;
-            if (angle - tile_angular_size > horizon)
-                return -1.0;
-        }
-
-        double tile_world_size = (2.0 / (1 << node.level)) * PLANET_RADIUS * 1.5708;
-        return (tile_world_size / std::max(dist, 1.0)) * screen_height / fov_y;
-    };
+    // Planet quadtree helpers are now in planet.h/.cpp
 
     // ---- Frame loop ---------------------------------------------------------
     uint32_t current_frame = 0;
@@ -1785,9 +1445,9 @@ int main()
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        if (g_reload_shaders) {
+        if (input.reload_shaders) {
             pipelines_reload(pipelines, device);
-            g_reload_shaders = false;
+            input.reload_shaders = false;
         }
 
         int fb_w, fb_h;
@@ -2080,7 +1740,10 @@ int main()
         // ---- Per-frame camera movement (double precision) ----
         {
             auto cam_result = camera_update(g_camera, window, dt, PLANET_RADIUS,
-                [](glm::vec3 dir) { return cpu_terrain_height_with_stamps(dir); });
+                [](glm::vec3 dir) {
+                    return cpu_terrain_height_with_stamps(dir, g_stamps.data(),
+                        static_cast<uint32_t>(g_stamps.size()));
+                });
             g_terrain_height_at_cam = cam_result.terrain_height_at_cam;
             g_altitude_above_terrain = cam_result.altitude_above_terrain;
         }
@@ -2093,19 +1756,21 @@ int main()
         // ---- Ray-pick cursor on sphere surface ----
         float grid_x = 0.0f, grid_y = 0.0f;
         glm::vec3 stamp_sphere_dir(0.0f);
-        g_cursor_on_world = false;
+        cursor_on_world = false;
         {
             int win_w, win_h;
             glfwGetWindowSize(window, &win_w, &win_h);
-            float ndc_x = static_cast<float>(g_cursor_x) / win_w * 2.0f - 1.0f;
-            float ndc_y = static_cast<float>(g_cursor_y) / win_h * 2.0f - 1.0f;
+            float ndc_x = static_cast<float>(input.cursor_x) / win_w * 2.0f - 1.0f;
+            float ndc_y = static_cast<float>(input.cursor_y) / win_h * 2.0f - 1.0f;
 
-            glm::mat4 inv_vp = glm::inverse(cam_proj * cam_view);
-            glm::vec4 near_clip = inv_vp * glm::vec4(ndc_x, ndc_y, 1.0f, 1.0f);
-            near_clip /= near_clip.w;
-
-            glm::dvec3 ray_origin(g_camera.pos_x, g_camera.pos_y, g_camera.pos_z);
-            glm::dvec3 ray_dir = glm::normalize(glm::dvec3(near_clip));
+            // Unproject screen point through inverse projection to get camera-local ray
+            glm::mat4 inv_proj = glm::inverse(cam_proj);
+            glm::vec4 clip_pt = inv_proj * glm::vec4(ndc_x, ndc_y, 1.0f, 1.0f);
+            clip_pt /= clip_pt.w;
+            // Rotate camera-local direction into world space
+            glm::vec3 ray_local = glm::normalize(glm::vec3(clip_pt));
+            glm::dvec3 ray_origin = camera_eye_position(g_camera);
+            glm::dvec3 ray_dir = glm::normalize(glm::dvec3(g_camera.orientation * ray_local));
 
             double sphere_r = static_cast<double>(PLANET_RADIUS) + g_terrain_height_at_cam;
             double a = glm::dot(ray_dir, ray_dir);
@@ -2118,22 +1783,22 @@ int main()
                 if (t > 0.0) {
                     glm::dvec3 hit = ray_origin + t * ray_dir;
                     stamp_sphere_dir = glm::normalize(glm::vec3(hit));
-                    g_cursor_on_world = true;
+                    cursor_on_world = true;
                 }
             }
         }
-        bool brush_active = g_lmb_held && !g_rmb_held;
-        bool brush_hit = brush_active && g_cursor_on_world;
+        bool brush_active = input.lmb_held && !input.rmb_held;
+        bool brush_hit = brush_active && cursor_on_world;
 
         // ---- Place terrain stamp on LMB ----
         if (brush_hit &&
-            (g_brush_mode == BrushMode::Raise || g_brush_mode == BrushMode::Lower) &&
+            (input.brush_mode == BrushMode::Raise || input.brush_mode == BrushMode::Lower) &&
             g_stamps.size() < MAX_STAMPS)
         {
             static double last_stamp_time = 0.0;
             double now_s = glfwGetTime();
             if (now_s - last_stamp_time > 0.1) {
-                float sign = (g_brush_mode == BrushMode::Raise) ? 1.0f : -1.0f;
+                float sign = (input.brush_mode == BrushMode::Raise) ? 1.0f : -1.0f;
                 float angular_radius = g_ui.brush_radius_grid * g_ui.stamp_angular_scale;
                 angular_radius = std::clamp(angular_radius, 0.0001f, 0.2f);
 
@@ -2154,11 +1819,11 @@ int main()
         {
             float brush_radius_world = g_ui.brush_radius_grid * bp.cell_spacing;
             glm::vec4 brush_color;
-            if (g_brush_mode == BrushMode::Raise)
+            if (input.brush_mode == BrushMode::Raise)
                 brush_color = glm::vec4(0.30f, 0.95f, 0.40f, 1.0f);
-            else if (g_brush_mode == BrushMode::Lower)
+            else if (input.brush_mode == BrushMode::Lower)
                 brush_color = glm::vec4(0.95f, 0.45f, 0.20f, 1.0f);
-            else if (g_brush_mode == BrushMode::Sand)
+            else if (input.brush_mode == BrushMode::Sand)
                 brush_color = glm::vec4(0.85f, 0.70f, 0.45f, 1.0f);
             else
                 brush_color = glm::vec4(0.30f, 0.85f, 0.95f, 1.0f);
@@ -2175,7 +1840,7 @@ int main()
             float angular_r = g_ui.brush_radius_grid * g_ui.stamp_angular_scale;
             cam.brush_world = glm::vec4(
                 stamp_sphere_dir.x, stamp_sphere_dir.y, stamp_sphere_dir.z,
-                g_cursor_on_world ? angular_r : 0.0f);
+                cursor_on_world ? angular_r : 0.0f);
             cam.brush_color = brush_color;
             cam.inv_view_proj = glm::inverse(cam_proj * cam_view);
             std::memcpy(camera_ubo_info.pMappedData, &cam, sizeof(cam));
@@ -2183,8 +1848,8 @@ int main()
         }
 
         // ---- Terrain brush dispatch (before SWE) ----
-        if (brush_hit && (g_brush_mode == BrushMode::Raise || g_brush_mode == BrushMode::Lower)) {
-            float sign = (g_brush_mode == BrushMode::Raise) ? 1.0f : -1.0f;
+        if (brush_hit && (input.brush_mode == BrushMode::Raise || input.brush_mode == BrushMode::Lower)) {
+            float sign = (input.brush_mode == BrushMode::Raise) ? 1.0f : -1.0f;
 
             TerrainBrushPC tb_pc{};
             tb_pc.brush_x = grid_x;
@@ -2218,7 +1883,7 @@ int main()
         }
 
         // ---- Sand brush dispatch ----
-        if (brush_hit && g_brush_mode == BrushMode::Sand) {
+        if (brush_hit && input.brush_mode == BrushMode::Sand) {
             TerrainBrushPC sb_pc{};
             sb_pc.brush_x = grid_x;
             sb_pc.brush_y = grid_y;
@@ -2250,54 +1915,19 @@ int main()
         }
 
         // ---- Planet tile selection and generation ----
-        std::vector<QuadNode> visible_tiles;
-        visible_tiles.reserve(PLANET_TILE_POOL);
+        PlanetTraversalParams tp{};
+        tp.cam_pos = camera_eye_position(g_camera);
+        tp.cam_forward = glm::dvec3(camera_forward(g_camera));
+        tp.screen_height = static_cast<float>(extent.height);
+        tp.fov_y = g_camera.fov_y;
+        tp.planet_radius = PLANET_RADIUS;
+        tp.subdivide_threshold = TILE_SUBDIVIDE_PX;
+        tp.max_level = PLANET_MAX_LEVEL;
+        tp.max_tiles = PLANET_TILE_POOL;
+        tp.altitude_above_terrain = g_altitude_above_terrain;
+        auto visible_tiles = planet_select_visible_tiles(tp);
+        g_ui.visible_tile_count = static_cast<uint32_t>(visible_tiles.size());
         {
-            glm::dvec3 cam_pos_d(g_camera.pos_x, g_camera.pos_y, g_camera.pos_z);
-            float screen_h = static_cast<float>(extent.height);
-
-            glm::dvec3 cam_fwd_d(camera_forward(g_camera));
-
-            // Dynamic max LOD: cap based on altitude to limit LOD range
-            uint32_t effective_max_level = PLANET_MAX_LEVEL;
-            if (g_altitude_above_terrain > 100.0) {
-                int cap = static_cast<int>(14.0 - std::log2(g_altitude_above_terrain / 100.0));
-                effective_max_level = static_cast<uint32_t>(std::clamp(cap, 5, static_cast<int>(PLANET_MAX_LEVEL)));
-            }
-
-            // Priority queue: always process the tile with largest screen error first
-            std::priority_queue<TileCandidate> pq;
-
-            for (uint32_t f = 0; f < 6; f++) {
-                QuadNode root{f, 0, 0, 0};
-                double err = compute_tile_error(root, cam_pos_d, cam_fwd_d, screen_h, g_camera.fov_y);
-                if (err > 0.0) pq.push({root, err});
-            }
-
-            while (!pq.empty() && visible_tiles.size() < PLANET_TILE_POOL) {
-                auto top = pq.top();
-                pq.pop();
-
-                if (top.screen_error > TILE_SUBDIVIDE_PX && top.node.level < effective_max_level) {
-                    for (uint32_t cy = 0; cy < 2; cy++)
-                        for (uint32_t cx = 0; cx < 2; cx++) {
-                            QuadNode child{top.node.face, top.node.level + 1,
-                                           top.node.x * 2 + cx, top.node.y * 2 + cy};
-                            double err = compute_tile_error(child, cam_pos_d, cam_fwd_d, screen_h, g_camera.fov_y);
-                            if (err > 0.0) pq.push({child, err});
-                        }
-                } else {
-                    visible_tiles.push_back(top.node);
-                }
-            }
-
-            // Drain remaining tiles that don't need subdivision
-            while (!pq.empty() && visible_tiles.size() < PLANET_TILE_POOL) {
-                visible_tiles.push_back(pq.top().node);
-                pq.pop();
-            }
-
-            g_ui.visible_tile_count = static_cast<uint32_t>(visible_tiles.size());
 
             // Upload stamps to GPU if changed
             if (g_stamps_dirty && !g_stamps.empty()) {
@@ -2487,13 +2117,13 @@ int main()
                 swe_pc.grid_h = SWE_GRID_H;
 
                 if (step == 0) {
-                    bool water_brush_active = brush_hit && g_brush_mode == BrushMode::Water;
-                    if (g_pulse_pending) {
+                    bool water_brush_active = brush_hit && input.brush_mode == BrushMode::Water;
+                    if (input.pulse_pending) {
                         swe_pc.pulse_x = SWE_GRID_W * 0.5f;
                         swe_pc.pulse_y = SWE_GRID_H * 0.5f;
                         swe_pc.pulse_radius = g_ui.pulse_radius_cells;
                         swe_pc.pulse_amount = g_ui.pulse_amount;
-                        g_pulse_pending = false;
+                        input.pulse_pending = false;
                     } else if (water_brush_active) {
                         swe_pc.pulse_x = grid_x;
                         swe_pc.pulse_y = grid_y;
@@ -2656,14 +2286,14 @@ int main()
             vkCmdBindVertexBuffers(frame.cmd, 0, 1, &clipmap_vbo, &clip_offset);
             vkCmdBindIndexBuffer(frame.cmd, clipmap_ibo, 0, VK_INDEX_TYPE_UINT32);
 
-            glm::dvec3 cam_pos_d(g_camera.pos_x, g_camera.pos_y, g_camera.pos_z);
+            glm::dvec3 cam_pos_d = camera_eye_position(g_camera);
 
             for (uint32_t i = 0; i < visible_tiles.size(); i++) {
                 const auto& tile = visible_tiles[i];
                 float ts = 2.0f / static_cast<float>(1u << tile.level);
 
                 // rel_xyz = center_dir * R - cam (VS adds height displacement)
-                glm::dvec3 dir = tile_center_dir(tile);
+                glm::dvec3 dir = planet_tile_center_dir(tile);
                 glm::dvec3 center_at_R = dir * static_cast<double>(PLANET_RADIUS);
                 glm::dvec3 rel_d = center_at_R - cam_pos_d;
 
@@ -2827,7 +2457,7 @@ int main()
         VkResult present_result = vkQueuePresentKHR(renderer.present_queue, &present_info);
 
         if (present_result == VK_ERROR_OUT_OF_DATE_KHR ||
-            present_result == VK_SUBOPTIMAL_KHR || g_framebuffer_resized) {
+            present_result == VK_SUBOPTIMAL_KHR || input.framebuffer_resized) {
             renderer_rebuild_swapchain(renderer);
         } else if (present_result != VK_SUCCESS) {
             std::fprintf(stderr, "Failed to present (VkResult %d).\n",
@@ -2850,10 +2480,10 @@ int main()
             cpu_avg_ms = cpu_sum / timing_count;
             gpu_avg_ms = gpu_sum / timing_count;
             const char* mode_str = "water";
-            if (g_brush_mode == BrushMode::Raise) mode_str = "raise";
-            else if (g_brush_mode == BrushMode::Lower) mode_str = "lower";
-            float strength_display = (g_brush_mode == BrushMode::Water) ? g_ui.brush_strength : g_ui.terrain_strength;
-            const char* unit = (g_brush_mode == BrushMode::Water) ? "m/frame" : "m/s";
+            if (input.brush_mode == BrushMode::Raise) mode_str = "raise";
+            else if (input.brush_mode == BrushMode::Lower) mode_str = "lower";
+            float strength_display = (input.brush_mode == BrushMode::Water) ? g_ui.brush_strength : g_ui.terrain_strength;
+            const char* unit = (input.brush_mode == BrushMode::Water) ? "m/frame" : "m/s";
             char title[256];
             std::snprintf(title, sizeof(title),
                 "drift_engine — CPU %.1f ms | GPU %.1f ms | %.0f fps | %s | size %.0f | strength %.1f %s",

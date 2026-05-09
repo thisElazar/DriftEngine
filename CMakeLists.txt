@@ -61,7 +61,14 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 
-FetchContent_MakeAvailable(glfw vk-bootstrap VulkanMemoryAllocator glm imgui)
+FetchContent_Declare(
+    tomlplusplus
+    GIT_REPOSITORY https://github.com/marzer/tomlplusplus.git
+    GIT_TAG        v3.4.0
+    GIT_SHALLOW    TRUE
+)
+
+FetchContent_MakeAvailable(glfw vk-bootstrap VulkanMemoryAllocator glm imgui tomlplusplus)
 
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
@@ -90,9 +97,12 @@ message(STATUS "Vulkan library:     ${Vulkan_LIBRARIES}")
 add_executable(drift_engine
     src/main.cpp
     src/camera.cpp
+    src/input.cpp
     src/pipeline.cpp
+    src/planet.cpp
     src/renderer.cpp
     src/resources.cpp
+    src/terrain.cpp
     src/ui.cpp
     src/vma_impl.cpp
 )
@@ -166,3 +176,9 @@ endforeach()
 
 add_custom_target(shaders ALL DEPENDS ${SPV_OUTPUTS})
 add_dependencies(drift_engine shaders)
+
+# ---------------------------------------------------------------------------
+# Bestiary library + Species Lab app
+# ---------------------------------------------------------------------------
+add_subdirectory(bestiary)
+add_subdirectory(apps/species_lab)

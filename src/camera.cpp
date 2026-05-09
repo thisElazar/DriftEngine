@@ -1,34 +1,101 @@
 #include "camera.h"
 #include <GLFW/glfw3.h>
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/gtx/quaternion.hpp>
 #include <algorithm>
 #include <cmath>
 
+static glm::quat orientation_from_up(glm::vec3 up)
+{
+    up = glm::normalize(up);
+    glm::vec3 world_up(0.0f, 1.0f, 0.0f);
+
+    float d = glm::dot(up, world_up);
+    if (d > 0.9999f)
+        return glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+    if (d < -0.9999f)
+        return glm::angleAxis(glm::pi<float>(), glm::vec3(0.0f, 0.0f, 1.0f));
+
+    glm::vec3 axis = glm::normalize(glm::cross(world_up, up));
+    float angle = std::acos(std::clamp(d, -1.0f, 1.0f));
+    return glm::angleAxis(angle, axis);
+}
+
+glm::dvec3 camera_eye_position(const Camera& cam)
+{
+    glm::vec3 offset = cam.orientation * glm::vec3(0.0f, 0.0f, static_cast<float>(cam.arm_length));
+    return glm::dvec3(cam.pos_x, cam.pos_y, cam.pos_z) + glm::dvec3(offset);
+}
+
 glm::vec3 camera_forward(const Camera& cam)
 {
-    float cy = std::cos(cam.yaw);
-    float sy = std::sin(cam.yaw);
-    float cp = std::cos(cam.pitch);
-    float sp = std::sin(cam.pitch);
-    return glm::vec3(cy * cp, sp, sy * cp);
+    return glm::normalize(cam.orientation * glm::vec3(0.0f, 0.0f, -1.0f));
+}
+
+glm::vec3 camera_up(const Camera& cam)
+{
+    return glm::normalize(cam.orientation * glm::vec3(0.0f, 1.0f, 0.0f));
+}
+
+glm::vec3 camera_right(const Camera& cam)
+{
+    return glm::normalize(cam.orientation * glm::vec3(1.0f, 0.0f, 0.0f));
 }
 
 void camera_apply_mouse_look(Camera& cam, float dx, float dy, float sensitivity)
 {
-    cam.yaw   += dx * sensitivity;
-    cam.pitch -= dy * sensitivity;
-    cam.pitch = std::clamp(cam.pitch, -1.5f, 1.5f);
+    // Yaw around the radial "up" at the pivot, pitch around camera right.
+    // This orbits the camera around the pivot point.
+    glm::vec3 radial_up = glm::normalize(glm::vec3(
+        static_cast<float>(cam.pos_x),
+        static_cast<float>(cam.pos_y),
+        static_cast<float>(cam.pos_z)));
+
+    glm::vec3 right = camera_right(cam);
+
+    glm::quat yaw_rot = glm::angleAxis(-dx * sensitivity, radial_up);
+    glm::quat pitch_rot = glm::angleAxis(-dy * sensitivity, right);
+
+    cam.orientation = glm::normalize(yaw_rot * pitch_rot * cam.orientation);
+
+    // Prevent roll drift
+    glm::vec3 fwd = cam.orientation * glm::vec3(0.0f, 0.0f, -1.0f);
+    glm::vec3 corrected_right = glm::normalize(glm::cross(fwd, radial_up));
+    glm::vec3 corrected_up = glm::cross(corrected_right, fwd);
+    glm::mat3 m(corrected_right, corrected_up, -fwd);
+    cam.orientation = glm::normalize(glm::quat_cast(m));
+}
+
+void camera_zoom(Camera& cam, double amount)
+{
+    double factor = 1.0 - amount * 0.1;
+    cam.arm_length = std::clamp(cam.arm_length * factor, 10.0, 50000000.0);
+}
+
+void camera_initialize_orientation(Camera& cam)
+{
+    glm::vec3 up = glm::normalize(glm::vec3(
+        static_cast<float>(cam.pos_x),
+        static_cast<float>(cam.pos_y),
+        static_cast<float>(cam.pos_z)));
+
+    cam.orientation = orientation_from_up(up);
 }
 
 CameraUpdateResult camera_update(Camera& cam, GLFWwindow* window, float dt,
                                  float planet_radius,
                                  std::function<float(glm::vec3)> height_fn)
 {
-    glm::dvec3 cam_pos_d(cam.pos_x, cam.pos_y, cam.pos_z);
-    double cam_dist = glm::length(cam_pos_d);
-    glm::vec3 cam_dir_f = glm::normalize(glm::vec3(cam_pos_d));
-    double terrain_height = static_cast<double>(height_fn(cam_dir_f));
+    // Pivot is at pos_x/y/z. Compute altitude at pivot.
+    glm::dvec3 pivot(cam.pos_x, cam.pos_y, cam.pos_z);
+    glm::vec3 pivot_dir = glm::normalize(glm::vec3(pivot));
+    double terrain_height = static_cast<double>(height_fn(pivot_dir));
     double terrain_radius = static_cast<double>(planet_radius) + terrain_height;
-    double altitude = cam_dist - terrain_radius;
+
+    // Eye position for altitude-based speed
+    glm::dvec3 eye = camera_eye_position(cam);
+    double eye_dist = glm::length(eye);
+    double altitude = eye_dist - terrain_radius;
 
     float base_speed = static_cast<float>(std::max(altitude, 10.0)) * 1.5f;
     float speed = base_speed;
@@ -37,17 +104,25 @@ CameraUpdateResult camera_update(Camera& cam, GLFWwindow* window, float dt,
     if (glfwGetKey(window, GLFW_KEY_LEFT_ALT) == GLFW_PRESS)
         speed *= 0.2f;
 
+    // WASD moves the pivot along the surface tangent plane, Q/E moves radially
+    glm::vec3 radial_up = pivot_dir;
     glm::vec3 fwd = camera_forward(cam);
-    glm::vec3 right = glm::normalize(glm::cross(fwd, glm::vec3(0, 1, 0)));
-    glm::vec3 up(0, 1, 0);
+    glm::vec3 right = camera_right(cam);
+
+    glm::vec3 fwd_tangent = fwd - glm::dot(fwd, radial_up) * radial_up;
+    glm::vec3 right_tangent = right - glm::dot(right, radial_up) * radial_up;
+    if (glm::dot(fwd_tangent, fwd_tangent) > 1e-6f)
+        fwd_tangent = glm::normalize(fwd_tangent);
+    if (glm::dot(right_tangent, right_tangent) > 1e-6f)
+        right_tangent = glm::normalize(right_tangent);
 
     glm::vec3 move(0.0f);
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) move += fwd;
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) move -= fwd;
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) move += right;
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) move -= right;
-    if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) move += up;
-    if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) move -= up;
+    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) move += fwd_tangent;
+    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) move -= fwd_tangent;
+    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) move += right_tangent;
+    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) move -= right_tangent;
+    if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) move += radial_up;
+    if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) move -= radial_up;
 
     if (glm::dot(move, move) > 0.0f) {
         glm::vec3 dir = glm::normalize(move);
@@ -56,17 +131,21 @@ CameraUpdateResult camera_update(Camera& cam, GLFWwindow* window, float dt,
         cam.pos_z += static_cast<double>(dir.z) * speed * dt;
     }
 
-    cam_pos_d = glm::dvec3(cam.pos_x, cam.pos_y, cam.pos_z);
-    cam_dist = glm::length(cam_pos_d);
-    cam_dir_f = glm::normalize(glm::vec3(cam_pos_d));
-    double h_at_new_pos = static_cast<double>(height_fn(cam_dir_f));
-    double min_radius = static_cast<double>(planet_radius) + h_at_new_pos + 2.0;
-    if (cam_dist < min_radius) {
-        glm::dvec3 cam_dir_d = cam_pos_d / cam_dist;
-        cam.pos_x = cam_dir_d.x * min_radius;
-        cam.pos_y = cam_dir_d.y * min_radius;
-        cam.pos_z = cam_dir_d.z * min_radius;
+    // Clamp pivot so eye doesn't go below terrain
+    eye = camera_eye_position(cam);
+    eye_dist = glm::length(eye);
+    glm::vec3 eye_dir = glm::normalize(glm::vec3(eye));
+    double h_at_eye = static_cast<double>(height_fn(eye_dir));
+    double min_eye_radius = static_cast<double>(planet_radius) + h_at_eye + 2.0;
+    if (eye_dist < min_eye_radius) {
+        glm::dvec3 push_dir = glm::normalize(eye);
+        double push = min_eye_radius - eye_dist;
+        cam.pos_x += push_dir.x * push;
+        cam.pos_y += push_dir.y * push;
+        cam.pos_z += push_dir.z * push;
         altitude = 2.0;
+    } else {
+        altitude = eye_dist - (static_cast<double>(planet_radius) + h_at_eye);
     }
 
     return {terrain_height, altitude};
@@ -74,8 +153,17 @@ CameraUpdateResult camera_update(Camera& cam, GLFWwindow* window, float dt,
 
 glm::mat4 camera_build_view(const Camera& cam)
 {
-    glm::vec3 fwd = camera_forward(cam);
-    return glm::lookAtRH(glm::vec3(0.0f), fwd, glm::vec3(0.0f, 1.0f, 0.0f));
+    glm::mat3 rot = glm::mat3_cast(cam.orientation);
+    glm::mat3 inv_rot = glm::transpose(rot);
+    // Camera-relative: translate by arm length along local Z
+    glm::vec3 arm_offset(0.0f, 0.0f, static_cast<float>(cam.arm_length));
+    glm::vec3 eye_local = rot * arm_offset;
+    glm::mat4 view(1.0f);
+    view[0] = glm::vec4(inv_rot[0], 0.0f);
+    view[1] = glm::vec4(inv_rot[1], 0.0f);
+    view[2] = glm::vec4(inv_rot[2], 0.0f);
+    view[3] = glm::vec4(-(inv_rot * eye_local), 1.0f);
+    return view;
 }
 
 glm::mat4 camera_build_proj(const Camera& cam, float aspect)
