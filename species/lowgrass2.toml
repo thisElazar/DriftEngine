@@ -1,0 +1,13 @@
+[species]
+kind = 'grass_clump'
+name = 'lowgrass2'
+
+[morphology]
+blade_count = 36
+blade_height = 0.242
+blade_width = 0.0224
+splay_angle = 41.2
+clump_radius = 0.487
+
+[appearance]
+base_color = [0.42, 0.55, 0.22]

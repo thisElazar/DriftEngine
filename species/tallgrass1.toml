@@ -1,0 +1,13 @@
+[species]
+kind = 'grass_clump'
+name = 'tallgrass1'
+
+[morphology]
+blade_count = 13
+blade_height = 1.105
+blade_width = 0.05
+splay_angle = 5.5
+clump_radius = 0.208
+
+[appearance]
+base_color = [0.42, 0.55, 0.22]

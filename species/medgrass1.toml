@@ -1,0 +1,13 @@
+[species]
+kind = 'grass_clump'
+name = 'medgrass1'
+
+[morphology]
+blade_count = 24
+blade_height = 0.35
+blade_width = 0.0363
+splay_angle = 23.9
+clump_radius = 0.072
+
+[appearance]
+base_color = [0.42, 0.55, 0.22]
