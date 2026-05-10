@@ -156,6 +156,10 @@ void renderer_init(Renderer& r, int width, int height, const char* title)
     VK_CHECK(vkCreateQueryPool(r.device, &qp_ci, nullptr, &r.query_pool));
 
     ImGui::CreateContext();
+    // We manage GLFW_CURSOR mode ourselves (per-frame state machine in main).
+    // Without this flag, ImGui_ImplGlfw_NewFrame forces CURSOR_NORMAL each
+    // frame and the OS cursor leaks back over the rendered world.
+    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     ImGui_ImplGlfw_InitForVulkan(r.window, false);
 
     VkDescriptorPoolSize imgui_pool_sizes[] = {

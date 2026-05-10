@@ -20,30 +20,12 @@ static void key_callback(GLFWwindow* window, int key, int /*scancode*/, int acti
         input.reload_shaders = true;
     if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureKeyboard)
         return;
-
-    bool fp = (ctx->camera->mode == CameraMode::FirstPerson);
-
-    if (key == GLFW_KEY_SPACE) {
-        if (action == GLFW_PRESS) {
-            if (fp) {
-                input.space_held = true;
-                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-            } else {
-                input.pulse_pending = true;
-            }
-        } else if (action == GLFW_RELEASE) {
-            if (input.space_held) {
-                input.space_held = false;
-                if (ctx->camera->mode == CameraMode::FirstPerson) {
-                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-                    input.first_mouse = true;
-                }
-            }
-        }
-    }
-
+    if (key == GLFW_KEY_SPACE && action == GLFW_PRESS)
+        input.pulse_pending = true;
     if (key == GLFW_KEY_F && action == GLFW_PRESS)
         input.toggle_camera_mode = true;
+    if (key == GLFW_KEY_C && action == GLFW_PRESS)
+        input.warp_to_cursor = true;
     if (action == GLFW_PRESS) {
         if (key == GLFW_KEY_1) input.brush_mode = BrushMode::Raise;
         if (key == GLFW_KEY_2) input.brush_mode = BrushMode::Lower;
@@ -77,24 +59,15 @@ static void mouse_button_callback(GLFWwindow* window, int button, int action, in
 
     if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse)
         return;
-
-    bool fp = (ctx->camera->mode == CameraMode::FirstPerson);
-
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
         input.lmb_held = (action == GLFW_PRESS);
     }
     if (button == GLFW_MOUSE_BUTTON_RIGHT) {
         input.rmb_held = (action == GLFW_PRESS);
-        // RMB drives capture only in orbital. FP owns the cursor full-time
-        // (released by holding spacebar).
-        if (!fp) {
-            if (input.rmb_held) {
-                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-                input.first_mouse = true;
-            } else {
-                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-            }
-        }
+        // Cursor mode is driven from main loop (per-frame state machine).
+        // We just signal first_mouse on RMB press so the look delta starts
+        // fresh after the cursor jumps from visible-pos to disabled-virtual.
+        if (input.rmb_held) input.first_mouse = true;
     }
 }
 
@@ -106,21 +79,16 @@ static void cursor_pos_callback(GLFWwindow* window, double xpos, double ypos)
     input.cursor_x = xpos;
     input.cursor_y = ypos;
 
-    bool fp = (ctx->camera->mode == CameraMode::FirstPerson);
-    bool look_active = fp ? !input.space_held : input.rmb_held;
-
-    if (look_active) {
+    if (input.rmb_held) {
         if (input.first_mouse) {
             input.last_cursor_x = xpos;
             input.last_cursor_y = ypos;
             input.first_mouse = false;
-        } else {
-            float dx = static_cast<float>(xpos - input.last_cursor_x);
-            float dy = static_cast<float>(ypos - input.last_cursor_y);
-            camera_apply_mouse_look(*ctx->camera, dx, dy);
+            return;
         }
-    } else {
-        input.first_mouse = true;
+        float dx = static_cast<float>(xpos - input.last_cursor_x);
+        float dy = static_cast<float>(ypos - input.last_cursor_y);
+        camera_apply_mouse_look(*ctx->camera, dx, dy);
     }
     input.last_cursor_x = xpos;
     input.last_cursor_y = ypos;

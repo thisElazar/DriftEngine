@@ -21,6 +21,12 @@ void ui_draw(UIState& s)
             ImGui::Text("Terrain height: %.1f m", s.terrain_height_at_cam);
             ImGui::Text("Tiles: %u", s.visible_tile_count);
             ImGui::Text("Camera: %s  [F to toggle]", s.first_person_mode ? "First-person" : "Orbital");
+            if (s.first_person_mode) {
+                ImGui::Text("Speed: %.2f m/s   (walk %.1f)", s.move_speed_mps, s.walk_speed_setting);
+                ImGui::TextDisabled("Scroll = walk speed   C = fly to cursor");
+            } else {
+                ImGui::Text("Speed: %.0f m/s", s.move_speed_mps);
+            }
         }
 
         if (ImGui::CollapsingHeader("Water Physics", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -96,19 +102,6 @@ void ui_draw(UIState& s)
             ImGui::TextDisabled("F5: hot-reload shaders");
         }
         ImGui::End();
-    }
-
-    if (s.first_person_mode) {
-        ImVec2 disp = ImGui::GetIO().DisplaySize;
-        ImVec2 c(disp.x * 0.5f, disp.y * 0.5f);
-        ImU32 col = IM_COL32(255, 255, 255, 200);
-        const float arm = 6.0f;
-        const float gap = 2.0f;
-        ImDrawList* dl = ImGui::GetForegroundDrawList();
-        dl->AddLine(ImVec2(c.x - arm, c.y), ImVec2(c.x - gap, c.y), col, 1.5f);
-        dl->AddLine(ImVec2(c.x + gap, c.y), ImVec2(c.x + arm, c.y), col, 1.5f);
-        dl->AddLine(ImVec2(c.x, c.y - arm), ImVec2(c.x, c.y - gap), col, 1.5f);
-        dl->AddLine(ImVec2(c.x, c.y + gap), ImVec2(c.x, c.y + arm), col, 1.5f);
     }
 
     ImGui::Render();

@@ -26,6 +26,18 @@ struct FirstPersonState {
     glm::quat  orientation{1.0f, 0.0f, 0.0f, 0.0f};
     float      eye_height_offset = 1.7f;
     float      walk_speed = 4.0f;
+    float      vertical_velocity = 0.0f;
+    bool       grounded = true;
+
+    // Fly-to-cursor: parametric great-circle path with altitude arc.
+    glm::dvec3 warp_d0{0.0, 0.0, 1.0};      // start direction (unit)
+    glm::dvec3 warp_d1{0.0, 0.0, 1.0};      // end direction (unit)
+    double     warp_r0 = 0.0;               // start radius from planet center
+    double     warp_r1 = 0.0;               // end radius from planet center
+    double     warp_arc_h = 0.0;            // peak altitude bump (meters)
+    double     warp_duration = 0.0;         // seconds total
+    double     warp_elapsed = 0.0;
+    bool       warping = false;
 };
 
 struct Camera {
@@ -77,3 +89,8 @@ glm::mat4 camera_build_proj(const Camera& cam, float aspect);
 void camera_switch_to_first_person(Camera& cam, float planet_radius,
                                    std::function<float(glm::vec3)> height_fn);
 void camera_switch_to_orbital(Camera& cam);
+
+// Begin a smoothed fly-to point. In FP, target_world is the desired eye
+// position (already including eye_height_offset above the surface). No-op if
+// the camera is not in FirstPerson mode.
+void camera_begin_warp_to(Camera& cam, glm::dvec3 target_eye);

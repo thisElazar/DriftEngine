@@ -52,8 +52,9 @@ float3 compute_water_color(float depth, float3 sphere_dir, float3 world_pos)
     float3 shallow = float3(0.55, 0.85, 0.90);
     float3 mid     = float3(0.10, 0.40, 0.65);
     float3 deep_c  = float3(0.02, 0.10, 0.22);
-    float t1 = smoothstep(0.0,  200.0, depth);
-    float t2 = smoothstep(200.0, 2000.0, depth);
+    float depth_scale = max(max_elevation, 100.0);
+    float t1 = smoothstep(0.0,  depth_scale * 0.05, depth);
+    float t2 = smoothstep(depth_scale * 0.05, depth_scale * 0.3, depth);
     float3 base = lerp(lerp(shallow, mid, t1), deep_c, t2);
 
     float NdotV = saturate(dot(N, V));
@@ -77,7 +78,8 @@ float4 main(PSInput input) : SV_Target
 {
     float3 color;
 
-    if (input.water_depth > 0.5) {
+    float shore_band = max(max_elevation * 0.005, 0.5);
+    if (input.water_depth > shore_band) {
         color = compute_water_color(input.water_depth, input.sphere_direction, input.world_pos);
         color = lerp(color, float3(0.95, 0.95, 0.97), saturate(input.foam));
     } else if (input.water_depth > 0.0) {
@@ -88,7 +90,7 @@ float4 main(PSInput input) : SV_Target
         terrain_color *= 0.3 + 0.7 * NdotL;
 
         float3 water_col = compute_water_color(input.water_depth, input.sphere_direction, input.world_pos);
-        float blend = smoothstep(0.0, 0.5, input.water_depth);
+        float blend = smoothstep(0.0, shore_band, input.water_depth);
         color = lerp(terrain_color, water_col, blend);
     } else {
         color = elevation_ramp(input.height_normalized);
@@ -100,15 +102,30 @@ float4 main(PSInput input) : SV_Target
         color *= lighting;
     }
 
-    // Brush cursor ring
+    // Brush cursor — two protocols selected by brush_color.a:
+    //   alpha < 0.5  (orbital): brush_world.xyz = sphere direction (unit),
+    //                           brush_world.w   = angular radius (radians).
+    //   alpha >= 0.5 (FP):      brush_world.xyz = camera-relative world pos
+    //                                             of the cursor hit (meters),
+    //                           brush_world.w   = meter radius of the dot.
+    //
+    // FP uses world-space distance because at planet scale the angular dot
+    // product loses fp32 precision (sub-1e-7 rad is unresolvable, so a small
+    // dot tints the whole screen). Camera-relative world coords stay precise.
     float brush_radius = brush_world.w;
     if (brush_radius > 0.0) {
-        float3 brush_dir = normalize(brush_world.xyz);
-        float3 frag_dir = normalize(input.sphere_direction);
-        float angular_dist = acos(clamp(dot(frag_dir, brush_dir), -1.0, 1.0));
-        float ring = smoothstep(brush_radius * 0.9, brush_radius, angular_dist)
-                   * smoothstep(brush_radius * 1.15, brush_radius, angular_dist);
-        color = lerp(color, brush_color.rgb, ring * 0.8);
+        float t;
+        if (brush_color.a >= 0.5) {
+            float dist = length(input.world_pos - brush_world.xyz);
+            t = smoothstep(brush_radius, brush_radius * 0.5, dist);
+        } else {
+            float3 brush_dir = normalize(brush_world.xyz);
+            float3 frag_dir = normalize(input.sphere_direction);
+            float angular_dist = acos(clamp(dot(frag_dir, brush_dir), -1.0, 1.0));
+            t = smoothstep(brush_radius * 0.9, brush_radius, angular_dist)
+              * smoothstep(brush_radius * 1.15, brush_radius, angular_dist);
+        }
+        color = lerp(color, brush_color.rgb, t * 0.85);
     }
 
     // Distance fog

@@ -79,7 +79,16 @@ float cpu_terrain_height(glm::vec3 sphere_dir) {
     float biome_h = (mountain * mtn_w + desert * desert_w + plains * plains_w + polar * polar_w) / total_w;
 
     float h = base + biome_h;
+
+    // Mirror the GPU global-relief + surface-detail stack (planet_gen.cs.hlsl)
+    // so ray-pick and camera height-snap track the rendered surface.
+    h += cpu_ridged3d(sp * 0.4f, 5) * 350.0f;
+    h += (cpu_fbm3d(sp * 0.08f, 6, 2.0f, 0.5f) - 0.5f) * 600.0f;
     h += (cpu_gradient_noise_3d(sp * 0.15f) - 0.5f) * 40.0f;
+    h += (cpu_fbm3d(sp * 1.6f, 3, 2.0f, 0.5f) - 0.5f) * 200.0f;
+    h += (cpu_gradient_noise_3d(sp * 13.0f)  - 0.5f) * 30.0f;
+    h += (cpu_gradient_noise_3d(sp * 80.0f)  - 0.5f) * 8.0f;
+    h += (cpu_gradient_noise_3d(sp * 640.0f) - 0.5f) * 1.5f;
 
     return h;
 }

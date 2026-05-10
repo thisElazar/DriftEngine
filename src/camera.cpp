@@ -161,13 +161,72 @@ static CameraUpdateResult fp_update(FirstPersonState& s, GLFWwindow* window, flo
                                     float planet_radius,
                                     const std::function<float(glm::vec3)>& height_fn)
 {
+    // Fly-to-cursor: parametric great-circle path with sin-bump altitude
+    // arc. Slerp the direction from start to target so we follow the curve
+    // of the planet (a straight 3D line clips through terrain over distance).
+    // Smoothstep ease in/out for natural acceleration. Hard-clamp every step
+    // to stay above terrain so we never tunnel.
+    if (s.warping) {
+        s.warp_elapsed += static_cast<double>(dt);
+        double t = std::clamp(s.warp_elapsed / std::max(s.warp_duration, 1e-3), 0.0, 1.0);
+        double ts = t * t * (3.0 - 2.0 * t);  // smoothstep ease in/out
+
+        // Slerp direction along the great circle.
+        double dot01 = glm::clamp(glm::dot(s.warp_d0, s.warp_d1), -1.0, 1.0);
+        double angle = std::acos(dot01);
+        glm::dvec3 dir;
+        if (angle < 1e-6) {
+            dir = glm::normalize(glm::mix(s.warp_d0, s.warp_d1, ts));
+        } else {
+            double sa = std::sin(angle);
+            dir = glm::normalize(
+                (std::sin((1.0 - ts) * angle) / sa) * s.warp_d0
+              + (std::sin(ts * angle) / sa) * s.warp_d1);
+        }
+
+        // Radius: lerp endpoint radii + sin-arc altitude bump (peaks at t=0.5).
+        double r_lerp = s.warp_r0 + (s.warp_r1 - s.warp_r0) * ts;
+        double r_arc = std::sin(t * 3.14159265358979) * s.warp_arc_h;
+        double r = r_lerp + r_arc;
+
+        // Stay above terrain — no clipping at any point along the path.
+        glm::vec3 dirf = glm::vec3(dir);
+        double h_here = static_cast<double>(height_fn(dirf));
+        double min_r = static_cast<double>(planet_radius) + h_here
+                     + static_cast<double>(s.eye_height_offset);
+        if (r < min_r) r = min_r;
+
+        s.eye = dir * r;
+
+        if (t >= 1.0) {
+            // Land — snap to target, restore walking state.
+            glm::vec3 land_dir = glm::vec3(s.warp_d1);
+            float land_h = height_fn(land_dir);
+            double land_r = static_cast<double>(planet_radius) + static_cast<double>(land_h)
+                          + static_cast<double>(s.eye_height_offset);
+            s.eye = glm::dvec3(land_dir) * land_r;
+            s.warping = false;
+            s.vertical_velocity = 0.0f;
+            s.grounded = true;
+        }
+
+        double altitude = glm::length(s.eye)
+                        - (static_cast<double>(planet_radius) + h_here);
+        return {h_here, altitude};
+    }
+
     glm::vec3 eye_dir = glm::normalize(glm::vec3(s.eye));
     double terrain_height = static_cast<double>(height_fn(eye_dir));
     double terrain_radius = static_cast<double>(planet_radius) + terrain_height;
     double eye_dist = glm::length(s.eye);
     double altitude = eye_dist - terrain_radius;
 
+    bool vertical_input = glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS
+                       || glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS;
+
     float speed = s.walk_speed;
+    if (!s.grounded && !vertical_input)
+        speed *= std::clamp(static_cast<float>(altitude) * 0.1f, 1.0f, 20.0f);
     if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) speed *= 4.0f;
     if (glfwGetKey(window, GLFW_KEY_LEFT_ALT)   == GLFW_PRESS) speed *= 0.25f;
 
@@ -180,42 +239,67 @@ static CameraUpdateResult fp_update(FirstPersonState& s, GLFWwindow* window, flo
     if (glm::dot(fwd_tangent, fwd_tangent) > 1e-6f)     fwd_tangent = glm::normalize(fwd_tangent);
     if (glm::dot(right_tangent, right_tangent) > 1e-6f) right_tangent = glm::normalize(right_tangent);
 
+    // Horizontal movement (tangent to sphere)
     glm::vec3 move(0.0f);
     if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) move += fwd_tangent;
     if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) move -= fwd_tangent;
     if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) move += right_tangent;
     if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) move -= right_tangent;
-    if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) move += radial_up;
-    if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) move -= radial_up;
 
     if (glm::dot(move, move) > 0.0f) {
         glm::vec3 dir = glm::normalize(move);
         s.eye += glm::dvec3(dir) * static_cast<double>(speed * dt);
     }
 
-    // Snap eye to terrain + offset (only when not flying upward via Q/E).
+    // Vertical: Q/E give direct thrust, otherwise gravity pulls toward ground
+    if (vertical_input) {
+        float vert = 0.0f;
+        if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) vert += 1.0f;
+        if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) vert -= 1.0f;
+        s.vertical_velocity = vert * speed;
+        s.grounded = false;
+    } else if (!s.grounded) {
+        s.vertical_velocity -= 9.81f * dt;
+    }
+
+    if (!s.grounded || vertical_input) {
+        s.eye += glm::dvec3(radial_up) * static_cast<double>(s.vertical_velocity * dt);
+    }
+
+    // Smooth height tracking: lerp toward terrain + eye_height
     glm::vec3 new_dir = glm::normalize(glm::vec3(s.eye));
     double h_here = static_cast<double>(height_fn(new_dir));
-    double target_radius = static_cast<double>(planet_radius) + h_here
+    double ground_radius = static_cast<double>(planet_radius) + h_here
                          + static_cast<double>(s.eye_height_offset);
     double cur_dist = glm::length(s.eye);
 
-    bool vertical_input = glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS
-                       || glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS;
-
-    if (!vertical_input) {
-        glm::dvec3 d = glm::dvec3(new_dir);
-        s.eye = d * target_radius;
+    // Walking on the ground: always lerp toward target height. Asymmetric
+    // rate — fast for stepping up onto rises so we don't clip through them,
+    // slower for stepping down so it feels like walking, not falling. Using
+    // a single lerp (not snap-vs-lerp) avoids jitter when stamp falloff makes
+    // ground_radius oscillate by a few cm across the eye position.
+    if (s.grounded && !vertical_input) {
+        double diff = ground_radius - cur_dist;
+        double rate = (diff > 0.0) ? 30.0 : 12.0;
+        double a = std::clamp(static_cast<double>(dt) * rate, 0.0, 1.0);
+        double new_r = cur_dist + diff * a;
+        // Hard floor — never let the eye dip below the surface. Clipping
+        // breaks the ray-pick (sample at ray_origin returns negative and the
+        // forward march early-outs).
+        double floor_r = static_cast<double>(planet_radius) + h_here
+                       + static_cast<double>(s.eye_height_offset) * 0.4;
+        if (new_r < floor_r) new_r = floor_r;
+        s.eye = glm::dvec3(new_dir) * new_r;
+        s.vertical_velocity = 0.0f;
+        altitude = new_r - (static_cast<double>(planet_radius) + h_here);
+    } else if (cur_dist <= ground_radius) {
+        // Falling — landed. Clamp and zero velocity.
+        s.eye = glm::dvec3(new_dir) * ground_radius;
+        s.vertical_velocity = 0.0f;
+        s.grounded = true;
         altitude = static_cast<double>(s.eye_height_offset);
     } else {
-        double min_radius = static_cast<double>(planet_radius) + h_here
-                          + static_cast<double>(s.eye_height_offset) * 0.5;
-        if (cur_dist < min_radius) {
-            s.eye = glm::dvec3(new_dir) * min_radius;
-            altitude = min_radius - (static_cast<double>(planet_radius) + h_here);
-        } else {
-            altitude = cur_dist - (static_cast<double>(planet_radius) + h_here);
-        }
+        altitude = cur_dist - (static_cast<double>(planet_radius) + h_here);
     }
 
     return {terrain_height, altitude};
@@ -343,5 +427,31 @@ void camera_switch_to_orbital(Camera& cam)
     cam.orbit.pivot = cam.fp.eye;
     cam.orbit.orientation = cam.fp.orientation;
     cam.orbit.arm_length = std::max(cam.orbit.arm_length, 50.0);
+    cam.fp.warping = false;
     cam.mode = CameraMode::Orbital;
+}
+
+void camera_begin_warp_to(Camera& cam, glm::dvec3 target_eye)
+{
+    if (cam.mode != CameraMode::FirstPerson) return;
+
+    glm::dvec3 d0 = glm::normalize(cam.fp.eye);
+    glm::dvec3 d1 = glm::normalize(target_eye);
+    double r0 = glm::length(cam.fp.eye);
+    double r1 = glm::length(target_eye);
+
+    double dot01 = glm::clamp(glm::dot(d0, d1), -1.0, 1.0);
+    double angle = std::acos(dot01);
+    double arc_dist = angle * r0;  // surface-arc distance, approx
+
+    cam.fp.warp_d0 = d0;
+    cam.fp.warp_d1 = d1;
+    cam.fp.warp_r0 = r0;
+    cam.fp.warp_r1 = r1;
+    cam.fp.warp_arc_h = std::clamp(arc_dist * 0.1, 50.0, 5000.0);
+    cam.fp.warp_duration = std::clamp(arc_dist / 10000.0, 0.4, 3.0);
+    cam.fp.warp_elapsed = 0.0;
+    cam.fp.warping = true;
+    cam.fp.vertical_velocity = 0.0f;
+    cam.fp.grounded = false;  // we're in flight
 }

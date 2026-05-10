@@ -21,7 +21,7 @@ struct InputState {
     bool reload_shaders      = false;
     bool pulse_pending       = false;
     bool toggle_camera_mode  = false;
-    bool space_held          = false;
+    bool warp_to_cursor      = false;
 
     BrushMode brush_mode = BrushMode::Water;
 };

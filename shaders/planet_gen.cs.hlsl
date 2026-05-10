@@ -151,7 +151,20 @@ float terrain_height(float3 sphere_dir)
     float biome_h = (mountain * mtn_w + desert * desert_w + plains * plains_w + polar * polar_w) / total_w;
 
     float h = base + biome_h;
-    h += (gradient_noise_3d(sp * 0.15) - 0.5) * 40.0;
+
+    // Biome-independent global relief — without this, plains/desert biomes
+    // dominate ~80% of the planet and stay nearly flat (only 400-500 m of
+    // variation on a 200-1700 m base). These layers add visible structure
+    // everywhere while preserving the biome character on top.
+    h += ridged3d(sp * 0.4, 5) * 350.0;                 // global ridge networks (~16 km)
+    h += (fbm3d(sp * 0.08, 6, 2.0, 0.5) - 0.5) * 600.0; // ~80 km broad swell
+
+    // Surface detail — visible at walking scale, independent of biome.
+    h += (gradient_noise_3d(sp * 0.15) - 0.5) * 40.0;   // ~40 km
+    h += (fbm3d(sp * 1.6, 3, 2.0, 0.5)  - 0.5) * 200.0; // ~4 km rolling
+    h += (gradient_noise_3d(sp * 13.0)  - 0.5) * 30.0;  // ~500 m bumps
+    h += (gradient_noise_3d(sp * 80.0)  - 0.5) * 8.0;   // ~80 m undulation
+    h += (gradient_noise_3d(sp * 640.0) - 0.5) * 1.5;   // ~10 m surface
 
     return h;
 }

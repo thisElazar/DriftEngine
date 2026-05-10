@@ -74,7 +74,9 @@ struct UIState {
     bool request_basin_reset = false;
 
     // Camera (read-only display)
-    bool first_person_mode = false;
+    bool  first_person_mode  = false;
+    float move_speed_mps     = 0.0f;
+    float walk_speed_setting = 0.0f;
 };
 
 void ui_draw(UIState& state);

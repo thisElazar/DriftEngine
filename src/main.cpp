@@ -1749,6 +1749,7 @@ int main()
     // Number of terrain stamps already applied to disturbed tiles' h column.
     // When new stamps are added, the delta is dispatched as h-adjust per disturbed tile.
     uint32_t last_processed_stamp_count = 0;
+    uint32_t terrain_gen_stamp_count = 0;
     double last_time = glfwGetTime();
 
     constexpr int AVG_FRAMES = 30;
@@ -2066,24 +2067,42 @@ int main()
             };
 
             if (input.toggle_camera_mode) {
-                if (g_camera.mode == CameraMode::Orbital) {
+                if (g_camera.mode == CameraMode::Orbital)
                     camera_switch_to_first_person(g_camera, PLANET_RADIUS, height_fn);
-                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-                    input.first_mouse = true;
-                    input.space_held = false;
-                } else {
+                else
                     camera_switch_to_orbital(g_camera);
-                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-                    input.rmb_held = false;
-                    input.space_held = false;
-                }
+                input.rmb_held = false;
                 input.toggle_camera_mode = false;
             }
             g_ui.first_person_mode = (g_camera.mode == CameraMode::FirstPerson);
 
+            glm::dvec3 prev_eye = camera_eye_position(g_camera);
             auto cam_result = camera_update(g_camera, window, dt, PLANET_RADIUS, height_fn);
             g_terrain_height_at_cam = cam_result.terrain_height_at_cam;
             g_altitude_above_terrain = cam_result.altitude_above_terrain;
+
+            // Per-frame movement speed for the HUD (smoothed).
+            glm::dvec3 cur_eye = camera_eye_position(g_camera);
+            double frame_speed = (dt > 1e-6) ? glm::length(cur_eye - prev_eye) / dt : 0.0;
+            g_ui.move_speed_mps = static_cast<float>(0.85 * g_ui.move_speed_mps + 0.15 * frame_speed);
+            g_ui.walk_speed_setting = g_camera.fp.walk_speed;
+        }
+
+        // ---- Cursor visibility (UE pattern) ----
+        // OS cursor hidden over the world (3D brush ring/dot is the cursor),
+        // captured during RMB-look, normal over ImGui. Switch only on change
+        // so we're not pinging GLFW every frame.
+        {
+            bool over_ui = ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse;
+            int desired = over_ui     ? GLFW_CURSOR_NORMAL
+                        : input.rmb_held ? GLFW_CURSOR_DISABLED
+                                         : GLFW_CURSOR_HIDDEN;
+            static int current_cursor_mode = -1;
+            if (desired != current_cursor_mode) {
+                glfwSetInputMode(window, GLFW_CURSOR, desired);
+                if (desired == GLFW_CURSOR_DISABLED) input.first_mouse = true;
+                current_cursor_mode = desired;
+            }
         }
 
         // ---- Camera UBO update (camera-relative, reversed-Z infinite far) ----
@@ -2094,13 +2113,13 @@ int main()
         // ---- Ray-pick cursor against heightfield ----
         float grid_x = 0.0f, grid_y = 0.0f;
         glm::vec3 stamp_sphere_dir(0.0f);
+        glm::dvec3 stamp_world_pos(0.0);
         cursor_on_world = false;
         {
             int win_w, win_h;
             glfwGetWindowSize(window, &win_w, &win_h);
-            bool fp = (g_camera.mode == CameraMode::FirstPerson);
-            float ndc_x = fp ? 0.0f : static_cast<float>(input.cursor_x) / win_w * 2.0f - 1.0f;
-            float ndc_y = fp ? 0.0f : static_cast<float>(input.cursor_y) / win_h * 2.0f - 1.0f;
+            float ndc_x = static_cast<float>(input.cursor_x) / win_w * 2.0f - 1.0f;
+            float ndc_y = static_cast<float>(input.cursor_y) / win_h * 2.0f - 1.0f;
 
             glm::mat4 inv_proj = glm::inverse(cam_proj);
             glm::vec4 clip_pt = inv_proj * glm::vec4(ndc_x, ndc_y, 1.0f, 1.0f);
@@ -2109,9 +2128,6 @@ int main()
             glm::dvec3 ray_origin = camera_eye_position(g_camera);
             glm::dvec3 ray_dir = glm::normalize(glm::dvec3(camera_orientation(g_camera) * ray_local));
 
-            // Adaptive forward march against the heightfield, then bisect.
-            // Sphere-intersect is too coarse near the surface (FP) and ignores
-            // stamps; ray-march catches both.
             auto sample = [&](const glm::dvec3& p) -> double {
                 double r = glm::length(p);
                 glm::vec3 dir = glm::vec3(p / r);
@@ -2121,11 +2137,29 @@ int main()
                 return r - (static_cast<double>(PLANET_RADIUS) + static_cast<double>(h));
             };
 
-            const double max_dist = 200000.0;  // 200 km
-            double t = 0.0;
-            double prev_t = 0.0;
-            double prev_d = sample(ray_origin);
-            // If we're somehow already below surface, nothing to pick.
+            // Coarse sphere intersect at the planet base radius gives us the
+            // smooth-planet hit. We start the heightfield march ~10 km before
+            // that to capture mountains, and use the sphere hit as fallback
+            // when the heightfield doesn't converge (avoids the cursor
+            // jumping to the horizon-lock point on near-tangent rays).
+            const double R_base = static_cast<double>(PLANET_RADIUS);
+            double sphere_t = -1.0;
+            {
+                double b = 2.0 * glm::dot(ray_origin, ray_dir);
+                double c = glm::dot(ray_origin, ray_origin) - R_base * R_base;
+                double disc = b * b - 4.0 * c;
+                if (disc >= 0.0) {
+                    double t_hit = 0.5 * (-b - std::sqrt(disc));
+                    if (t_hit > 0.0) sphere_t = t_hit;
+                }
+            }
+
+            const double max_dist = 5.0e7;  // 50 000 km
+            double t_seed = (sphere_t > 0.0) ? std::max(0.0, sphere_t - 10000.0) : 0.0;
+            double t = t_seed;
+            double prev_t = t_seed;
+            double prev_d = sample(ray_origin + t * ray_dir);
+
             if (prev_d > 0.0) {
                 double step = std::max(prev_d * 0.5, 1.0);
                 bool found = false;
@@ -2136,7 +2170,6 @@ int main()
                     if (d <= 0.0) { found = true; break; }
                     prev_t = t;
                     prev_d = d;
-                    // Geometric step growth, bounded.
                     step = std::clamp(d * 0.8, 1.0, 5000.0);
                 }
                 if (found) {
@@ -2148,12 +2181,78 @@ int main()
                     }
                     glm::dvec3 hit = ray_origin + hi * ray_dir;
                     stamp_sphere_dir = glm::normalize(glm::vec3(hit));
+                    stamp_world_pos = hit;
+                    cursor_on_world = true;
+                }
+            }
+
+            // Sphere-hit fallback: heightfield march didn't find a crossing
+            // but the smooth planet would have been hit. Land on the smooth
+            // sphere so the cursor stays put on the planet rather than
+            // jumping out to the horizon-lock point.
+            if (!cursor_on_world && sphere_t > 0.0) {
+                glm::dvec3 hit = ray_origin + sphere_t * ray_dir;
+                glm::vec3 dir = glm::normalize(glm::vec3(hit));
+                float h = cpu_terrain_height_with_stamps(dir, g_stamps.data(),
+                    static_cast<uint32_t>(g_stamps.size()));
+                if (g_ui.ocean_enabled) h = std::max(h, g_ui.sea_level);
+                double surf_r = R_base + static_cast<double>(h);
+                stamp_sphere_dir = dir;
+                stamp_world_pos = glm::dvec3(dir) * surf_r;
+                cursor_on_world = true;
+            }
+
+            // Horizon-lock (UE port): ray genuinely missed the planet (sky).
+            // Take the ray's closest approach to the planet center, but cap
+            // at ~200 km along the ray so we don't land on the far side of
+            // the planet when looking near the horizon.
+            if (!cursor_on_world) {
+                double t_close = -glm::dot(ray_origin, ray_dir);
+                if (t_close > 0.0) {
+                    double t_use = std::min(t_close, 200000.0);
+                    glm::dvec3 close_pt = ray_origin + t_use * ray_dir;
+                    glm::vec3 dir = glm::normalize(glm::vec3(close_pt));
+                    float h = cpu_terrain_height_with_stamps(dir, g_stamps.data(),
+                        static_cast<uint32_t>(g_stamps.size()));
+                    if (g_ui.ocean_enabled) h = std::max(h, g_ui.sea_level);
+                    double surf_r = R_base + static_cast<double>(h);
+                    stamp_sphere_dir = dir;
+                    stamp_world_pos = glm::dvec3(dir) * surf_r;
                     cursor_on_world = true;
                 }
             }
         }
-        bool brush_active = input.lmb_held && !input.rmb_held;
+        // ---- Fly-to-cursor (C key, FP only) ----
+        if (input.warp_to_cursor) {
+            if (g_camera.mode == CameraMode::FirstPerson && cursor_on_world) {
+                float h = cpu_terrain_height_with_stamps(stamp_sphere_dir, g_stamps.data(),
+                    static_cast<uint32_t>(g_stamps.size()));
+                if (g_ui.ocean_enabled) h = std::max(h, g_ui.sea_level);
+                double target_radius = static_cast<double>(PLANET_RADIUS) + static_cast<double>(h)
+                                     + static_cast<double>(g_camera.fp.eye_height_offset);
+                glm::dvec3 target_eye = glm::dvec3(stamp_sphere_dir) * target_radius;
+                camera_begin_warp_to(g_camera, target_eye);
+            }
+            input.warp_to_cursor = false;
+        }
+
+        // FP is move + warp only. Terrain/water painting happens in orbital
+        // (god's-eye) mode where the brush ring + LMB are the editing tools.
+        bool can_paint = (g_camera.mode == CameraMode::Orbital);
+        bool brush_active = can_paint && input.lmb_held && !input.rmb_held;
         bool brush_hit = brush_active && cursor_on_world;
+
+        // Brush angular radius scales with view distance so the ring stays a
+        // sensible on-screen size at any altitude (UE pattern). Drives both the
+        // visualization and the stamp angular radius — WYSIWYG.
+        float effective_angular = 0.0f;
+        if (cursor_on_world) {
+            glm::dvec3 eye_w = camera_eye_position(g_camera);
+            double pick_dist = glm::length(stamp_world_pos - eye_w);
+            double scale = std::clamp(pick_dist / 5000.0, 0.0005, 4.0);
+            float base = g_ui.brush_radius_grid * g_ui.stamp_angular_scale;
+            effective_angular = std::clamp(static_cast<float>(base * scale), 1e-6f, 0.2f);
+        }
 
         // ---- Place terrain stamp on LMB ----
         if (brush_hit &&
@@ -2164,8 +2263,7 @@ int main()
             double now_s = glfwGetTime();
             if (now_s - last_stamp_time > 0.1) {
                 float sign = (input.brush_mode == BrushMode::Raise) ? 1.0f : -1.0f;
-                float angular_radius = g_ui.brush_radius_grid * g_ui.stamp_angular_scale;
-                angular_radius = std::clamp(angular_radius, 0.0001f, 0.2f);
+                float angular_radius = effective_angular;
 
                 TerrainStamp stamp{};
                 stamp.pos_x = stamp_sphere_dir.x;
@@ -2190,8 +2288,7 @@ int main()
             static double last_water_stamp_time = 0.0;
             double now_s = glfwGetTime();
             if (now_s - last_water_stamp_time > 0.1) {
-                float angular_radius = g_ui.brush_radius_grid * g_ui.stamp_angular_scale;
-                angular_radius = std::clamp(angular_radius, 0.0001f, 0.2f);
+                float angular_radius = effective_angular;
 
                 WaterStamp s{};
                 s.pos_x = stamp_sphere_dir.x;
@@ -2209,18 +2306,19 @@ int main()
             }
         }
 
-        // ---- Camera UBO update (perspective + brush ring) ----
+        // ---- Camera UBO update (perspective + brush cursor) ----
         {
-            float brush_radius_world = g_ui.brush_radius_grid * bp.cell_spacing;
+            // brush_color.a = 0 → ring (orbital), 1 → filled dot (FP).
+            float cursor_alpha = (g_camera.mode == CameraMode::FirstPerson) ? 1.0f : 0.0f;
             glm::vec4 brush_color;
             if (input.brush_mode == BrushMode::Raise)
-                brush_color = glm::vec4(0.30f, 0.95f, 0.40f, 1.0f);
+                brush_color = glm::vec4(0.30f, 0.95f, 0.40f, cursor_alpha);
             else if (input.brush_mode == BrushMode::Lower)
-                brush_color = glm::vec4(0.95f, 0.45f, 0.20f, 1.0f);
+                brush_color = glm::vec4(0.95f, 0.45f, 0.20f, cursor_alpha);
             else if (input.brush_mode == BrushMode::Sand)
-                brush_color = glm::vec4(0.85f, 0.70f, 0.45f, 1.0f);
+                brush_color = glm::vec4(0.85f, 0.70f, 0.45f, cursor_alpha);
             else
-                brush_color = glm::vec4(0.30f, 0.85f, 0.95f, 1.0f);
+                brush_color = glm::vec4(0.30f, 0.85f, 0.95f, cursor_alpha);
 
             CameraData cam{};
             cam.view = cam_view;
@@ -2231,18 +2329,33 @@ int main()
             cam._pad1 = 0.0f;
             cam.cam_pos = glm::vec3(0.0f);  // camera-relative rendering
             cam._pad2 = g_ui.mud_visibility;
-            float angular_r = g_ui.brush_radius_grid * g_ui.stamp_angular_scale;
-            cam.brush_world = glm::vec4(
-                stamp_sphere_dir.x, stamp_sphere_dir.y, stamp_sphere_dir.z,
-                cursor_on_world ? angular_r : 0.0f);
+            // Two protocols, picked by brush_color.a:
+            //   FP (alpha=1): camera-relative world pos + meter radius.
+            //   Orbital (alpha=0): sphere direction + angular radius.
+            if (g_camera.mode == CameraMode::FirstPerson) {
+                glm::dvec3 eye_w = camera_eye_position(g_camera);
+                glm::vec3 cam_rel = glm::vec3(stamp_world_pos - eye_w);
+                double pick_dist = glm::length(stamp_world_pos - eye_w);
+                // Dot world-radius scales with view distance so it stays
+                // ~0.3° on screen — visible at any reach. No upper cap; at
+                // 100 km distance the dot is 500 m, at 1000 km it's 5 km,
+                // which still reads as a small pip on screen.
+                float dot_r = static_cast<float>(std::clamp(pick_dist * 0.005, 0.25, 1.0e6));
+                cam.brush_world = glm::vec4(cam_rel.x, cam_rel.y, cam_rel.z,
+                                            cursor_on_world ? dot_r : 0.0f);
+            } else {
+                cam.brush_world = glm::vec4(
+                    stamp_sphere_dir.x, stamp_sphere_dir.y, stamp_sphere_dir.z,
+                    cursor_on_world ? effective_angular : 0.0f);
+            }
             cam.brush_color = brush_color;
             cam.inv_view_proj = glm::inverse(cam_proj * cam_view);
             std::memcpy(camera_ubo_info.pMappedData, &cam, sizeof(cam));
             vmaFlushAllocation(allocator, camera_ubo_alloc, 0, VK_WHOLE_SIZE);
         }
 
-        // ---- Terrain brush dispatch (before SWE) ----
-        if (brush_hit && (input.brush_mode == BrushMode::Raise || input.brush_mode == BrushMode::Lower)) {
+        // ---- Terrain brush dispatch (flat-grid only, before SWE) ----
+        if (!g_ui.ocean_enabled && brush_hit && (input.brush_mode == BrushMode::Raise || input.brush_mode == BrushMode::Lower)) {
             float sign = (input.brush_mode == BrushMode::Raise) ? 1.0f : -1.0f;
 
             TerrainBrushPC tb_pc{};
@@ -2276,8 +2389,8 @@ int main()
             vkCmdPipelineBarrier2(frame.cmd, &tb_dep);
         }
 
-        // ---- Sand brush dispatch ----
-        if (brush_hit && input.brush_mode == BrushMode::Sand) {
+        // ---- Sand brush dispatch (flat-grid only) ----
+        if (!g_ui.ocean_enabled && brush_hit && input.brush_mode == BrushMode::Sand) {
             TerrainBrushPC sb_pc{};
             sb_pc.brush_x = grid_x;
             sb_pc.brush_y = grid_y;
@@ -2422,43 +2535,59 @@ int main()
                 g_water_stamps_dirty = false;
             }
 
-            // Dispatch planet_gen compute for each visible tile
-            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines.terrain_gen_pipeline);
-            vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                pipelines.terrain_gen_pipeline_layout, 0, 1, &terrain_gen_desc_set, 0, nullptr);
-
-            for (uint32_t i = 0; i < visible_tiles.size(); i++) {
-                const auto& tile = visible_tiles[i];
-                float ts = 2.0f / static_cast<float>(1u << tile.level);
-
-                PlanetGenPC gen_pc{};
-                gen_pc.u_min = -1.0f + tile.x * ts;
-                gen_pc.v_min = -1.0f + tile.y * ts;
-                gen_pc.tile_size = ts;
-                gen_pc.face = tile.face;
-                gen_pc.pool_index = tile_slots[i];
-                gen_pc.tex_res = PLANET_TILE_RES;
-                gen_pc.seed = 42;
-                gen_pc.stamp_count = static_cast<uint32_t>(g_stamps.size());
-
-                vkCmdPushConstants(frame.cmd, pipelines.terrain_gen_pipeline_layout,
-                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gen_pc), &gen_pc);
-                vkCmdDispatch(frame.cmd, (PLANET_TILE_RES + 7) / 8, (PLANET_TILE_RES + 7) / 8, 1);
+            // Build the set of tiles that need terrain (re)generation:
+            // - newly visible tiles (pending_init)
+            // - all allocated tiles when stamps change (stamps are global)
+            bool stamps_changed = (static_cast<uint32_t>(g_stamps.size()) != terrain_gen_stamp_count);
+            std::vector<std::pair<QuadNode, uint32_t>> tiles_to_gen;
+            if (stamps_changed) {
+                for (const auto& [tile, slot] : tile_slot_map)
+                    tiles_to_gen.push_back({tile, slot});
+                terrain_gen_stamp_count = static_cast<uint32_t>(g_stamps.size());
+            } else {
+                for (const auto& tile : pending_init) {
+                    auto it = tile_slot_map.find(tile);
+                    if (it != tile_slot_map.end())
+                        tiles_to_gen.push_back({tile, it->second});
+                }
             }
 
-            // Barrier: compute -> compute+vertex (SWE reads heightmap, then VS reads both)
-            VkMemoryBarrier2 gen_bar{};
-            gen_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            gen_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            gen_bar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            gen_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
-                                 | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-            gen_bar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-            VkDependencyInfo gen_dep{};
-            gen_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            gen_dep.memoryBarrierCount = 1;
-            gen_dep.pMemoryBarriers = &gen_bar;
-            vkCmdPipelineBarrier2(frame.cmd, &gen_dep);
+            if (!tiles_to_gen.empty()) {
+                vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines.terrain_gen_pipeline);
+                vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    pipelines.terrain_gen_pipeline_layout, 0, 1, &terrain_gen_desc_set, 0, nullptr);
+
+                for (const auto& [tile, slot] : tiles_to_gen) {
+                    float ts = 2.0f / static_cast<float>(1u << tile.level);
+
+                    PlanetGenPC gen_pc{};
+                    gen_pc.u_min = -1.0f + tile.x * ts;
+                    gen_pc.v_min = -1.0f + tile.y * ts;
+                    gen_pc.tile_size = ts;
+                    gen_pc.face = tile.face;
+                    gen_pc.pool_index = slot;
+                    gen_pc.tex_res = PLANET_TILE_RES;
+                    gen_pc.seed = 42;
+                    gen_pc.stamp_count = static_cast<uint32_t>(g_stamps.size());
+
+                    vkCmdPushConstants(frame.cmd, pipelines.terrain_gen_pipeline_layout,
+                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(gen_pc), &gen_pc);
+                    vkCmdDispatch(frame.cmd, (PLANET_TILE_RES + 7) / 8, (PLANET_TILE_RES + 7) / 8, 1);
+                }
+
+                VkMemoryBarrier2 gen_bar{};
+                gen_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                gen_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                gen_bar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                gen_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+                gen_bar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                VkDependencyInfo gen_dep{};
+                gen_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                gen_dep.memoryBarrierCount = 1;
+                gen_dep.pMemoryBarriers = &gen_bar;
+                vkCmdPipelineBarrier2(frame.cmd, &gen_dep);
+            }
         }
 
         // ---- Planet SWE init + step (per-tile, only on disturbed tiles) ----
