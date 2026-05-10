@@ -667,8 +667,9 @@ void draw_lab_panel(int& species_kind, int& view_mode,
         ImGui::TextUnformatted("Environment");
         ImGui::Separator();
         ImGui::SliderFloat("region_size",   &eco_params.region_size,   5.0f, 40.0f, "%.0f m");
-        ImGui::SliderFloat("density_scale", &eco_params.density_scale, 0.1f, 3.0f,  "%.2f");
-        ImGui::SliderFloat("r_min",         &eco_params.r_min,         0.1f, 2.0f,  "%.2f m");
+        ImGui::SliderFloat("density_scale",      &eco_params.density_scale,      0.1f, 3.0f,  "%.2f");
+        ImGui::SliderFloat("phenotype_variance", &eco_params.phenotype_variance, 0.0f, 1.0f,  "%.2f");
+        ImGui::SliderFloat("r_min",              &eco_params.r_min,              0.1f, 2.0f,  "%.2f m");
         ImGui::SliderFloat("r_max",         &eco_params.r_max,         1.0f, 8.0f,  "%.1f m");
         int seed_int = static_cast<int>(eco_params.seed);
         if (ImGui::SliderInt("seed", &seed_int, 0, 999))

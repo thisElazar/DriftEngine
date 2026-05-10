@@ -30,6 +30,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -56,6 +58,9 @@ double g_terrain_height_at_cam = 0.0;
 double g_altitude_above_terrain = 100000.0;
 std::vector<TerrainStamp> g_stamps;
 bool g_stamps_dirty = false;
+
+std::vector<WaterStamp> g_water_stamps;
+bool g_water_stamps_dirty = false;
 UIState g_ui;
 float g_accumulated_atmo_time = 0.0f;
 
@@ -287,6 +292,44 @@ int main()
     VK_CHECK(vmaCreateBuffer(allocator, &stamp_buf_ci, &stamp_buf_ai,
         &stamp_buf, &stamp_buf_alloc, &stamp_buf_info));
 
+    // ---- Water stamp buffer (parallel to terrain stamps) --------------------
+    VkBuffer water_stamp_buf = VK_NULL_HANDLE;
+    VmaAllocation water_stamp_buf_alloc = VK_NULL_HANDLE;
+    VmaAllocationInfo water_stamp_buf_info{};
+    {
+        VkBufferCreateInfo bci{};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = MAX_WATER_STAMPS * sizeof(WaterStamp);
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        VmaAllocationCreateInfo ai{};
+        ai.usage = VMA_MEMORY_USAGE_AUTO;
+        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+                 | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VK_CHECK(vmaCreateBuffer(allocator, &bci, &ai,
+            &water_stamp_buf, &water_stamp_buf_alloc, &water_stamp_buf_info));
+    }
+
+    // ---- Planet SWE edge-flag buffer (per-pool-slot, host-readable) ----------
+    // The step shader InterlockedOrs bits into edge_flags[pool_index] when water
+    // crosses an edge above static depth. CPU reads this each frame to anchor
+    // missing neighbors and grow the simulation domain.
+    VkBuffer edge_flags_buf = VK_NULL_HANDLE;
+    VmaAllocation edge_flags_alloc = VK_NULL_HANDLE;
+    VmaAllocationInfo edge_flags_info{};
+    {
+        VkBufferCreateInfo bci{};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = PLANET_TILE_POOL * sizeof(uint32_t);
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                  | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VmaAllocationCreateInfo ai{};
+        ai.usage = VMA_MEMORY_USAGE_AUTO;
+        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+                 | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VK_CHECK(vmaCreateBuffer(allocator, &bci, &ai,
+            &edge_flags_buf, &edge_flags_alloc, &edge_flags_info));
+    }
+
     // ---- SWE images (ping-pong state + output) ------------------------------
     SweImage swe_state_a = create_swe_image(device, allocator, SWE_GRID_W, SWE_GRID_H);
     SweImage swe_state_b = create_swe_image(device, allocator, SWE_GRID_W, SWE_GRID_H);
@@ -426,7 +469,7 @@ int main()
     pool_sizes[3].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     pool_sizes[3].descriptorCount = 48;
     pool_sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_sizes[4].descriptorCount = 5;
+    pool_sizes[4].descriptorCount = 12;
 
     VkDescriptorPoolCreateInfo dp_ci{};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1307,11 +1350,24 @@ int main()
         terrain_info.imageView = clipmap_hm_view;
         terrain_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkDescriptorImageInfo state_info{};
-        state_info.imageView = water_state_a_view;
-        state_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo state_a_info{};
+        state_a_info.imageView = water_state_a_view;
+        state_a_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[2]{};
+        VkDescriptorImageInfo state_b_info{};
+        state_b_info.imageView = water_state_b_view;
+        state_b_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo output_info{};
+        output_info.imageView = water_output_view;
+        output_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorBufferInfo water_stamp_bi{};
+        water_stamp_bi.buffer = water_stamp_buf;
+        water_stamp_bi.offset = 0;
+        water_stamp_bi.range = MAX_WATER_STAMPS * sizeof(WaterStamp);
+
+        VkWriteDescriptorSet writes[5]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = planet_swe_init_desc_set;
         writes[0].dstBinding = 0;
@@ -1324,8 +1380,62 @@ int main()
         writes[1].dstBinding = 1;
         writes[1].descriptorCount = 1;
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        writes[1].pImageInfo = &state_info;
+        writes[1].pImageInfo = &state_a_info;
 
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = planet_swe_init_desc_set;
+        writes[2].dstBinding = 2;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[2].pImageInfo = &state_b_info;
+
+        writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[3].dstSet = planet_swe_init_desc_set;
+        writes[3].dstBinding = 3;
+        writes[3].descriptorCount = 1;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[3].pImageInfo = &output_info;
+
+        writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[4].dstSet = planet_swe_init_desc_set;
+        writes[4].dstBinding = 4;
+        writes[4].descriptorCount = 1;
+        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[4].pBufferInfo = &water_stamp_bi;
+
+        vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
+    }
+
+    // Planet SWE h-adjust descriptor: state_a + state_b (storage images, RW).
+    VkDescriptorSet planet_swe_h_adjust_desc_set = VK_NULL_HANDLE;
+    {
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = desc_pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &pipelines.planet_swe_h_adjust_desc_layout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &ai, &planet_swe_h_adjust_desc_set));
+
+        VkDescriptorImageInfo state_a_info{};
+        state_a_info.imageView = water_state_a_view;
+        state_a_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo state_b_info{};
+        state_b_info.imageView = water_state_b_view;
+        state_b_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkWriteDescriptorSet writes[2]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = planet_swe_h_adjust_desc_set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[0].pImageInfo = &state_a_info;
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = planet_swe_h_adjust_desc_set;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[1].pImageInfo = &state_b_info;
         vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
     }
 
@@ -1355,8 +1465,13 @@ int main()
         output_info.imageView = water_output_view;
         output_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
+        VkDescriptorBufferInfo edge_flags_bi{};
+        edge_flags_bi.buffer = edge_flags_buf;
+        edge_flags_bi.offset = 0;
+        edge_flags_bi.range = VK_WHOLE_SIZE;
+
         // Set 0: read A -> write B
-        VkWriteDescriptorSet w0[4]{};
+        VkWriteDescriptorSet w0[5]{};
         w0[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w0[0].dstSet = planet_swe_step_desc_sets[0];
         w0[0].dstBinding = 0;
@@ -1381,10 +1496,16 @@ int main()
         w0[3].descriptorCount = 1;
         w0[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         w0[3].pImageInfo = &output_info;
-        vkUpdateDescriptorSets(device, 4, w0, 0, nullptr);
+        w0[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w0[4].dstSet = planet_swe_step_desc_sets[0];
+        w0[4].dstBinding = 4;
+        w0[4].descriptorCount = 1;
+        w0[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w0[4].pBufferInfo = &edge_flags_bi;
+        vkUpdateDescriptorSets(device, 5, w0, 0, nullptr);
 
         // Set 1: read B -> write A
-        VkWriteDescriptorSet w1[4]{};
+        VkWriteDescriptorSet w1[5]{};
         w1[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w1[0].dstSet = planet_swe_step_desc_sets[1];
         w1[0].dstBinding = 0;
@@ -1409,7 +1530,13 @@ int main()
         w1[3].descriptorCount = 1;
         w1[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         w1[3].pImageInfo = &output_info;
-        vkUpdateDescriptorSets(device, 4, w1, 0, nullptr);
+        w1[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w1[4].dstSet = planet_swe_step_desc_sets[1];
+        w1[4].dstBinding = 4;
+        w1[4].descriptorCount = 1;
+        w1[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w1[4].pBufferInfo = &edge_flags_bi;
+        vkUpdateDescriptorSets(device, 5, w1, 0, nullptr);
     }
 
     uint32_t planet_swe_ping_pong = 0;
@@ -1604,8 +1731,24 @@ int main()
     uint32_t sediment_ping_pong = 0;
     uint32_t atmo_ping_pong = 0;
     bool atmo_needs_init = true;
-    std::vector<QuadNode> prev_visible_tiles;
+    // Stable slot allocator: a QuadNode keeps the same pool_index for as long as it
+    // remains visible OR is disturbed. Slots are recycled (LIFO) when a tile leaves
+    // the visible set AND is not disturbed. Disturbed tiles stay anchored so the
+    // brushed water keeps simulating across camera moves and LOD transitions.
+    std::unordered_map<QuadNode, uint32_t, QuadNodeHash> tile_slot_map;
+    auto INVALID_TILE = QuadNode{0xFFFFFFFFu, 0u, 0u, 0u};
+    std::vector<QuadNode> slot_to_tile(PLANET_TILE_POOL, INVALID_TILE);
+    std::vector<uint32_t> free_slots;
+    free_slots.reserve(PLANET_TILE_POOL);
+    for (uint32_t s = PLANET_TILE_POOL; s-- > 0; ) free_slots.push_back(s);
     bool planet_swe_needs_full_init = true;
+    std::unordered_set<QuadNode, QuadNodeHash> disturbed_tiles;
+    // Tiles that need their SWE state initialized on the next init pass — a single
+    // queue fed by the visible-tile allocator and by the cross-tile auto-anchor path.
+    std::unordered_set<QuadNode, QuadNodeHash> pending_init;
+    // Number of terrain stamps already applied to disturbed tiles' h column.
+    // When new stamps are added, the delta is dispatched as h-adjust per disturbed tile.
+    uint32_t last_processed_stamp_count = 0;
     double last_time = glfwGetTime();
 
     constexpr int AVG_FRAMES = 30;
@@ -1915,13 +2058,30 @@ int main()
 
         // ---- Per-frame camera movement (double precision) ----
         {
-            auto cam_result = camera_update(g_camera, window, dt, PLANET_RADIUS,
-                [](glm::vec3 dir) {
-                    float h = cpu_terrain_height_with_stamps(dir, g_stamps.data(),
-                        static_cast<uint32_t>(g_stamps.size()));
-                    if (g_ui.ocean_enabled) h = std::max(h, g_ui.sea_level);
-                    return h;
-                });
+            auto height_fn = [](glm::vec3 dir) {
+                float h = cpu_terrain_height_with_stamps(dir, g_stamps.data(),
+                    static_cast<uint32_t>(g_stamps.size()));
+                if (g_ui.ocean_enabled) h = std::max(h, g_ui.sea_level);
+                return h;
+            };
+
+            if (input.toggle_camera_mode) {
+                if (g_camera.mode == CameraMode::Orbital) {
+                    camera_switch_to_first_person(g_camera, PLANET_RADIUS, height_fn);
+                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                    input.first_mouse = true;
+                    input.space_held = false;
+                } else {
+                    camera_switch_to_orbital(g_camera);
+                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                    input.rmb_held = false;
+                    input.space_held = false;
+                }
+                input.toggle_camera_mode = false;
+            }
+            g_ui.first_person_mode = (g_camera.mode == CameraMode::FirstPerson);
+
+            auto cam_result = camera_update(g_camera, window, dt, PLANET_RADIUS, height_fn);
             g_terrain_height_at_cam = cam_result.terrain_height_at_cam;
             g_altitude_above_terrain = cam_result.altitude_above_terrain;
         }
@@ -1931,35 +2091,62 @@ int main()
         glm::mat4 cam_view = camera_build_view(g_camera);
         glm::mat4 cam_proj = camera_build_proj(g_camera, aspect);
 
-        // ---- Ray-pick cursor on sphere surface ----
+        // ---- Ray-pick cursor against heightfield ----
         float grid_x = 0.0f, grid_y = 0.0f;
         glm::vec3 stamp_sphere_dir(0.0f);
         cursor_on_world = false;
         {
             int win_w, win_h;
             glfwGetWindowSize(window, &win_w, &win_h);
-            float ndc_x = static_cast<float>(input.cursor_x) / win_w * 2.0f - 1.0f;
-            float ndc_y = static_cast<float>(input.cursor_y) / win_h * 2.0f - 1.0f;
+            bool fp = (g_camera.mode == CameraMode::FirstPerson);
+            float ndc_x = fp ? 0.0f : static_cast<float>(input.cursor_x) / win_w * 2.0f - 1.0f;
+            float ndc_y = fp ? 0.0f : static_cast<float>(input.cursor_y) / win_h * 2.0f - 1.0f;
 
-            // Unproject screen point through inverse projection to get camera-local ray
             glm::mat4 inv_proj = glm::inverse(cam_proj);
             glm::vec4 clip_pt = inv_proj * glm::vec4(ndc_x, ndc_y, 1.0f, 1.0f);
             clip_pt /= clip_pt.w;
-            // Rotate camera-local direction into world space
             glm::vec3 ray_local = glm::normalize(glm::vec3(clip_pt));
             glm::dvec3 ray_origin = camera_eye_position(g_camera);
-            glm::dvec3 ray_dir = glm::normalize(glm::dvec3(g_camera.orientation * ray_local));
+            glm::dvec3 ray_dir = glm::normalize(glm::dvec3(camera_orientation(g_camera) * ray_local));
 
-            double sphere_r = static_cast<double>(PLANET_RADIUS) + g_terrain_height_at_cam;
-            double a = glm::dot(ray_dir, ray_dir);
-            double b = 2.0 * glm::dot(ray_origin, ray_dir);
-            double c = glm::dot(ray_origin, ray_origin) - sphere_r * sphere_r;
-            double disc = b * b - 4.0 * a * c;
+            // Adaptive forward march against the heightfield, then bisect.
+            // Sphere-intersect is too coarse near the surface (FP) and ignores
+            // stamps; ray-march catches both.
+            auto sample = [&](const glm::dvec3& p) -> double {
+                double r = glm::length(p);
+                glm::vec3 dir = glm::vec3(p / r);
+                float h = cpu_terrain_height_with_stamps(dir, g_stamps.data(),
+                    static_cast<uint32_t>(g_stamps.size()));
+                if (g_ui.ocean_enabled) h = std::max(h, g_ui.sea_level);
+                return r - (static_cast<double>(PLANET_RADIUS) + static_cast<double>(h));
+            };
 
-            if (disc >= 0.0) {
-                double t = (-b - std::sqrt(disc)) / (2.0 * a);
-                if (t > 0.0) {
-                    glm::dvec3 hit = ray_origin + t * ray_dir;
+            const double max_dist = 200000.0;  // 200 km
+            double t = 0.0;
+            double prev_t = 0.0;
+            double prev_d = sample(ray_origin);
+            // If we're somehow already below surface, nothing to pick.
+            if (prev_d > 0.0) {
+                double step = std::max(prev_d * 0.5, 1.0);
+                bool found = false;
+                for (int i = 0; i < 64; ++i) {
+                    t += step;
+                    if (t > max_dist) break;
+                    double d = sample(ray_origin + t * ray_dir);
+                    if (d <= 0.0) { found = true; break; }
+                    prev_t = t;
+                    prev_d = d;
+                    // Geometric step growth, bounded.
+                    step = std::clamp(d * 0.8, 1.0, 5000.0);
+                }
+                if (found) {
+                    double lo = prev_t, hi = t;
+                    for (int i = 0; i < 20; ++i) {
+                        double mid = 0.5 * (lo + hi);
+                        if (sample(ray_origin + mid * ray_dir) > 0.0) lo = mid;
+                        else hi = mid;
+                    }
+                    glm::dvec3 hit = ray_origin + hi * ray_dir;
                     stamp_sphere_dir = glm::normalize(glm::vec3(hit));
                     cursor_on_world = true;
                 }
@@ -1990,6 +2177,35 @@ int main()
                 g_stamps.push_back(stamp);
                 g_stamps_dirty = true;
                 last_stamp_time = now_s;
+            }
+        }
+
+        // ---- Place water stamp on LMB (parallel to terrain stamps) ----
+        // Persistent record of brushed water; applied to every LOD's SWE init so
+        // a brushed lake stays visible from any zoom. The dynamic SWE step still
+        // adds waves on top at the brushed level — this is the static skeleton.
+        if (brush_hit && input.brush_mode == BrushMode::Water &&
+            g_water_stamps.size() < MAX_WATER_STAMPS)
+        {
+            static double last_water_stamp_time = 0.0;
+            double now_s = glfwGetTime();
+            if (now_s - last_water_stamp_time > 0.1) {
+                float angular_radius = g_ui.brush_radius_grid * g_ui.stamp_angular_scale;
+                angular_radius = std::clamp(angular_radius, 0.0001f, 0.2f);
+
+                WaterStamp s{};
+                s.pos_x = stamp_sphere_dir.x;
+                s.pos_y = stamp_sphere_dir.y;
+                s.pos_z = stamp_sphere_dir.z;
+                s.radius = angular_radius;
+                // The brush deposits a *column*: per stamp adds brush_strength
+                // metres at the center, falling off via the gaussian. This makes
+                // brushing build up a lake over a couple of seconds.
+                s.water_amount = g_ui.brush_strength;
+                s.cos_radius = std::cos(angular_radius);
+                g_water_stamps.push_back(s);
+                g_water_stamps_dirty = true;
+                last_water_stamp_time = now_s;
             }
         }
 
@@ -2111,6 +2327,85 @@ int main()
             return a.y < b.y;
         });
         g_ui.visible_tile_count = static_cast<uint32_t>(visible_tiles.size());
+
+        // ---- Auto-anchor neighbors from previous frame's edge flags -----------
+        // The step shader InterlockedOrs which edges of each disturbed tile have
+        // water above static. We resolve those flagged tiles' missing same-face
+        // same-level neighbors and anchor them so water can flow into them next
+        // frame. Face-seam and LOD-mismatch crossings are deferred to Phase 2/3
+        // (planet_neighbor_same_face returns invalid; that edge stays reflective).
+        if (g_ui.ocean_enabled) {
+            const uint32_t* flags = static_cast<const uint32_t*>(edge_flags_info.pMappedData);
+            if (flags) {
+                for (uint32_t s = 0; s < PLANET_TILE_POOL; ++s) {
+                    if (flags[s] == 0) continue;
+                    QuadNode tile = slot_to_tile[s];
+                    if (tile.face == INVALID_TILE.face) continue;  // slot is unassigned
+                    for (int dir = 0; dir < 4; ++dir) {
+                        uint32_t bit = 1u << dir;
+                        if (!(flags[s] & bit)) continue;
+                        QuadNeighbor nb = planet_neighbor_same_face(tile, dir);
+                        if (!nb.valid) continue;
+                        if (tile_slot_map.count(nb.tile)) {
+                            // Already anchored. Just join the simulation.
+                            disturbed_tiles.insert(nb.tile);
+                            continue;
+                        }
+                        if (free_slots.empty()) continue;
+                        uint32_t ns = free_slots.back();
+                        free_slots.pop_back();
+                        tile_slot_map.emplace(nb.tile, ns);
+                        slot_to_tile[ns] = nb.tile;
+                        disturbed_tiles.insert(nb.tile);
+                        pending_init.insert(nb.tile);
+                    }
+                }
+            }
+        }
+
+        // ---- Stable slot allocation -------------------------------------------
+        // tile_slots[i] is the pool_index for visible_tiles[i]. Tiles new to the
+        // visible set are pushed into pending_init for the SWE init pass.
+        std::vector<uint32_t> tile_slots(visible_tiles.size());
+        {
+            std::unordered_set<QuadNode, QuadNodeHash> visible_set;
+            visible_set.reserve(visible_tiles.size());
+            for (const auto& t : visible_tiles) visible_set.insert(t);
+
+            // Free slots whose tile has left the visible set — but never free a
+            // disturbed (brushed) tile. Those stay anchored to their slot so the
+            // SWE simulation keeps running and the water survives camera moves
+            // / LOD transitions, like terrain stamps survive.
+            for (auto it = tile_slot_map.begin(); it != tile_slot_map.end(); ) {
+                if (!visible_set.count(it->first) && !disturbed_tiles.count(it->first)) {
+                    slot_to_tile[it->second] = INVALID_TILE;
+                    free_slots.push_back(it->second);
+                    it = tile_slot_map.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            // Resolve / allocate slots for visible tiles.
+            for (uint32_t i = 0; i < visible_tiles.size(); i++) {
+                auto it = tile_slot_map.find(visible_tiles[i]);
+                if (it != tile_slot_map.end()) {
+                    tile_slots[i] = it->second;
+                } else {
+                    // PLANET_TILE_POOL >> typical visible count; underrun should not happen.
+                    uint32_t slot = free_slots.empty() ? 0u : free_slots.back();
+                    if (!free_slots.empty()) free_slots.pop_back();
+                    tile_slot_map.emplace(visible_tiles[i], slot);
+                    slot_to_tile[slot] = visible_tiles[i];
+                    tile_slots[i] = slot;
+                    pending_init.insert(visible_tiles[i]);
+                }
+            }
+        }
+        if (planet_swe_needs_full_init) {
+            for (const auto& t : visible_tiles) pending_init.insert(t);
+            planet_swe_needs_full_init = false;
+        }
         {
 
             // Upload stamps to GPU if changed
@@ -2119,6 +2414,12 @@ int main()
                 std::memcpy(stamp_buf_info.pMappedData, g_stamps.data(), copy_size);
                 vmaFlushAllocation(allocator, stamp_buf_alloc, 0, copy_size);
                 g_stamps_dirty = false;
+            }
+            if (g_water_stamps_dirty && !g_water_stamps.empty()) {
+                size_t copy_size = g_water_stamps.size() * sizeof(WaterStamp);
+                std::memcpy(water_stamp_buf_info.pMappedData, g_water_stamps.data(), copy_size);
+                vmaFlushAllocation(allocator, water_stamp_buf_alloc, 0, copy_size);
+                g_water_stamps_dirty = false;
             }
 
             // Dispatch planet_gen compute for each visible tile
@@ -2135,7 +2436,7 @@ int main()
                 gen_pc.v_min = -1.0f + tile.y * ts;
                 gen_pc.tile_size = ts;
                 gen_pc.face = tile.face;
-                gen_pc.pool_index = i;
+                gen_pc.pool_index = tile_slots[i];
                 gen_pc.tex_res = PLANET_TILE_RES;
                 gen_pc.seed = 42;
                 gen_pc.stamp_count = static_cast<uint32_t>(g_stamps.size());
@@ -2160,35 +2461,62 @@ int main()
             vkCmdPipelineBarrier2(frame.cmd, &gen_dep);
         }
 
-        // ---- Planet SWE init + step (disabled until water brush is wired) ----
-        if (false && g_ui.ocean_enabled) {
-            // Detect changed tiles and reinitialize water state
-            bool any_init = false;
-            for (uint32_t i = 0; i < visible_tiles.size(); i++) {
-                bool needs_init = planet_swe_needs_full_init
-                    || (i >= prev_visible_tiles.size())
-                    || (visible_tiles[i] != prev_visible_tiles[i]);
-                if (needs_init) {
-                    if (!any_init) {
-                        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipelines.planet_swe_init_pipeline);
-                        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipelines.planet_swe_init_pipeline_layout, 0, 1,
-                            &planet_swe_init_desc_set, 0, nullptr);
-                        any_init = true;
-                    }
+        // ---- Planet SWE init + step (per-tile, only on disturbed tiles) ----
+        if (g_ui.ocean_enabled) {
+            // Clear edge_flags before this frame's step; barrier so InterlockedOrs
+            // see a zeroed buffer.
+            vkCmdFillBuffer(frame.cmd, edge_flags_buf, 0, VK_WHOLE_SIZE, 0u);
+            {
+                VkMemoryBarrier2 ef_bar{};
+                ef_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                ef_bar.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                ef_bar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                ef_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                ef_bar.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                                     | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                VkDependencyInfo dep{};
+                dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                dep.memoryBarrierCount = 1;
+                dep.pMemoryBarriers = &ef_bar;
+                vkCmdPipelineBarrier2(frame.cmd, &dep);
+            }
+
+            // Init dispatch — consume pending_init.
+            bool any_init = !pending_init.empty();
+            if (any_init) {
+                vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    pipelines.planet_swe_init_pipeline);
+                vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    pipelines.planet_swe_init_pipeline_layout, 0, 1,
+                    &planet_swe_init_desc_set, 0, nullptr);
+                for (const auto& t : pending_init) {
+                    auto it = tile_slot_map.find(t);
+                    if (it == tile_slot_map.end()) continue;
+                    float ts = 2.0f / static_cast<float>(1u << t.level);
                     PlanetSweInitPC ipc{};
                     ipc.grid_w = PLANET_TILE_RES;
                     ipc.grid_h = PLANET_TILE_RES;
                     ipc.sea_level = g_ui.sea_level;
-                    ipc.pool_index = i;
+                    ipc.pool_index = it->second;
+                    ipc.u_min = -1.0f + t.x * ts;
+                    ipc.v_min = -1.0f + t.y * ts;
+                    ipc.tile_size = ts;
+                    ipc.face = t.face;
+                    ipc.water_stamp_count = static_cast<uint32_t>(g_water_stamps.size());
                     vkCmdPushConstants(frame.cmd, pipelines.planet_swe_init_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ipc), &ipc);
                     vkCmdDispatch(frame.cmd, (PLANET_TILE_RES + 7) / 8, (PLANET_TILE_RES + 7) / 8, 1);
                 }
+                pending_init.clear();
             }
-            planet_swe_needs_full_init = false;
-            prev_visible_tiles.assign(visible_tiles.begin(), visible_tiles.end());
+
+            // Pick target tile under the cursor for the water brush.
+            PlanetTilePick pick{};
+            bool water_brush_active = brush_hit && input.brush_mode == BrushMode::Water;
+            if (water_brush_active) {
+                pick = planet_pick_tile(stamp_sphere_dir, visible_tiles, PLANET_TILE_RES);
+                if (pick.hit) disturbed_tiles.insert(pick.node);
+            }
 
             if (any_init) {
                 VkMemoryBarrier2 init_bar{};
@@ -2205,68 +2533,206 @@ int main()
                 vkCmdPipelineBarrier2(frame.cmd, &dep);
             }
 
-            // SWE step with CFL sub-stepping
-            float swe_total_dt = std::min(dt, 0.033f) * g_ui.time_scale;
-            float min_dx = 1e30f;
-            for (uint32_t i = 0; i < visible_tiles.size(); i++) {
-                float ts = 2.0f / static_cast<float>(1u << visible_tiles[i].level);
-                float tile_dx = ts * PLANET_RADIUS / static_cast<float>(PLANET_TILE_RES - 1);
-                min_dx = std::min(min_dx, tile_dx);
-            }
-            if (min_dx < 1.0f) min_dx = 1.0f;
+            // ---- h-adjust: subtract any newly-applied terrain stamp's local Δz
+            // from disturbed tiles' water column h. Preserves water surface across
+            // bed changes (gated on previously-wet cells, so dry land doesn't
+            // spontaneously fill when terrain is lowered).
+            uint32_t cur_stamp_count = static_cast<uint32_t>(g_stamps.size());
+            // Discard the unprocessed range if the user hit "clear" or "undo" so
+            // we don't re-apply stamps that no longer exist.
+            if (cur_stamp_count < last_processed_stamp_count)
+                last_processed_stamp_count = cur_stamp_count;
 
-            float c_max = std::sqrt(g_ui.gravity * 200.0f);
-            float cfl_dt = min_dx / (c_max * 6.0f);
-            int substeps = std::max(1, static_cast<int>(std::ceil(swe_total_dt / cfl_dt)));
-            substeps = std::min(substeps, 16);
-            float sub_dt = swe_total_dt / substeps;
-
-            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                pipelines.planet_swe_step_pipeline);
-
-            for (int step = 0; step < substeps; ++step) {
-                if (step > 0) {
-                    VkMemoryBarrier2 sub_bar{};
-                    sub_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-                    sub_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                    sub_bar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                    sub_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                    sub_bar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
-                                         | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-                    VkDependencyInfo sub_dep{};
-                    sub_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-                    sub_dep.memoryBarrierCount = 1;
-                    sub_dep.pMemoryBarriers = &sub_bar;
-                    vkCmdPipelineBarrier2(frame.cmd, &sub_dep);
-                }
-
+            bool any_h_adjust = (cur_stamp_count > last_processed_stamp_count) && !disturbed_tiles.empty();
+            if (any_h_adjust) {
+                vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    pipelines.planet_swe_h_adjust_pipeline);
                 vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                    pipelines.planet_swe_step_pipeline_layout, 0, 1,
-                    &planet_swe_step_desc_sets[planet_swe_ping_pong], 0, nullptr);
+                    pipelines.planet_swe_h_adjust_pipeline_layout, 0, 1,
+                    &planet_swe_h_adjust_desc_set, 0, nullptr);
+                for (uint32_t si = last_processed_stamp_count; si < cur_stamp_count; ++si) {
+                    const TerrainStamp& s = g_stamps[si];
+                    for (const auto& tile : disturbed_tiles) {
+                        auto it = tile_slot_map.find(tile);
+                        if (it == tile_slot_map.end()) continue;
+                        float ts = 2.0f / static_cast<float>(1u << tile.level);
+                        PlanetSweHAdjustPC hpc{};
+                        hpc.u_min = -1.0f + tile.x * ts;
+                        hpc.v_min = -1.0f + tile.y * ts;
+                        hpc.tile_size = ts;
+                        hpc.face = tile.face;
+                        hpc.pool_index = it->second;
+                        hpc.grid_w = PLANET_TILE_RES;
+                        hpc.grid_h = PLANET_TILE_RES;
+                        hpc.stamp_pos_x = s.pos_x;
+                        hpc.stamp_pos_y = s.pos_y;
+                        hpc.stamp_pos_z = s.pos_z;
+                        hpc.stamp_cos_radius = s.cos_radius;
+                        hpc.stamp_delta_h = s.delta_h;
+                        vkCmdPushConstants(frame.cmd, pipelines.planet_swe_h_adjust_pipeline_layout,
+                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(hpc), &hpc);
+                        vkCmdDispatch(frame.cmd, (PLANET_TILE_RES + 7) / 8, (PLANET_TILE_RES + 7) / 8, 1);
+                    }
+                }
+                last_processed_stamp_count = cur_stamp_count;
 
-                for (uint32_t i = 0; i < visible_tiles.size(); i++) {
-                    float ts = 2.0f / static_cast<float>(1u << visible_tiles[i].level);
+                VkMemoryBarrier2 ha_bar{};
+                ha_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                ha_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                ha_bar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                ha_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                ha_bar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                                     | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                VkDependencyInfo ha_dep{};
+                ha_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                ha_dep.memoryBarrierCount = 1;
+                ha_dep.pMemoryBarriers = &ha_bar;
+                vkCmdPipelineBarrier2(frame.cmd, &ha_dep);
+            } else if (cur_stamp_count > last_processed_stamp_count) {
+                // No disturbed tiles to adjust, but still mark stamps as processed
+                // so they aren't re-applied if water is brushed later.
+                last_processed_stamp_count = cur_stamp_count;
+            }
+
+            // Step pass: simulate every disturbed tile, even ones that are not
+            // currently visible. The slot allocator keeps disturbed tiles anchored,
+            // so their heightmap and water state survive in the pool.
+            if (!disturbed_tiles.empty()) {
+                // Resolve disturbed tiles → pool slots + neighbor slots once.
+                // Tiles with no slot (shouldn't happen with anchored allocation,
+                // but guard) are skipped. Neighbor slots are 0xFFFFFFFFu when the
+                // neighbor is across a face seam / different LOD / unallocated;
+                // the shader treats those edges as reflective.
+                constexpr uint32_t NO_NEIGHBOR = 0xFFFFFFFFu;
+                struct DisturbedDispatch {
+                    QuadNode tile;
+                    uint32_t slot;
+                    float    tile_dx;
+                    uint32_t nb[4];  // L, R, D, U
+                };
+                std::vector<DisturbedDispatch> dd;
+                dd.reserve(disturbed_tiles.size());
+                for (const auto& tile : disturbed_tiles) {
+                    auto it = tile_slot_map.find(tile);
+                    if (it == tile_slot_map.end()) continue;
+                    float ts = 2.0f / static_cast<float>(1u << tile.level);
                     float tile_dx = ts * PLANET_RADIUS / static_cast<float>(PLANET_TILE_RES - 1);
-
-                    PlanetSweStepPC spc{};
-                    spc.time = static_cast<float>(now);
-                    spc.dt = sub_dt;
-                    spc.gravity = g_ui.gravity;
-                    spc.friction = g_ui.friction;
-                    spc.dx = tile_dx;
-                    spc.sea_level = g_ui.sea_level;
-                    spc.damping = g_ui.damping;
-                    spc.pool_index = i;
-                    spc.grid_w = PLANET_TILE_RES;
-                    spc.grid_h = PLANET_TILE_RES;
-                    spc.pulse_amount = 0.0f;
-
-                    vkCmdPushConstants(frame.cmd, pipelines.planet_swe_step_pipeline_layout,
-                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(spc), &spc);
-                    vkCmdDispatch(frame.cmd, (PLANET_TILE_RES + 7) / 8, (PLANET_TILE_RES + 7) / 8, 1);
+                    DisturbedDispatch entry{tile, it->second, tile_dx,
+                                            {NO_NEIGHBOR, NO_NEIGHBOR, NO_NEIGHBOR, NO_NEIGHBOR}};
+                    for (int dir = 0; dir < 4; ++dir) {
+                        QuadNeighbor nb = planet_neighbor_same_face(tile, dir);
+                        if (!nb.valid) continue;
+                        auto nit = tile_slot_map.find(nb.tile);
+                        if (nit != tile_slot_map.end()) entry.nb[dir] = nit->second;
+                    }
+                    dd.push_back(entry);
                 }
 
-                planet_swe_ping_pong ^= 1;
+                // CFL from the finest disturbed tile.
+                float swe_total_dt = std::min(dt, 0.033f) * g_ui.time_scale;
+                float min_dx = 1e30f;
+                for (const auto& d : dd) min_dx = std::min(min_dx, d.tile_dx);
+                if (min_dx < 1.0f) min_dx = 1.0f;
+
+                float c_max = std::sqrt(g_ui.gravity * 200.0f);
+                float cfl_dt = min_dx / (c_max * 6.0f);
+                int substeps = std::max(1, static_cast<int>(std::ceil(swe_total_dt / cfl_dt)));
+                substeps = std::min(substeps, 16);
+                float sub_dt = swe_total_dt / substeps;
+
+                // World brush radius derived the same way the cursor ring is sized:
+                // brush_world.w (in main.cpp ~2018) is an *angular* radius (radians);
+                // terrain.fs.hlsl draws the ring against acos(dot(frag_dir, brush_dir)).
+                // The arc length on the planet surface is angular * R.
+                float angular_r = g_ui.brush_radius_grid * g_ui.stamp_angular_scale;
+                float brush_world_r = angular_r * PLANET_RADIUS;
+
+                // Identify which entry in dd is the brush target (only meaningful while
+                // the brush is active and pointing at a visible disturbed tile).
+                int pick_dd_index = -1;
+                if (water_brush_active && pick.hit) {
+                    for (size_t k = 0; k < dd.size(); ++k) {
+                        if (dd[k].tile == pick.node) { pick_dd_index = (int)k; break; }
+                    }
+                }
+
+                vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                    pipelines.planet_swe_step_pipeline);
+
+                for (int step = 0; step < substeps; ++step) {
+                    if (step > 0) {
+                        VkMemoryBarrier2 sub_bar{};
+                        sub_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                        sub_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                        sub_bar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                        sub_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                        sub_bar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                                             | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                        VkDependencyInfo sub_dep{};
+                        sub_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                        sub_dep.memoryBarrierCount = 1;
+                        sub_dep.pMemoryBarriers = &sub_bar;
+                        vkCmdPipelineBarrier2(frame.cmd, &sub_dep);
+                    }
+
+                    vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                        pipelines.planet_swe_step_pipeline_layout, 0, 1,
+                        &planet_swe_step_desc_sets[planet_swe_ping_pong], 0, nullptr);
+
+                    for (size_t k = 0; k < dd.size(); ++k) {
+                        const auto& d = dd[k];
+                        PlanetSweStepPC spc{};
+                        spc.time = static_cast<float>(now);
+                        spc.dt = sub_dt;
+                        spc.gravity = g_ui.gravity;
+                        spc.friction = g_ui.friction;
+                        spc.dx = d.tile_dx;
+                        spc.sea_level = g_ui.sea_level;
+                        spc.damping = g_ui.damping;
+                        spc.pool_index = d.slot;
+                        spc.grid_w = PLANET_TILE_RES;
+                        spc.grid_h = PLANET_TILE_RES;
+
+                        // Only the picked tile, and only on the first substep,
+                        // injects the brush pulse — keeps total injection rate-like
+                        // regardless of substep count.
+                        bool inject_here = (step == 0) && ((int)k == pick_dd_index);
+                        if (inject_here) {
+                            float radius_cells = std::max(1.0f, brush_world_r / d.tile_dx);
+                            spc.pulse_x = pick.grid_x;
+                            spc.pulse_y = pick.grid_y;
+                            spc.pulse_radius = radius_cells;
+                            spc.pulse_amount = g_ui.brush_strength * sub_dt;
+                        } else {
+                            spc.pulse_amount = 0.0f;
+                        }
+
+                        spc.neighbor_left  = d.nb[0];
+                        spc.neighbor_right = d.nb[1];
+                        spc.neighbor_down  = d.nb[2];
+                        spc.neighbor_up    = d.nb[3];
+
+                        vkCmdPushConstants(frame.cmd, pipelines.planet_swe_step_pipeline_layout,
+                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(spc), &spc);
+                        vkCmdDispatch(frame.cmd, (PLANET_TILE_RES + 7) / 8, (PLANET_TILE_RES + 7) / 8, 1);
+                    }
+
+                    planet_swe_ping_pong ^= 1;
+                }
+
+                // Make this frame's edge_flags writes visible to the host so the
+                // next frame's auto-anchor pass can read them.
+                VkMemoryBarrier2 ef_host_bar{};
+                ef_host_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                ef_host_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                ef_host_bar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                ef_host_bar.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+                ef_host_bar.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+                VkDependencyInfo ef_host_dep{};
+                ef_host_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                ef_host_dep.memoryBarrierCount = 1;
+                ef_host_dep.pMemoryBarriers = &ef_host_bar;
+                vkCmdPipelineBarrier2(frame.cmd, &ef_host_dep);
             }
         }
 
@@ -2600,7 +3066,7 @@ int main()
                 tpc.v_min = -1.0f + tile.y * ts;
                 tpc.tile_size = ts;
                 tpc.face = tile.face;
-                tpc.pool_index = i;
+                tpc.pool_index = tile_slots[i];
                 tpc.planet_radius = PLANET_RADIUS;
                 tpc.max_elevation = PLANET_MAX_ELEVATION;
                 tpc.heightmap_texel = 1.0f / static_cast<float>(PLANET_TILE_RES);

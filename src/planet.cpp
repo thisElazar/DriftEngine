@@ -136,3 +136,138 @@ std::vector<QuadNode> planet_select_visible_tiles(const PlanetTraversalParams& p
 
     return visible_tiles;
 }
+
+// --------------------------------------------------------------------------
+// planet_pick_tile: sphere_dir → visible tile + fractional grid coords
+// --------------------------------------------------------------------------
+//
+// face_uv_to_cube case table (matches the function above):
+//   face 0  (+X): (1,  v, -u)         → on +X face, v = Y, u = -Z
+//   face 1  (-X): (-1, v,  u)         → on -X face, v = Y, u =  Z
+//   face 2  (+Y): (u,  1, -v)         → on +Y face, u = X, v = -Z
+//   face 3  (-Y): (u, -1,  v)         → on -Y face, u = X, v =  Z
+//   face 4  (+Z): (u,  v,  1)         → on +Z face, u = X, v =  Y
+//   face 5  (-Z): (-u, v, -1)         → on -Z face, u = -X, v =  Y
+
+static void cube_face_to_uv(const glm::vec3& cube, uint32_t face, float& u, float& v)
+{
+    switch (face) {
+        case 0: u = -cube.z; v =  cube.y; break;
+        case 1: u =  cube.z; v =  cube.y; break;
+        case 2: u =  cube.x; v = -cube.z; break;
+        case 3: u =  cube.x; v =  cube.z; break;
+        case 4: u =  cube.x; v =  cube.y; break;
+        case 5: u = -cube.x; v =  cube.y; break;
+        default: u = 0; v = 0; break;
+    }
+}
+
+PlanetTilePick planet_pick_tile(
+    glm::vec3 sphere_dir,
+    const std::vector<QuadNode>& visible_tiles,
+    uint32_t tile_res)
+{
+    PlanetTilePick out{};
+    out.hit = false;
+
+    if (glm::length(sphere_dir) < 1e-6f) return out;
+    sphere_dir = glm::normalize(sphere_dir);
+
+    // 1) Pick face from dominant axis.
+    float ax = std::fabs(sphere_dir.x);
+    float ay = std::fabs(sphere_dir.y);
+    float az = std::fabs(sphere_dir.z);
+    uint32_t face;
+    if (ax >= ay && ax >= az)      face = (sphere_dir.x > 0.0f) ? 0u : 1u;
+    else if (ay >= az)             face = (sphere_dir.y > 0.0f) ? 2u : 3u;
+    else                           face = (sphere_dir.z > 0.0f) ? 4u : 5u;
+
+    // 2) Initial cube-point guess: scale sphere_dir so dominant axis is ±1.
+    float dom = std::max(ax, std::max(ay, az));
+    if (dom < 1e-6f) return out;
+    glm::vec3 cube = sphere_dir / dom;
+
+    // 3) Two fixed-point refinement steps against cube_to_sphere.
+    //    cube_to_sphere preserves face membership and the dominant-axis sign,
+    //    so we keep the dominant axis pinned to ±1 and adjust only the other two.
+    auto refine = [&](glm::vec3& q) {
+        glm::vec3 s = planet_cube_to_sphere(q);
+        glm::vec3 d = sphere_dir - s;
+        // Apply correction in cube space; clamp so we don't overshoot the face.
+        q += d;
+        // Re-pin dominant axis to ±1.
+        switch (face) {
+            case 0: q.x =  1.0f; break;
+            case 1: q.x = -1.0f; break;
+            case 2: q.y =  1.0f; break;
+            case 3: q.y = -1.0f; break;
+            case 4: q.z =  1.0f; break;
+            case 5: q.z = -1.0f; break;
+        }
+        // Clamp the in-face coords to [-1, 1] (sphere_dir near a face edge can otherwise
+        // briefly drift out of range during iteration).
+        q.x = std::clamp(q.x, -1.0f, 1.0f);
+        q.y = std::clamp(q.y, -1.0f, 1.0f);
+        q.z = std::clamp(q.z, -1.0f, 1.0f);
+    };
+    refine(cube);
+    refine(cube);
+
+    // 4) Convert cube point on this face → face uv ∈ [-1, 1]².
+    float fu, fv;
+    cube_face_to_uv(cube, face, fu, fv);
+
+    // 5) Find finest-level visible tile on this face containing (fu, fv).
+    uint32_t best_i = 0;
+    int best_level = -1;
+    float best_u_min = 0, best_v_min = 0, best_ts = 0;
+    for (uint32_t i = 0; i < visible_tiles.size(); ++i) {
+        const QuadNode& t = visible_tiles[i];
+        if (t.face != face) continue;
+        float ts = 2.0f / float(1u << t.level);
+        float u_min = -1.0f + t.x * ts;
+        float v_min = -1.0f + t.y * ts;
+        // Inclusive bounds; ties go to the finer tile (last wins on equal level).
+        if (fu >= u_min && fu <= u_min + ts &&
+            fv >= v_min && fv <= v_min + ts &&
+            int(t.level) >= best_level) {
+            best_level = int(t.level);
+            best_i = i;
+            best_u_min = u_min;
+            best_v_min = v_min;
+            best_ts = ts;
+        }
+    }
+    if (best_level < 0) return out;
+
+    // 6) Fractional grid coords within the tile.
+    float lu = (fu - best_u_min) / best_ts;
+    float lv = (fv - best_v_min) / best_ts;
+    lu = std::clamp(lu, 0.0f, 1.0f);
+    lv = std::clamp(lv, 0.0f, 1.0f);
+
+    out.hit        = true;
+    out.node       = visible_tiles[best_i];
+    out.pool_index = best_i;
+    out.grid_x     = lu * float(tile_res - 1);
+    out.grid_y     = lv * float(tile_res - 1);
+    out.u_min      = best_u_min;
+    out.v_min      = best_v_min;
+    out.tile_size  = best_ts;
+    return out;
+}
+
+QuadNeighbor planet_neighbor_same_face(QuadNode t, int dir)
+{
+    int side = int(1u << t.level);
+    int tx = int(t.x), ty = int(t.y);
+    switch (dir) {
+        case 0: tx -= 1; break;
+        case 1: tx += 1; break;
+        case 2: ty -= 1; break;
+        case 3: ty += 1; break;
+        default: return {false, {}};
+    }
+    if (tx < 0 || tx >= side || ty < 0 || ty >= side) return {false, {}};
+    return {true, QuadNode{t.face, t.level, uint32_t(tx), uint32_t(ty)}};
+}

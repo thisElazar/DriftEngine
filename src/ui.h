@@ -14,10 +14,12 @@ struct UIState {
     uint32_t stamp_count = 0;
     uint32_t max_stamps = 0;
 
-    // Water physics
+    // Water physics — defaults tuned for visible flow at planet scale.
+    // (At level-8 cells of ~800 m, c = sqrt(g*h) ≈ 10 m/s, so flow takes
+    // tens of seconds to traverse a tile; lower friction lets it actually move.)
     float gravity = 9.81f;
-    float friction = 0.01f;
-    float damping = 0.001f;
+    float friction = 0.002f;
+    float damping = 0.0002f;
     float time_scale = 1.0f;
     bool request_water_reset = false;
 
@@ -70,6 +72,9 @@ struct UIState {
 
     // Scene
     bool request_basin_reset = false;
+
+    // Camera (read-only display)
+    bool first_person_mode = false;
 };
 
 void ui_draw(UIState& state);

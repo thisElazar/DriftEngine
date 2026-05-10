@@ -51,7 +51,8 @@ SweImage create_swe_image(VkDevice device, VmaAllocator allocator, uint32_t w, u
     img_ci.arrayLayers = 1;
     img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
     img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    img_ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    img_ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                 | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VmaAllocationCreateInfo alloc_ci{};

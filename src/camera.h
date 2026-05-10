@@ -9,13 +9,29 @@
 
 struct GLFWwindow;
 
-struct Camera {
-    double pos_x = (6371000.0 + 20000.0) * 0.7071;
-    double pos_y = (6371000.0 + 20000.0) * 0.7071;
-    double pos_z = 0.0;
+enum class CameraMode { Orbital, FirstPerson };
 
-    glm::quat orientation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
-    double arm_length = 5000.0;
+// Orbits an external pivot at arm_length offset.
+struct OrbitalState {
+    glm::dvec3 pivot{(6371000.0 + 20000.0) * 0.7071,
+                     (6371000.0 + 20000.0) * 0.7071,
+                     0.0};
+    glm::quat  orientation{1.0f, 0.0f, 0.0f, 0.0f};
+    double     arm_length = 5000.0;
+};
+
+// Eye is the camera position; mouse-look rotates the eye in place.
+struct FirstPersonState {
+    glm::dvec3 eye{0.0, 0.0, 0.0};
+    glm::quat  orientation{1.0f, 0.0f, 0.0f, 0.0f};
+    float      eye_height_offset = 1.7f;
+    float      walk_speed = 4.0f;
+};
+
+struct Camera {
+    CameraMode       mode = CameraMode::Orbital;
+    OrbitalState     orbit;
+    FirstPersonState fp;
 
     float fov_y = glm::radians(60.0f);
     float near_plane = 0.5f;
@@ -37,10 +53,11 @@ struct CameraData {
     glm::mat4 inv_view_proj;
 };
 
-glm::vec3 camera_forward(const Camera& cam);
-glm::vec3 camera_up(const Camera& cam);
-glm::vec3 camera_right(const Camera& cam);
+glm::vec3  camera_forward(const Camera& cam);
+glm::vec3  camera_up(const Camera& cam);
+glm::vec3  camera_right(const Camera& cam);
 glm::dvec3 camera_eye_position(const Camera& cam);
+glm::quat  camera_orientation(const Camera& cam);
 
 void camera_initialize_orientation(Camera& cam);
 
@@ -56,3 +73,7 @@ CameraUpdateResult camera_update(Camera& cam, GLFWwindow* window, float dt,
 glm::mat4 camera_build_view(const Camera& cam);
 
 glm::mat4 camera_build_proj(const Camera& cam, float aspect);
+
+void camera_switch_to_first_person(Camera& cam, float planet_radius,
+                                   std::function<float(glm::vec3)> height_fn);
+void camera_switch_to_orbital(Camera& cam);

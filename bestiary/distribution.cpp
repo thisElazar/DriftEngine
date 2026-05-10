@@ -245,6 +245,51 @@ static void emit_environment_ground(VegetationMesh& mesh,
 }
 
 // -----------------------------------------------------------------------
+// Phenotype jitter — per-instance parameter variation
+// -----------------------------------------------------------------------
+
+static float jitter(float base, float variance, uint32_t seed, uint32_t idx)
+{
+    float r = dhash_float(seed, idx) * 2.0f - 1.0f;
+    return base * (1.0f + r * variance);
+}
+
+static int jitter_int(int base, float variance, uint32_t seed, uint32_t idx)
+{
+    float r = dhash_float(seed, idx) * 2.0f - 1.0f;
+    return std::max(1, static_cast<int>(std::round(
+        static_cast<float>(base) * (1.0f + r * variance))));
+}
+
+static void jitter_clump(ClumpParams& p, float v, uint32_t seed)
+{
+    p.blade_count  = jitter_int(p.blade_count,  v, seed, 10u);
+    p.blade_height = jitter(p.blade_height, v, seed, 11u);
+    p.blade_width  = jitter(p.blade_width,  v * 0.5f, seed, 12u);
+    p.splay_angle  = jitter(p.splay_angle,  v, seed, 13u);
+    p.clump_radius = jitter(p.clump_radius, v, seed, 14u);
+}
+
+static void jitter_bush(BushParams& p, float v, uint32_t seed)
+{
+    p.leaf_count   = jitter_int(p.leaf_count,  v, seed, 20u);
+    p.bush_height  = jitter(p.bush_height,  v, seed, 21u);
+    p.bush_radius  = jitter(p.bush_radius,  v, seed, 22u);
+    p.leaf_length  = jitter(p.leaf_length,  v * 0.5f, seed, 23u);
+    p.stem_height  = jitter(p.stem_height,  v, seed, 24u);
+}
+
+static void jitter_tree(TreeParams& p, float v, uint32_t seed)
+{
+    p.tree_height   = jitter(p.tree_height,   v, seed, 30u);
+    p.trunk_height  = jitter(p.trunk_height,  v, seed, 31u);
+    p.crown_radius  = jitter(p.crown_radius,  v, seed, 32u);
+    p.crown_height  = jitter(p.crown_height,  v, seed, 33u);
+    p.trunk_width   = jitter(p.trunk_width,   v * 0.5f, seed, 34u);
+    p.leaf_count    = jitter_int(p.leaf_count, v, seed, 35u);
+}
+
+// -----------------------------------------------------------------------
 // Ecosystem assembly
 // -----------------------------------------------------------------------
 
@@ -253,7 +298,8 @@ VegetationMesh generate_ecosystem(
     const EnvironmentField& env,
     const ClumpParams& cp, const ClumpExpression& ce,
     const BushParams& bp, const BushExpression& be,
-    const TreeParams& tp, const TreeExpression& te)
+    const TreeParams& tp, const TreeExpression& te,
+    bool include_ground)
 {
     VegetationMesh mesh;
 
@@ -275,16 +321,22 @@ VegetationMesh generate_ecosystem(
         switch (kind) {
         case 0: {
             auto resolved = evaluate_expression(cp, ce, sample.moisture);
+            if (eco.phenotype_variance > 0.001f)
+                jitter_clump(resolved, eco.phenotype_variance, pt_seed);
             sub = generate_clump(resolved, pt_seed, false, x, z);
             break;
         }
         case 1: {
             auto resolved = evaluate_bush_expression(bp, be, sample.moisture);
+            if (eco.phenotype_variance > 0.001f)
+                jitter_bush(resolved, eco.phenotype_variance, pt_seed);
             sub = generate_bush(resolved, pt_seed, false, x, z);
             break;
         }
         case 2: {
             auto resolved = evaluate_tree_expression(tp, te, sample.moisture);
+            if (eco.phenotype_variance > 0.001f)
+                jitter_tree(resolved, eco.phenotype_variance, pt_seed);
             sub = generate_tree(resolved, pt_seed, false, x, z);
             break;
         }
@@ -297,7 +349,8 @@ VegetationMesh generate_ecosystem(
             mesh.indices.push_back(idx + vert_offset);
     }
 
-    emit_environment_ground(mesh, eco.region_size, env);
+    if (include_ground)
+        emit_environment_ground(mesh, eco.region_size, env);
 
     return mesh;
 }

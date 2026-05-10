@@ -38,6 +38,8 @@ struct EcosystemParams {
                                      0.15f, 0.25f, 0.8f, 0.85f, 1.0f};
     SpeciesSuitability tree_suit  = {0.3f, 0.4f, 0.9f, 1.0f,
                                      0.15f, 0.25f, 0.8f, 0.85f, 0.15f};
+
+    float phenotype_variance = 0.2f;  // 0..1, per-instance parameter jitter
 };
 
 float compute_suitability(const SpeciesSuitability& s,
@@ -48,6 +50,7 @@ VegetationMesh generate_ecosystem(
     const EnvironmentField& env,
     const ClumpParams& cp, const ClumpExpression& ce,
     const BushParams& bp, const BushExpression& be,
-    const TreeParams& tp, const TreeExpression& te);
+    const TreeParams& tp, const TreeExpression& te,
+    bool include_ground = true);
 
 } // namespace bestiary

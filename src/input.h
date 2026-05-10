@@ -20,6 +20,8 @@ struct InputState {
     bool framebuffer_resized = false;
     bool reload_shaders      = false;
     bool pulse_pending       = false;
+    bool toggle_camera_mode  = false;
+    bool space_held          = false;
 
     BrushMode brush_mode = BrushMode::Water;
 };

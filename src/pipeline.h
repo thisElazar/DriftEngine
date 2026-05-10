@@ -118,6 +118,33 @@ struct PlanetSweInitPC {
     uint32_t grid_h;
     float    sea_level;
     uint32_t pool_index;
+    // Tile params for sphere_dir reconstruction (used to sample water stamps).
+    float    u_min;
+    float    v_min;
+    float    tile_size;
+    uint32_t face;
+    uint32_t water_stamp_count;
+    uint32_t _pad0, _pad1, _pad2;
+};
+
+struct PlanetSweHAdjustPC {
+    float    u_min;
+    float    v_min;
+    float    tile_size;
+    uint32_t face;
+
+    uint32_t pool_index;
+    uint32_t grid_w;
+    uint32_t grid_h;
+    uint32_t _pad0;
+
+    float    stamp_pos_x;
+    float    stamp_pos_y;
+    float    stamp_pos_z;
+    float    stamp_cos_radius;
+
+    float    stamp_delta_h;
+    float    _pad1, _pad2, _pad3;
 };
 
 struct PlanetSweStepPC {
@@ -135,6 +162,12 @@ struct PlanetSweStepPC {
     float    pulse_y;
     float    pulse_radius;
     float    pulse_amount;
+    // Same-face same-level neighbor pool slots; 0xFFFFFFFFu means no neighbor
+    // (face seam or LOD mismatch — treated as reflective for now).
+    uint32_t neighbor_left;
+    uint32_t neighbor_right;
+    uint32_t neighbor_down;
+    uint32_t neighbor_up;
 };
 
 struct PlanetTilePC {
@@ -168,7 +201,19 @@ struct TerrainStamp {
     float    _pad0, _pad1;
 };
 
+// Mirrors TerrainStamp for the water brush. Persistent across LOD: tiles at
+// any level read these stamps in their SWE init pass to seed water above the
+// static sea level, so a brushed lake is visible at any zoom.
+struct WaterStamp {
+    float    pos_x, pos_y, pos_z;
+    float    radius;
+    float    water_amount;   // metres of water column to add at the stamp center
+    float    cos_radius;
+    float    _pad0, _pad1;
+};
+
 constexpr uint32_t MAX_STAMPS = 4096;
+constexpr uint32_t MAX_WATER_STAMPS = 4096;
 
 struct Pipelines {
     VkShaderModule swe_init_shader = VK_NULL_HANDLE;
@@ -188,6 +233,7 @@ struct Pipelines {
     VkShaderModule terrain_gen_shader = VK_NULL_HANDLE;
     VkShaderModule planet_swe_init_shader = VK_NULL_HANDLE;
     VkShaderModule planet_swe_step_shader = VK_NULL_HANDLE;
+    VkShaderModule planet_swe_h_adjust_shader = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout swe_init_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout swe_step_desc_layout = VK_NULL_HANDLE;
@@ -200,6 +246,7 @@ struct Pipelines {
     VkDescriptorSetLayout sand_render_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout planet_swe_init_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout planet_swe_step_desc_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout planet_swe_h_adjust_desc_layout = VK_NULL_HANDLE;
 
     VkPipelineLayout swe_init_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout swe_step_pipeline_layout = VK_NULL_HANDLE;
@@ -214,6 +261,7 @@ struct Pipelines {
     VkPipelineLayout sand_render_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout planet_swe_init_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout planet_swe_step_pipeline_layout = VK_NULL_HANDLE;
+    VkPipelineLayout planet_swe_h_adjust_pipeline_layout = VK_NULL_HANDLE;
 
     VkPipeline swe_init_pipeline = VK_NULL_HANDLE;
     VkPipeline swe_step_pipeline = VK_NULL_HANDLE;
@@ -229,6 +277,7 @@ struct Pipelines {
     VkPipeline sand_render_pipeline = VK_NULL_HANDLE;
     VkPipeline planet_swe_init_pipeline = VK_NULL_HANDLE;
     VkPipeline planet_swe_step_pipeline = VK_NULL_HANDLE;
+    VkPipeline planet_swe_h_adjust_pipeline = VK_NULL_HANDLE;
 };
 
 std::vector<uint32_t> load_spirv(const char* path);

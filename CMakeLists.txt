@@ -182,3 +182,4 @@ add_dependencies(drift_engine shaders)
 # ---------------------------------------------------------------------------
 add_subdirectory(bestiary)
 add_subdirectory(apps/species_lab)
+add_subdirectory(apps/world_lab)

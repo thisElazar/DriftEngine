@@ -1,11 +1,14 @@
 // planet_swe_step.cs.hlsl — Per-tile HLL Riemann SWE solver on Texture2DArray.
 // Adapted from swe_step.hlsl (Audusse et al. 2004 hydrostatic reconstruction).
-// No sponge layer — tile boundaries use clamped coords (reflective).
+// Cross-tile flow: when a sample goes off-edge, read from the same-level
+// same-face neighbor's edge cells via its pool slot. Face seams / LOD
+// mismatches fall back to reflective (clamp) until Phase 2/3.
 
 [[vk::binding(0, 0)]] Texture2DArray<float>    terrain;
 [[vk::binding(1, 0)]] Texture2DArray<float4>   state_read;
 [[vk::binding(2, 0)]] RWTexture2DArray<float4> state_write;
 [[vk::binding(3, 0)]] RWTexture2DArray<float4> output;
+[[vk::binding(4, 0)]] RWStructuredBuffer<uint> edge_flags;  // one uint per pool slot
 
 [[vk::push_constant]]
 cbuffer PushConstants {
@@ -23,6 +26,10 @@ cbuffer PushConstants {
     float pulse_y;
     float pulse_radius;
     float pulse_amount;
+    uint  neighbor_left;
+    uint  neighbor_right;
+    uint  neighbor_down;
+    uint  neighbor_up;
 };
 
 #define GRAVITY   gravity
@@ -33,21 +40,48 @@ cbuffer PushConstants {
 #define GRID_W    ((int)grid_w)
 #define GRID_H    ((int)grid_h)
 #define DRY_TOLERANCE 0.01f
+#define NO_NEIGHBOR 0xFFFFFFFFu
+
+#define EDGE_BIT_LEFT  1u
+#define EDGE_BIT_RIGHT 2u
+#define EDGE_BIT_DOWN  4u
+#define EDGE_BIT_UP    8u
 
 int2 ClampCoord(int2 c)
 {
     return clamp(c, int2(0, 0), int2(GRID_W - 1, GRID_H - 1));
 }
 
-float4 ReadState(int2 coord)
+// Resolve a (possibly off-edge) coord to (x, y, layer). For purely diagonal
+// off-edge cases (corners), fall back to ClampCoord on this tile — those
+// influence only second-order terms and aren't worth a 4-way corner table.
+struct Sample { uint3 idx; };
+Sample ResolveSample(int2 coord)
 {
-    return state_read[uint3(ClampCoord(coord), pool_index)];
+    Sample s;
+    if (coord.x < 0 && coord.y >= 0 && coord.y < GRID_H && neighbor_left != NO_NEIGHBOR) {
+        s.idx = uint3(uint(GRID_W - 1), uint(coord.y), neighbor_left);
+        return s;
+    }
+    if (coord.x >= GRID_W && coord.y >= 0 && coord.y < GRID_H && neighbor_right != NO_NEIGHBOR) {
+        s.idx = uint3(0u, uint(coord.y), neighbor_right);
+        return s;
+    }
+    if (coord.y < 0 && coord.x >= 0 && coord.x < GRID_W && neighbor_down != NO_NEIGHBOR) {
+        s.idx = uint3(uint(coord.x), uint(GRID_H - 1), neighbor_down);
+        return s;
+    }
+    if (coord.y >= GRID_H && coord.x >= 0 && coord.x < GRID_W && neighbor_up != NO_NEIGHBOR) {
+        s.idx = uint3(uint(coord.x), 0u, neighbor_up);
+        return s;
+    }
+    int2 c = ClampCoord(coord);
+    s.idx = uint3(uint(c.x), uint(c.y), pool_index);
+    return s;
 }
 
-float ReadTerrain(int2 coord)
-{
-    return terrain[uint3(ClampCoord(coord), pool_index)];
-}
+float4 ReadState(int2 coord)   { return state_read[ResolveSample(coord).idx]; }
+float  ReadTerrain(int2 coord) { return terrain[ResolveSample(coord).idx]; }
 
 float3 HLLFlux(float3 UL, float3 UR, bool bXDir)
 {
@@ -268,4 +302,16 @@ void main(uint3 ThreadId : SV_DispatchThreadID)
     float dhdy = (surfU - surfD) / (2.0f * DX);
 
     output[uint3(coord, pool_index)] = float4(h_new, dhdx, dhdy, foam);
+
+    // Mark per-edge "water above static reached this edge" so the CPU can
+    // anchor the corresponding neighbor next frame. Threshold is generous —
+    // slight numerical drift shouldn't trigger expansion.
+    float static_h = max(SEA_LEVEL - z, 0.0f);
+    if (h_new > static_h + 0.25f)
+    {
+        if (coord.x == 0)         InterlockedOr(edge_flags[pool_index], EDGE_BIT_LEFT);
+        if (coord.x == GRID_W-1)  InterlockedOr(edge_flags[pool_index], EDGE_BIT_RIGHT);
+        if (coord.y == 0)         InterlockedOr(edge_flags[pool_index], EDGE_BIT_DOWN);
+        if (coord.y == GRID_H-1)  InterlockedOr(edge_flags[pool_index], EDGE_BIT_UP);
+    }
 }
