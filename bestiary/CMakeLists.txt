@@ -7,6 +7,7 @@ add_library(bestiary STATIC
     morphology/clump.cpp
     morphology/bush.cpp
     morphology/tree.cpp
+    morphology/lplant.cpp
     species_file.cpp
     environment.cpp
     distribution.cpp

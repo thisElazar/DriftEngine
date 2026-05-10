@@ -3,6 +3,7 @@
 #include "morphology/clump.h"
 #include "morphology/bush.h"
 #include "morphology/tree.h"
+#include "morphology/lplant.h"
 #include <filesystem>
 #include <string>
 
@@ -39,5 +40,15 @@ bool load_tree(const std::filesystem::path& path,
                TreeParams& params,
                std::string& name,
                TreeExpression* expr = nullptr);
+
+bool save_lplant(const std::filesystem::path& path,
+                 const LPlantParams& params,
+                 const std::string& name,
+                 const LPlantExpression* expr = nullptr);
+
+bool load_lplant(const std::filesystem::path& path,
+                 LPlantParams& params,
+                 std::string& name,
+                 LPlantExpression* expr = nullptr);
 
 } // namespace bestiary
