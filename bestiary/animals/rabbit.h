@@ -17,6 +17,7 @@ struct RabbitParams {
     float paw_size         = 0.015f; // m
     float tail_size        = 0.03f;  // m — puff tail
     float coat_color[3]    = {0.60f, 0.52f, 0.42f};
+    float belly_color[3]   = {0.78f, 0.72f, 0.65f};
 
     float hop_period_seconds = 0.45f; // s
     float hop_height         = 0.06f; // m

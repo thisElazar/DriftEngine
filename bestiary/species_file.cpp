@@ -691,12 +691,35 @@ bool load_lplant(const std::filesystem::path& path,
 }
 
 // -----------------------------------------------------------------------
-// Herbivore
+// Creature (unified herbivore/predator/rabbit)
 // -----------------------------------------------------------------------
 
-bool save_herbivore(const std::filesystem::path& path,
-                    const HerbivoreProfile& profile,
-                    const std::string& name)
+static const char* archetype_string(Archetype a)
+{
+    switch (a) {
+    case Archetype::Herbivore: return "herbivore";
+    case Archetype::Predator:  return "predator";
+    case Archetype::Rabbit:    return "rabbit";
+    case Archetype::Bird:      return "bird";
+    case Archetype::Raptor:    return "raptor";
+    case Archetype::Snake:     return "snake";
+    }
+    return "herbivore";
+}
+
+static Archetype parse_archetype(const std::string& s)
+{
+    if (s == "predator") return Archetype::Predator;
+    if (s == "rabbit")   return Archetype::Rabbit;
+    if (s == "bird")     return Archetype::Bird;
+    if (s == "raptor")   return Archetype::Raptor;
+    if (s == "snake")    return Archetype::Snake;
+    return Archetype::Herbivore;
+}
+
+bool save_creature(const std::filesystem::path& path,
+                   const CreatureProfile& profile,
+                   const std::string& name)
 {
     std::ofstream out(path);
     if (!out.is_open()) {
@@ -705,7 +728,7 @@ bool save_herbivore(const std::filesystem::path& path,
     }
 
     out << "[species]\n"
-        << "kind = 'herbivore'\n"
+        << "kind = '" << archetype_string(profile.archetype) << "'\n"
         << "name = '" << name << "'\n"
         << "\n"
         << "[body]\n"
@@ -742,18 +765,31 @@ bool save_herbivore(const std::filesystem::path& path,
         << "flee_radius = "   << fmt(profile.flee_radius)   << "\n"
         << "flee_duration = " << fmt(profile.flee_duration) << "\n";
 
+    if (profile.archetype == Archetype::Predator) {
+        out << "\n[hunting]\n"
+            << "hunt_radius = "      << fmt(profile.hunt_radius)      << "\n"
+            << "chase_speed = "      << fmt(profile.chase_speed)      << "\n"
+            << "attack_range = "     << fmt(profile.attack_range)     << "\n"
+            << "kill_energy_gain = " << fmt(profile.kill_energy_gain) << "\n"
+            << "stalk_speed = "      << fmt(profile.stalk_speed)      << "\n"
+            << "consume_duration = " << fmt(profile.consume_duration) << "\n";
+    }
+
     return true;
 }
 
-bool load_herbivore(const std::filesystem::path& path,
-                    HerbivoreProfile& profile,
-                    std::string& name)
+bool load_creature(const std::filesystem::path& path,
+                   CreatureProfile& profile,
+                   std::string& name)
 {
     auto tbl = parse_toml(path);
     if (tbl.empty()) return false;
 
     if (auto v = tbl["species"]["name"].value<std::string>())
         name = *v;
+
+    if (auto v = tbl["species"]["kind"].value<std::string>())
+        profile.archetype = parse_archetype(*v);
 
     auto f = [&](const char* section, const char* key, float& dst) {
         if (auto v = tbl[section][key].value<double>())
@@ -789,6 +825,295 @@ bool load_herbivore(const std::filesystem::path& path,
 
     f("flee", "flee_radius",   profile.flee_radius);
     f("flee", "flee_duration", profile.flee_duration);
+
+    if (profile.archetype == Archetype::Predator) {
+        f("hunting", "hunt_radius",      profile.hunt_radius);
+        f("hunting", "chase_speed",      profile.chase_speed);
+        f("hunting", "attack_range",     profile.attack_range);
+        f("hunting", "kill_energy_gain", profile.kill_energy_gain);
+        f("hunting", "stalk_speed",      profile.stalk_speed);
+        f("hunting", "consume_duration", profile.consume_duration);
+    }
+
+    return true;
+}
+
+// -----------------------------------------------------------------------
+// Animal morphology (archetype-specific params)
+// -----------------------------------------------------------------------
+
+bool save_animal(const std::filesystem::path& path,
+                 Archetype archetype,
+                 const HerbivoreParams* herb,
+                 const PredatorParams* pred,
+                 const RabbitParams* rabbit,
+                 const BirdParams* bird,
+                 const SnakeParams* snake,
+                 const std::string& name)
+{
+    std::ofstream out(path);
+    if (!out.is_open()) return false;
+
+    out << "[species]\n"
+        << "kind = '" << archetype_string(archetype) << "'\n"
+        << "name = '" << name << "'\n\n";
+
+    switch (archetype) {
+    case Archetype::Herbivore:
+        if (!herb) return false;
+        out << "[morphology]\n"
+            << "torso_length = "     << fmt(herb->torso_length)     << "\n"
+            << "torso_girth = "      << fmt(herb->torso_girth)      << "\n"
+            << "neck_length = "      << fmt(herb->neck_length)      << "\n"
+            << "head_length = "      << fmt(herb->head_length)      << "\n"
+            << "leg_length_front = " << fmt(herb->leg_length_front) << "\n"
+            << "leg_length_back = "  << fmt(herb->leg_length_back)  << "\n"
+            << "leg_thickness = "    << fmt(herb->leg_thickness)    << "\n"
+            << "hoof_size = "        << fmt(herb->hoof_size)        << "\n"
+            << "walk_period = "      << fmt(herb->walk_period_seconds) << "\n"
+            << "foot_lift = "        << fmt(herb->foot_lift_height)    << "\n\n"
+            << "[appearance]\n"
+            << "coat_color = [" << fmt(herb->coat_color[0]) << ", "
+                                << fmt(herb->coat_color[1]) << ", "
+                                << fmt(herb->coat_color[2]) << "]\n";
+        break;
+    case Archetype::Predator:
+        if (!pred) return false;
+        out << "[morphology]\n"
+            << "torso_length = "     << fmt(pred->torso_length)     << "\n"
+            << "chest_girth = "      << fmt(pred->chest_girth)      << "\n"
+            << "waist_girth = "      << fmt(pred->waist_girth)      << "\n"
+            << "neck_length = "      << fmt(pred->neck_length)      << "\n"
+            << "snout_length = "     << fmt(pred->snout_length)     << "\n"
+            << "head_width = "       << fmt(pred->head_width)       << "\n"
+            << "leg_length_front = " << fmt(pred->leg_length_front) << "\n"
+            << "leg_length_back = "  << fmt(pred->leg_length_back)  << "\n"
+            << "leg_thickness = "    << fmt(pred->leg_thickness)    << "\n"
+            << "paw_size = "         << fmt(pred->paw_size)         << "\n"
+            << "tail_length = "      << fmt(pred->tail_length)      << "\n"
+            << "walk_period = "      << fmt(pred->walk_period_seconds) << "\n"
+            << "foot_lift = "        << fmt(pred->foot_lift_height)    << "\n\n"
+            << "[appearance]\n"
+            << "coat_color = [" << fmt(pred->coat_color[0]) << ", "
+                                << fmt(pred->coat_color[1]) << ", "
+                                << fmt(pred->coat_color[2]) << "]\n";
+        break;
+    case Archetype::Rabbit:
+        if (!rabbit) return false;
+        out << "[morphology]\n"
+            << "body_length = "      << fmt(rabbit->body_length)      << "\n"
+            << "body_girth = "       << fmt(rabbit->body_girth)       << "\n"
+            << "neck_length = "      << fmt(rabbit->neck_length)      << "\n"
+            << "head_length = "      << fmt(rabbit->head_length)      << "\n"
+            << "head_width = "       << fmt(rabbit->head_width)       << "\n"
+            << "ear_length = "       << fmt(rabbit->ear_length)       << "\n"
+            << "leg_length_front = " << fmt(rabbit->leg_length_front) << "\n"
+            << "leg_length_back = "  << fmt(rabbit->leg_length_back)  << "\n"
+            << "leg_thickness = "    << fmt(rabbit->leg_thickness)    << "\n"
+            << "paw_size = "         << fmt(rabbit->paw_size)         << "\n"
+            << "tail_size = "        << fmt(rabbit->tail_size)        << "\n"
+            << "hop_period = "       << fmt(rabbit->hop_period_seconds) << "\n"
+            << "hop_height = "       << fmt(rabbit->hop_height)         << "\n\n"
+            << "[appearance]\n"
+            << "coat_color = [" << fmt(rabbit->coat_color[0]) << ", "
+                                << fmt(rabbit->coat_color[1]) << ", "
+                                << fmt(rabbit->coat_color[2]) << "]\n";
+        break;
+    case Archetype::Bird:
+        if (!bird) return false;
+        out << "[morphology]\n"
+            << "body_length = "      << fmt(bird->body_length)      << "\n"
+            << "body_girth = "       << fmt(bird->body_girth)       << "\n"
+            << "neck_length = "      << fmt(bird->neck_length)      << "\n"
+            << "head_size = "        << fmt(bird->head_size)        << "\n"
+            << "beak_length = "      << fmt(bird->beak_length)      << "\n"
+            << "wing_length = "      << fmt(bird->wing_length)      << "\n"
+            << "leg_length_upper = " << fmt(bird->leg_length_upper) << "\n"
+            << "leg_length_lower = " << fmt(bird->leg_length_lower) << "\n"
+            << "leg_thickness = "    << fmt(bird->leg_thickness)    << "\n"
+            << "foot_size = "        << fmt(bird->foot_size)        << "\n"
+            << "tail_length = "      << fmt(bird->tail_length)      << "\n"
+            << "walk_period = "      << fmt(bird->walk_period_seconds) << "\n"
+            << "foot_lift = "        << fmt(bird->foot_lift_height)    << "\n"
+            << "hop_height = "       << fmt(bird->hop_height)          << "\n\n"
+            << "[appearance]\n"
+            << "coat_color = [" << fmt(bird->coat_color[0]) << ", "
+                                << fmt(bird->coat_color[1]) << ", "
+                                << fmt(bird->coat_color[2]) << "]\n";
+        break;
+    case Archetype::Raptor:
+        if (!bird) return false;
+        out << "[morphology]\n"
+            << "body_length = "      << fmt(bird->body_length)      << "\n"
+            << "body_girth = "       << fmt(bird->body_girth)       << "\n"
+            << "neck_length = "      << fmt(bird->neck_length)      << "\n"
+            << "head_size = "        << fmt(bird->head_size)        << "\n"
+            << "beak_length = "      << fmt(bird->beak_length)      << "\n"
+            << "wing_length = "      << fmt(bird->wing_length)      << "\n"
+            << "wing_width = "       << fmt(bird->wing_width)       << "\n"
+            << "wing_taper = "       << fmt(bird->wing_taper)       << "\n"
+            << "leg_length_upper = " << fmt(bird->leg_length_upper) << "\n"
+            << "leg_length_lower = " << fmt(bird->leg_length_lower) << "\n"
+            << "leg_thickness = "    << fmt(bird->leg_thickness)    << "\n"
+            << "foot_size = "        << fmt(bird->foot_size)        << "\n"
+            << "tail_length = "      << fmt(bird->tail_length)      << "\n"
+            << "flap_period = "      << fmt(bird->flap_period)      << "\n"
+            << "flap_amplitude = "   << fmt(bird->flap_amplitude)   << "\n"
+            << "flap_sweep = "       << fmt(bird->flap_sweep)       << "\n"
+            << "fly_height = "       << fmt(bird->fly_height)       << "\n\n"
+            << "[appearance]\n"
+            << "coat_color = [" << fmt(bird->coat_color[0]) << ", "
+                                << fmt(bird->coat_color[1]) << ", "
+                                << fmt(bird->coat_color[2]) << "]\n";
+        break;
+    case Archetype::Snake:
+        if (!snake) return false;
+        out << "[morphology]\n"
+            << "body_length = "      << fmt(snake->body_length)      << "\n"
+            << "body_thickness = "   << fmt(snake->body_thickness)   << "\n"
+            << "head_width = "       << fmt(snake->head_width)       << "\n"
+            << "head_length = "      << fmt(snake->head_length)      << "\n"
+            << "taper_tail = "       << fmt(snake->taper_tail)       << "\n"
+            << "slither_period = "   << fmt(snake->slither_period)   << "\n"
+            << "slither_amplitude = " << fmt(snake->slither_amplitude) << "\n"
+            << "slither_waves = "    << fmt(snake->slither_waves)    << "\n\n"
+            << "[appearance]\n"
+            << "coat_color = [" << fmt(snake->coat_color[0]) << ", "
+                                << fmt(snake->coat_color[1]) << ", "
+                                << fmt(snake->coat_color[2]) << "]\n";
+        break;
+    }
+
+    return out.good();
+}
+
+bool load_animal(const std::filesystem::path& path,
+                 Archetype& archetype,
+                 HerbivoreParams& herb,
+                 PredatorParams& pred,
+                 RabbitParams& rabbit,
+                 BirdParams& bird,
+                 SnakeParams& snake,
+                 std::string& name)
+{
+    auto tbl = parse_toml(path);
+    if (tbl.empty()) return false;
+
+    if (auto v = tbl["species"]["name"].value<std::string>())
+        name = *v;
+
+    std::string kind_str;
+    if (auto v = tbl["species"]["kind"].value<std::string>())
+        kind_str = *v;
+    archetype = parse_archetype(kind_str);
+
+    auto f = [&](const char* section, const char* key, float& dst) {
+        if (auto v = tbl[section][key].value<double>())
+            dst = static_cast<float>(*v);
+    };
+
+    auto read_color = [&](const char* section, const char* key, float color[3]) {
+        if (auto arr = tbl[section][key].as_array(); arr && arr->size() >= 3)
+            for (int i = 0; i < 3; ++i)
+                if (auto v = (*arr)[static_cast<size_t>(i)].value<double>())
+                    color[i] = static_cast<float>(*v);
+    };
+
+    switch (archetype) {
+    case Archetype::Herbivore:
+        f("morphology", "torso_length",     herb.torso_length);
+        f("morphology", "torso_girth",      herb.torso_girth);
+        f("morphology", "neck_length",      herb.neck_length);
+        f("morphology", "head_length",      herb.head_length);
+        f("morphology", "leg_length_front", herb.leg_length_front);
+        f("morphology", "leg_length_back",  herb.leg_length_back);
+        f("morphology", "leg_thickness",    herb.leg_thickness);
+        f("morphology", "hoof_size",        herb.hoof_size);
+        f("morphology", "walk_period",      herb.walk_period_seconds);
+        f("morphology", "foot_lift",        herb.foot_lift_height);
+        read_color("appearance", "coat_color", herb.coat_color);
+        break;
+    case Archetype::Predator:
+        f("morphology", "torso_length",     pred.torso_length);
+        f("morphology", "chest_girth",      pred.chest_girth);
+        f("morphology", "waist_girth",      pred.waist_girth);
+        f("morphology", "neck_length",      pred.neck_length);
+        f("morphology", "snout_length",     pred.snout_length);
+        f("morphology", "head_width",       pred.head_width);
+        f("morphology", "leg_length_front", pred.leg_length_front);
+        f("morphology", "leg_length_back",  pred.leg_length_back);
+        f("morphology", "leg_thickness",    pred.leg_thickness);
+        f("morphology", "paw_size",         pred.paw_size);
+        f("morphology", "tail_length",      pred.tail_length);
+        f("morphology", "walk_period",      pred.walk_period_seconds);
+        f("morphology", "foot_lift",        pred.foot_lift_height);
+        read_color("appearance", "coat_color", pred.coat_color);
+        break;
+    case Archetype::Rabbit:
+        f("morphology", "body_length",      rabbit.body_length);
+        f("morphology", "body_girth",       rabbit.body_girth);
+        f("morphology", "neck_length",      rabbit.neck_length);
+        f("morphology", "head_length",      rabbit.head_length);
+        f("morphology", "head_width",       rabbit.head_width);
+        f("morphology", "ear_length",       rabbit.ear_length);
+        f("morphology", "leg_length_front", rabbit.leg_length_front);
+        f("morphology", "leg_length_back",  rabbit.leg_length_back);
+        f("morphology", "leg_thickness",    rabbit.leg_thickness);
+        f("morphology", "paw_size",         rabbit.paw_size);
+        f("morphology", "tail_size",        rabbit.tail_size);
+        f("morphology", "hop_period",       rabbit.hop_period_seconds);
+        f("morphology", "hop_height",       rabbit.hop_height);
+        read_color("appearance", "coat_color", rabbit.coat_color);
+        break;
+    case Archetype::Bird:
+        f("morphology", "body_length",      bird.body_length);
+        f("morphology", "body_girth",       bird.body_girth);
+        f("morphology", "neck_length",      bird.neck_length);
+        f("morphology", "head_size",        bird.head_size);
+        f("morphology", "beak_length",      bird.beak_length);
+        f("morphology", "wing_length",      bird.wing_length);
+        f("morphology", "leg_length_upper", bird.leg_length_upper);
+        f("morphology", "leg_length_lower", bird.leg_length_lower);
+        f("morphology", "leg_thickness",    bird.leg_thickness);
+        f("morphology", "foot_size",        bird.foot_size);
+        f("morphology", "tail_length",      bird.tail_length);
+        f("morphology", "walk_period",      bird.walk_period_seconds);
+        f("morphology", "foot_lift",        bird.foot_lift_height);
+        f("morphology", "hop_height",       bird.hop_height);
+        read_color("appearance", "coat_color", bird.coat_color);
+        break;
+    case Archetype::Raptor:
+        f("morphology", "body_length",      bird.body_length);
+        f("morphology", "body_girth",       bird.body_girth);
+        f("morphology", "neck_length",      bird.neck_length);
+        f("morphology", "head_size",        bird.head_size);
+        f("morphology", "beak_length",      bird.beak_length);
+        f("morphology", "wing_length",      bird.wing_length);
+        f("morphology", "wing_width",       bird.wing_width);
+        f("morphology", "wing_taper",       bird.wing_taper);
+        f("morphology", "leg_length_upper", bird.leg_length_upper);
+        f("morphology", "leg_length_lower", bird.leg_length_lower);
+        f("morphology", "leg_thickness",    bird.leg_thickness);
+        f("morphology", "foot_size",        bird.foot_size);
+        f("morphology", "tail_length",      bird.tail_length);
+        f("morphology", "flap_period",      bird.flap_period);
+        f("morphology", "flap_amplitude",   bird.flap_amplitude);
+        f("morphology", "flap_sweep",       bird.flap_sweep);
+        f("morphology", "fly_height",       bird.fly_height);
+        read_color("appearance", "coat_color", bird.coat_color);
+        break;
+    case Archetype::Snake:
+        f("morphology", "body_length",      snake.body_length);
+        f("morphology", "body_thickness",   snake.body_thickness);
+        f("morphology", "head_width",       snake.head_width);
+        f("morphology", "head_length",      snake.head_length);
+        f("morphology", "taper_tail",       snake.taper_tail);
+        f("morphology", "slither_period",   snake.slither_period);
+        f("morphology", "slither_amplitude", snake.slither_amplitude);
+        f("morphology", "slither_waves",    snake.slither_waves);
+        read_color("appearance", "coat_color", snake.coat_color);
+        break;
+    }
 
     return true;
 }

@@ -70,7 +70,7 @@ void pipelines_create(Pipelines& p, VkDevice device)
 
     VK_CHECK(vkCreateShaderModule(device, &swe_step_sm_ci, nullptr, &p.swe_step_shader));
 
-    VkDescriptorSetLayoutBinding swe_step_bindings[4]{};
+    VkDescriptorSetLayoutBinding swe_step_bindings[6]{};
     swe_step_bindings[0].binding = 0;
     swe_step_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     swe_step_bindings[0].descriptorCount = 1;
@@ -91,9 +91,19 @@ void pipelines_create(Pipelines& p, VkDevice device)
     swe_step_bindings[3].descriptorCount = 1;
     swe_step_bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+    swe_step_bindings[4].binding = 4;
+    swe_step_bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    swe_step_bindings[4].descriptorCount = 1;
+    swe_step_bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    swe_step_bindings[5].binding = 5;
+    swe_step_bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    swe_step_bindings[5].descriptorCount = 1;
+    swe_step_bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
     VkDescriptorSetLayoutCreateInfo swe_step_dsl_ci{};
     swe_step_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    swe_step_dsl_ci.bindingCount = 4;
+    swe_step_dsl_ci.bindingCount = 6;
     swe_step_dsl_ci.pBindings = swe_step_bindings;
 
     VK_CHECK(vkCreateDescriptorSetLayout(device, &swe_step_dsl_ci, nullptr, &p.swe_step_desc_layout));
@@ -497,7 +507,7 @@ void pipelines_create(Pipelines& p, VkDevice device)
 
     VK_CHECK(vkCreateShaderModule(device, &ero_sm_ci, nullptr, &p.erosion_shader));
 
-    VkDescriptorSetLayoutBinding ero_bindings[4]{};
+    VkDescriptorSetLayoutBinding ero_bindings[8]{};
     ero_bindings[0].binding = 0;
     ero_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     ero_bindings[0].descriptorCount = 1;
@@ -518,9 +528,29 @@ void pipelines_create(Pipelines& p, VkDevice device)
     ero_bindings[3].descriptorCount = 1;
     ero_bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+    ero_bindings[4].binding = 4;
+    ero_bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    ero_bindings[4].descriptorCount = 1;
+    ero_bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    ero_bindings[5].binding = 5;
+    ero_bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    ero_bindings[5].descriptorCount = 1;
+    ero_bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    ero_bindings[6].binding = 6;
+    ero_bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    ero_bindings[6].descriptorCount = 1;
+    ero_bindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    ero_bindings[7].binding = 7;
+    ero_bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    ero_bindings[7].descriptorCount = 1;
+    ero_bindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
     VkDescriptorSetLayoutCreateInfo ero_dsl_ci{};
     ero_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    ero_dsl_ci.bindingCount = 4;
+    ero_dsl_ci.bindingCount = 8;
     ero_dsl_ci.pBindings = ero_bindings;
 
     VK_CHECK(vkCreateDescriptorSetLayout(device, &ero_dsl_ci, nullptr, &p.ero_desc_layout));
@@ -553,9 +583,9 @@ void pipelines_create(Pipelines& p, VkDevice device)
     VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &ero_cp_ci, nullptr, &p.erosion_pipeline));
 
     // ---- Atmosphere descriptor set layout --------------------------------------
-    VkDescriptorSetLayoutBinding atmo_bindings[6]{};
+    VkDescriptorSetLayoutBinding atmo_bindings[11]{};
     atmo_bindings[0].binding = 0;
-    atmo_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    atmo_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     atmo_bindings[0].descriptorCount = 1;
     atmo_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
@@ -584,9 +614,34 @@ void pipelines_create(Pipelines& p, VkDevice device)
     atmo_bindings[5].descriptorCount = 1;
     atmo_bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+    atmo_bindings[6].binding = 6;
+    atmo_bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    atmo_bindings[6].descriptorCount = 1;
+    atmo_bindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    atmo_bindings[7].binding = 7;
+    atmo_bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    atmo_bindings[7].descriptorCount = 1;
+    atmo_bindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    atmo_bindings[8].binding = 8;
+    atmo_bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    atmo_bindings[8].descriptorCount = 1;
+    atmo_bindings[8].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    atmo_bindings[9].binding = 9;
+    atmo_bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    atmo_bindings[9].descriptorCount = 1;
+    atmo_bindings[9].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    atmo_bindings[10].binding = 10;
+    atmo_bindings[10].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    atmo_bindings[10].descriptorCount = 1;
+    atmo_bindings[10].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
     VkDescriptorSetLayoutCreateInfo atmo_dsl_ci{};
     atmo_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    atmo_dsl_ci.bindingCount = 6;
+    atmo_dsl_ci.bindingCount = 11;
     atmo_dsl_ci.pBindings = atmo_bindings;
 
     VK_CHECK(vkCreateDescriptorSetLayout(device, &atmo_dsl_ci, nullptr, &p.atmo_desc_layout));
@@ -860,14 +915,14 @@ void pipelines_create(Pipelines& p, VkDevice device)
     }
 
     // ---- Sand compute descriptor set layout ------------------------------------
-    VkDescriptorSetLayoutBinding sand_sim_bindings[4]{};
+    VkDescriptorSetLayoutBinding sand_sim_bindings[7]{};
     sand_sim_bindings[0].binding = 0;
-    sand_sim_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    sand_sim_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     sand_sim_bindings[0].descriptorCount = 1;
     sand_sim_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     sand_sim_bindings[1].binding = 1;
-    sand_sim_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    sand_sim_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     sand_sim_bindings[1].descriptorCount = 1;
     sand_sim_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
@@ -877,13 +932,28 @@ void pipelines_create(Pipelines& p, VkDevice device)
     sand_sim_bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
     sand_sim_bindings[3].binding = 3;
-    sand_sim_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    sand_sim_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     sand_sim_bindings[3].descriptorCount = 1;
     sand_sim_bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+    sand_sim_bindings[4].binding = 4;
+    sand_sim_bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    sand_sim_bindings[4].descriptorCount = 1;
+    sand_sim_bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    sand_sim_bindings[5].binding = 5;
+    sand_sim_bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    sand_sim_bindings[5].descriptorCount = 1;
+    sand_sim_bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    sand_sim_bindings[6].binding = 6;
+    sand_sim_bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    sand_sim_bindings[6].descriptorCount = 1;
+    sand_sim_bindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
     VkDescriptorSetLayoutCreateInfo sand_sim_dsl_ci{};
     sand_sim_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    sand_sim_dsl_ci.bindingCount = 4;
+    sand_sim_dsl_ci.bindingCount = 7;
     sand_sim_dsl_ci.pBindings = sand_sim_bindings;
 
     VK_CHECK(vkCreateDescriptorSetLayout(device, &sand_sim_dsl_ci, nullptr, &p.sand_sim_desc_layout));

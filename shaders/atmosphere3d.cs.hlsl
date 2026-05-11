@@ -9,8 +9,8 @@
 #define TWO_PI 6.28318530718
 #define PI     3.14159265359
 
-[[vk::combinedImageSampler]][[vk::binding(0, 0)]] Texture2D<float>   terrain_tex;
-[[vk::combinedImageSampler]][[vk::binding(0, 0)]] SamplerState        terrain_sampler;
+[[vk::binding(0, 0)]]  Texture2D<float>   terrain_tex;
+[[vk::binding(9, 0)]]  SamplerState       terrain_sampler;
 [[vk::binding(1, 0)]] Texture3D<float4>   state_read;
 [[vk::binding(2, 0)]] RWTexture3D<float4> state_write;
 [[vk::binding(3, 0)]] Texture3D<float4>   wind_read;
@@ -18,8 +18,8 @@
 [[vk::binding(5, 0)]] RWTexture2D<float>  shadow_out;
 [[vk::binding(6, 0)]] RWTexture2D<float4> ground_cond_out;
 [[vk::binding(7, 0)]] RWTexture2D<float2> ground_wind_out;
-[[vk::combinedImageSampler]][[vk::binding(8, 0)]] Texture2D<float4> swe_output;
-[[vk::combinedImageSampler]][[vk::binding(8, 0)]] SamplerState      swe_sampler;
+[[vk::binding(8, 0)]]  Texture2D<float4>  swe_output;
+[[vk::binding(10, 0)]] SamplerState       swe_sampler;
 
 [[vk::push_constant]]
 cbuffer PC {

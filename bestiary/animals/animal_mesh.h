@@ -67,4 +67,6 @@ void append_path_tube(AnimalMesh& mesh,
                       const float color[3],
                       int slices, int segments_per_span);
 
+void countershade(AnimalMesh& mesh, const float belly_color[3]);
+
 } // namespace bestiary

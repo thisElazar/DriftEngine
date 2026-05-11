@@ -8,11 +8,11 @@
 
 namespace bestiary {
 
-struct HerbivoreProfile;
+struct CreatureProfile;
 
 VegetationMesh generate_creature_meshes(
     std::vector<Agent>& agents,
-    const std::vector<HerbivoreProfile>& profiles,
+    const std::vector<CreatureProfile>& profiles,
     std::function<float(float x, float z)> terrain_height,
     float dt = 0.016f);
 

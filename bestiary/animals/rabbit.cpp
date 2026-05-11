@@ -181,6 +181,7 @@ AnimalMesh generate_rabbit_mesh(const RabbitParams& p)
     leg_spheres(15, 16, 17, 18);
     leg_spheres(19, 20, 21, 22);
 
+    countershade(mesh, p.belly_color);
     return mesh;
 }
 

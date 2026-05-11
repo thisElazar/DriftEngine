@@ -710,11 +710,12 @@ int main()
         sizeof(SweInitPC));
 
     ComputePipeline pipe_swe_step = make_compute_pipeline(device, "shaders/swe_step.spv",
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,           // 0: terrain
-         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,            // 1: state_read
-         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 2: state_write
-         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 3: output
-         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},  // 4: ground_cond
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  // 0: terrain
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  // 1: state_read
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 2: state_write
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 3: output
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  // 4: ground_cond
+         VK_DESCRIPTOR_TYPE_SAMPLER},       // 5: ground_cond_sampler
         sizeof(SweStepPC));
 
     ComputePipeline pipe_brush = make_compute_pipeline(device, "shaders/terrain_brush.spv",
@@ -731,15 +732,17 @@ int main()
     // binding 6: ground_cond_out (RWTexture2D<float4>)
     // binding 7: ground_wind_out (RWTexture2D<float2>)
     ComputePipeline pipe_atmo = make_compute_pipeline(device, "shaders/atmosphere3d_cs.spv",
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,  // 0: terrain heightmap
-         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,            // 1: state_read
-         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 2: state_write
-         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,            // 3: wind_read
-         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 4: wind_write
-         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 5: shadow_out
-         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 6: ground_cond_out
-         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 7: ground_wind_out
-         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},  // 8: swe_output
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  // 0: terrain heightmap
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  // 1: state_read
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 2: state_write
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  // 3: wind_read
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 4: wind_write
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 5: shadow_out
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 6: ground_cond_out
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 7: ground_wind_out
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  // 8: swe_output
+         VK_DESCRIPTOR_TYPE_SAMPLER,        // 9: terrain_sampler
+         VK_DESCRIPTOR_TYPE_SAMPLER},       // 10: swe_sampler
         sizeof(Atmo3DPC));
 
     // Erosion compute pipeline
@@ -748,26 +751,29 @@ int main()
     // binding 2: sediment_in (Texture2D<float>)
     // binding 3: sediment_out (RWTexture2D<float>)
     ComputePipeline pipe_erosion = make_compute_pipeline(device, "shaders/erosion.spv",
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 0: terrain (heightmap RW)
-         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,            // 1: swe_state
-         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,            // 2: sediment_in
-         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 3: sediment_out
-         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,   // 4: ground_cond
-         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},  // 5: ground_wind
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 0: terrain (heightmap RW)
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  // 1: swe_state
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  // 2: sediment_in
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  // 3: sediment_out
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  // 4: ground_cond
+         VK_DESCRIPTOR_TYPE_SAMPLER,        // 5: ground_cond_sampler
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  // 6: ground_wind
+         VK_DESCRIPTOR_TYPE_SAMPLER},       // 7: ground_wind_sampler
         sizeof(ErosionPC));
 
     // ---- Descriptor pool --------------------------------------------------
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     {
         VkDescriptorPoolSize pool_sizes[] = {
-            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,         32},
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,         48},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,         32},
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16},
+            {VK_DESCRIPTOR_TYPE_SAMPLER,                24},
         };
         VkDescriptorPoolCreateInfo pci{};
         pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pci.maxSets       = 32;
-        pci.poolSizeCount = 3;
+        pci.poolSizeCount = 4;
         pci.pPoolSizes    = pool_sizes;
         VK_CHECK(vkCreateDescriptorPool(device, &pci, nullptr, &desc_pool));
     }
@@ -815,14 +821,16 @@ int main()
     write_image(ds_swe_step[0], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, state_a.view, VK_NULL_HANDLE);
     write_image(ds_swe_step[0], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, state_b.view, VK_NULL_HANDLE);
     write_image(ds_swe_step[0], 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, water_out.view, VK_NULL_HANDLE);
-    write_image(ds_swe_step[0], 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ground_cond.view, sampler);
+    write_image(ds_swe_step[0], 4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ground_cond.view, VK_NULL_HANDLE);
+    write_image(ds_swe_step[0], 5, VK_DESCRIPTOR_TYPE_SAMPLER, VK_NULL_HANDLE, sampler);
 
     // step set 1: read B -> write A
     write_image(ds_swe_step[1], 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, hm_gpu.view,  VK_NULL_HANDLE);
     write_image(ds_swe_step[1], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, state_b.view, VK_NULL_HANDLE);
     write_image(ds_swe_step[1], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, state_a.view, VK_NULL_HANDLE);
     write_image(ds_swe_step[1], 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, water_out.view, VK_NULL_HANDLE);
-    write_image(ds_swe_step[1], 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ground_cond.view, sampler);
+    write_image(ds_swe_step[1], 4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ground_cond.view, VK_NULL_HANDLE);
+    write_image(ds_swe_step[1], 5, VK_DESCRIPTOR_TYPE_SAMPLER, VK_NULL_HANDLE, sampler);
 
     write_image(ds_brush, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, hm_gpu.view, VK_NULL_HANDLE);
 
@@ -832,26 +840,30 @@ int main()
         alloc_set(pipe_atmo.dsl)
     };
     // Set 0: read state[0]/wind[0], write state[1]/wind[1]
-    write_image(ds_atmo[0], 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, hm_gpu.view,         sampler);
-    write_image(ds_atmo[0], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          atmo_state[0].view,   VK_NULL_HANDLE);
-    write_image(ds_atmo[0], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          atmo_state[1].view,   VK_NULL_HANDLE);
-    write_image(ds_atmo[0], 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          wind_field[0].view,   VK_NULL_HANDLE);
-    write_image(ds_atmo[0], 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          wind_field[1].view,   VK_NULL_HANDLE);
-    write_image(ds_atmo[0], 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          atmo_shadow.view,     VK_NULL_HANDLE);
-    write_image(ds_atmo[0], 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          ground_cond.view,     VK_NULL_HANDLE);
-    write_image(ds_atmo[0], 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          ground_wind.view,     VK_NULL_HANDLE);
-    write_image(ds_atmo[0], 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, water_out.view,       sampler);
+    write_image(ds_atmo[0], 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  hm_gpu.view,         VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  atmo_state[0].view,  VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  atmo_state[1].view,  VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  wind_field[0].view,  VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  wind_field[1].view,  VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  atmo_shadow.view,    VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  ground_cond.view,    VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  ground_wind.view,    VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 8, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  water_out.view,      VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 9, VK_DESCRIPTOR_TYPE_SAMPLER,        VK_NULL_HANDLE,      sampler);
+    write_image(ds_atmo[0],10, VK_DESCRIPTOR_TYPE_SAMPLER,        VK_NULL_HANDLE,      sampler);
 
     // Set 1: read state[1]/wind[1], write state[0]/wind[0]
-    write_image(ds_atmo[1], 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, hm_gpu.view,         sampler);
-    write_image(ds_atmo[1], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          atmo_state[1].view,   VK_NULL_HANDLE);
-    write_image(ds_atmo[1], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          atmo_state[0].view,   VK_NULL_HANDLE);
-    write_image(ds_atmo[1], 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          wind_field[1].view,   VK_NULL_HANDLE);
-    write_image(ds_atmo[1], 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          wind_field[0].view,   VK_NULL_HANDLE);
-    write_image(ds_atmo[1], 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          atmo_shadow.view,     VK_NULL_HANDLE);
-    write_image(ds_atmo[1], 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          ground_cond.view,     VK_NULL_HANDLE);
-    write_image(ds_atmo[1], 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          ground_wind.view,     VK_NULL_HANDLE);
-    write_image(ds_atmo[1], 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, water_out.view,       sampler);
+    write_image(ds_atmo[1], 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  hm_gpu.view,         VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  atmo_state[1].view,  VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  atmo_state[0].view,  VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  wind_field[1].view,  VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  wind_field[0].view,  VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  atmo_shadow.view,    VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  ground_cond.view,    VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  ground_wind.view,    VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 8, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  water_out.view,      VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 9, VK_DESCRIPTOR_TYPE_SAMPLER,        VK_NULL_HANDLE,      sampler);
+    write_image(ds_atmo[1],10, VK_DESCRIPTOR_TYPE_SAMPLER,        VK_NULL_HANDLE,      sampler);
 
     // --- Erosion descriptor sets (ping-ponged on sediment) ---
     VkDescriptorSet ds_erosion[2] = {
@@ -863,16 +875,20 @@ int main()
     write_image(ds_erosion[0], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  state_a.view,      VK_NULL_HANDLE);
     write_image(ds_erosion[0], 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  sediment[0].view,  VK_NULL_HANDLE);
     write_image(ds_erosion[0], 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  sediment[1].view,  VK_NULL_HANDLE);
-    write_image(ds_erosion[0], 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ground_cond.view, sampler);
-    write_image(ds_erosion[0], 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ground_wind.view, sampler);
+    write_image(ds_erosion[0], 4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  ground_cond.view,  VK_NULL_HANDLE);
+    write_image(ds_erosion[0], 5, VK_DESCRIPTOR_TYPE_SAMPLER,        VK_NULL_HANDLE,    sampler);
+    write_image(ds_erosion[0], 6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  ground_wind.view,  VK_NULL_HANDLE);
+    write_image(ds_erosion[0], 7, VK_DESCRIPTOR_TYPE_SAMPLER,        VK_NULL_HANDLE,    sampler);
 
     // Set 1: sediment[1] -> sediment[0], reads current SWE state B
     write_image(ds_erosion[1], 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  hm_gpu.view,       VK_NULL_HANDLE);
     write_image(ds_erosion[1], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  state_b.view,      VK_NULL_HANDLE);
     write_image(ds_erosion[1], 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  sediment[1].view,  VK_NULL_HANDLE);
     write_image(ds_erosion[1], 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  sediment[0].view,  VK_NULL_HANDLE);
-    write_image(ds_erosion[1], 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ground_cond.view, sampler);
-    write_image(ds_erosion[1], 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ground_wind.view, sampler);
+    write_image(ds_erosion[1], 4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  ground_cond.view,  VK_NULL_HANDLE);
+    write_image(ds_erosion[1], 5, VK_DESCRIPTOR_TYPE_SAMPLER,        VK_NULL_HANDLE,    sampler);
+    write_image(ds_erosion[1], 6, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  ground_wind.view,  VK_NULL_HANDLE);
+    write_image(ds_erosion[1], 7, VK_DESCRIPTOR_TYPE_SAMPLER,        VK_NULL_HANDLE,    sampler);
 
     // ---- Graphics pipelines ---------------------------------------------
     TerrainPipeline pipe_terrain = create_terrain_pipeline(device);

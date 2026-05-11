@@ -1,6 +1,7 @@
 # Plant Lab — plant morphology viewer.
 
-add_executable(plant_lab main.cpp)
+add_executable(plant_lab main.cpp plant_lab.cpp)
+target_include_directories(plant_lab PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.. )
 target_link_libraries(plant_lab PRIVATE drift_engine_core bestiary)
 
 # --- HLSL -> SPIR-V for Plant Lab shaders ---

@@ -9,13 +9,13 @@ struct Particle {
     float size;
 };
 
-[[vk::combinedImageSampler]][[vk::binding(0, 0)]] Texture2D<float>  terrain_tex;
-[[vk::combinedImageSampler]][[vk::binding(0, 0)]] SamplerState      terrain_sampler;
-[[vk::combinedImageSampler]][[vk::binding(1, 0)]] Texture3D<float4> wind_vol;
-[[vk::combinedImageSampler]][[vk::binding(1, 0)]] SamplerState      wind_sampler;
+[[vk::binding(0, 0)]] Texture2D<float>  terrain_tex;
+[[vk::binding(4, 0)]] SamplerState      terrain_sampler;
+[[vk::binding(1, 0)]] Texture3D<float4> wind_vol;
+[[vk::binding(5, 0)]] SamplerState      wind_sampler;
 [[vk::binding(2, 0)]] RWStructuredBuffer<Particle> particles;
-[[vk::combinedImageSampler]][[vk::binding(3, 0)]] Texture2D<float>  sand_deposit;
-[[vk::combinedImageSampler]][[vk::binding(3, 0)]] SamplerState      sand_deposit_sampler;
+[[vk::binding(3, 0)]] Texture2D<float>  sand_deposit;
+[[vk::binding(6, 0)]] SamplerState      sand_deposit_sampler;
 
 [[vk::push_constant]]
 cbuffer SandSimPC {

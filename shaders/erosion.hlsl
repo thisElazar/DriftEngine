@@ -2,10 +2,10 @@
 [[vk::binding(1, 0)]] Texture2D<float4>  swe_state;
 [[vk::binding(2, 0)]] Texture2D<float>   sediment_in;
 [[vk::binding(3, 0)]] RWTexture2D<float> sediment_out;
-[[vk::combinedImageSampler]][[vk::binding(4, 0)]] Texture2D<float4> ground_cond;
-[[vk::combinedImageSampler]][[vk::binding(4, 0)]] SamplerState      ground_cond_sampler;
-[[vk::combinedImageSampler]][[vk::binding(5, 0)]] Texture2D<float2> ground_wind;
-[[vk::combinedImageSampler]][[vk::binding(5, 0)]] SamplerState      ground_wind_sampler;
+[[vk::binding(4, 0)]] Texture2D<float4> ground_cond;
+[[vk::binding(5, 0)]] SamplerState      ground_cond_sampler;
+[[vk::binding(6, 0)]] Texture2D<float2> ground_wind;
+[[vk::binding(7, 0)]] SamplerState      ground_wind_sampler;
 
 [[vk::push_constant]]
 cbuffer PC {

@@ -362,6 +362,8 @@ int main()
     SweImage wind_field_a = create_volume_image(device, allocator, ATMO_W, ATMO_H, ATMO_D, VK_FORMAT_R16G16B16A16_SFLOAT);
     SweImage wind_field_b = create_volume_image(device, allocator, ATMO_W, ATMO_H, ATMO_D, VK_FORMAT_R16G16B16A16_SFLOAT);
     SweImage atmo_shadow  = create_sediment_image(device, allocator, ATMO_W, ATMO_H);
+    SweImage ground_cond  = create_swe_image(device, allocator, ATMO_W, ATMO_H);
+    SweImage ground_wind  = create_wind_image(device, allocator, ATMO_W, ATMO_H);
     SweImage sand_deposit = create_sediment_image(device, allocator, SWE_GRID_W, SWE_GRID_H);
 
     // ---- Tile pool (replaces clipmap heightmap array) ----------------------------
@@ -476,22 +478,24 @@ int main()
 
     // ---- Descriptor pool + sets ---------------------------------------------
     // Counts: SWE init(2) + SWE step×2(8) + terrain brush(1) + gfx(4 incl sediment) + erosion×2(8) = needs ~23 descriptors
-    VkDescriptorPoolSize pool_sizes[5]{};
+    VkDescriptorPoolSize pool_sizes[6]{};
     pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    pool_sizes[0].descriptorCount = 35;
+    pool_sizes[0].descriptorCount = 45;
     pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    pool_sizes[1].descriptorCount = 22;
+    pool_sizes[1].descriptorCount = 48;
     pool_sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     pool_sizes[2].descriptorCount = 4;
     pool_sizes[3].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     pool_sizes[3].descriptorCount = 48;
     pool_sizes[4].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     pool_sizes[4].descriptorCount = 12;
+    pool_sizes[5].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    pool_sizes[5].descriptorCount = 32;
 
     VkDescriptorPoolCreateInfo dp_ci{};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dp_ci.maxSets = 25;
-    dp_ci.poolSizeCount = 5;
+    dp_ci.poolSizeCount = 6;
     dp_ci.pPoolSizes = pool_sizes;
 
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
@@ -609,8 +613,15 @@ int main()
         output_info.imageView = swe_output.view;
         output_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
+        VkDescriptorImageInfo ground_cond_info{};
+        ground_cond_info.imageView = ground_cond.view;
+        ground_cond_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo ground_cond_sampler_info{};
+        ground_cond_sampler_info.sampler = sampler;
+
         // Set 0: read A -> write B
-        VkWriteDescriptorSet writes_0[4]{};
+        VkWriteDescriptorSet writes_0[6]{};
         writes_0[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes_0[0].dstSet = swe_step_desc_sets[0];
         writes_0[0].dstBinding = 0;
@@ -639,10 +650,24 @@ int main()
         writes_0[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         writes_0[3].pImageInfo = &output_info;
 
-        vkUpdateDescriptorSets(device, 4, writes_0, 0, nullptr);
+        writes_0[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes_0[4].dstSet = swe_step_desc_sets[0];
+        writes_0[4].dstBinding = 4;
+        writes_0[4].descriptorCount = 1;
+        writes_0[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes_0[4].pImageInfo = &ground_cond_info;
+
+        writes_0[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes_0[5].dstSet = swe_step_desc_sets[0];
+        writes_0[5].dstBinding = 5;
+        writes_0[5].descriptorCount = 1;
+        writes_0[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes_0[5].pImageInfo = &ground_cond_sampler_info;
+
+        vkUpdateDescriptorSets(device, 6, writes_0, 0, nullptr);
 
         // Set 1: read B -> write A
-        VkWriteDescriptorSet writes_1[4]{};
+        VkWriteDescriptorSet writes_1[6]{};
         writes_1[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes_1[0].dstSet = swe_step_desc_sets[1];
         writes_1[0].dstBinding = 0;
@@ -671,7 +696,21 @@ int main()
         writes_1[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         writes_1[3].pImageInfo = &output_info;
 
-        vkUpdateDescriptorSets(device, 4, writes_1, 0, nullptr);
+        writes_1[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes_1[4].dstSet = swe_step_desc_sets[1];
+        writes_1[4].dstBinding = 4;
+        writes_1[4].descriptorCount = 1;
+        writes_1[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes_1[4].pImageInfo = &ground_cond_info;
+
+        writes_1[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes_1[5].dstSet = swe_step_desc_sets[1];
+        writes_1[5].dstBinding = 5;
+        writes_1[5].descriptorCount = 1;
+        writes_1[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes_1[5].pImageInfo = &ground_cond_sampler_info;
+
+        vkUpdateDescriptorSets(device, 6, writes_1, 0, nullptr);
     }
 
     // Graphics descriptors (2 sets — differ only in binding 5: cloud volume a vs b)
@@ -845,8 +884,22 @@ int main()
         sed_b_info.imageView = sediment_b.view;
         sed_b_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
+        VkDescriptorImageInfo gc_info{};
+        gc_info.imageView = ground_cond.view;
+        gc_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo gc_sampler_info{};
+        gc_sampler_info.sampler = sampler;
+
+        VkDescriptorImageInfo gw_info{};
+        gw_info.imageView = ground_wind.view;
+        gw_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo gw_sampler_info{};
+        gw_sampler_info.sampler = sampler;
+
         // Set 0: read sediment_a -> write sediment_b
-        VkWriteDescriptorSet w0[4]{};
+        VkWriteDescriptorSet w0[8]{};
         w0[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w0[0].dstSet = ero_desc_sets[0];
         w0[0].dstBinding = 0;
@@ -875,10 +928,38 @@ int main()
         w0[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         w0[3].pImageInfo = &sed_b_info;
 
-        vkUpdateDescriptorSets(device, 4, w0, 0, nullptr);
+        w0[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w0[4].dstSet = ero_desc_sets[0];
+        w0[4].dstBinding = 4;
+        w0[4].descriptorCount = 1;
+        w0[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        w0[4].pImageInfo = &gc_info;
+
+        w0[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w0[5].dstSet = ero_desc_sets[0];
+        w0[5].dstBinding = 5;
+        w0[5].descriptorCount = 1;
+        w0[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        w0[5].pImageInfo = &gc_sampler_info;
+
+        w0[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w0[6].dstSet = ero_desc_sets[0];
+        w0[6].dstBinding = 6;
+        w0[6].descriptorCount = 1;
+        w0[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        w0[6].pImageInfo = &gw_info;
+
+        w0[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w0[7].dstSet = ero_desc_sets[0];
+        w0[7].dstBinding = 7;
+        w0[7].descriptorCount = 1;
+        w0[7].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        w0[7].pImageInfo = &gw_sampler_info;
+
+        vkUpdateDescriptorSets(device, 8, w0, 0, nullptr);
 
         // Set 1: read sediment_b -> write sediment_a
-        VkWriteDescriptorSet w1[4]{};
+        VkWriteDescriptorSet w1[8]{};
         w1[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         w1[0].dstSet = ero_desc_sets[1];
         w1[0].dstBinding = 0;
@@ -907,7 +988,35 @@ int main()
         w1[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         w1[3].pImageInfo = &sed_a_info;
 
-        vkUpdateDescriptorSets(device, 4, w1, 0, nullptr);
+        w1[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w1[4].dstSet = ero_desc_sets[1];
+        w1[4].dstBinding = 4;
+        w1[4].descriptorCount = 1;
+        w1[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        w1[4].pImageInfo = &gc_info;
+
+        w1[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w1[5].dstSet = ero_desc_sets[1];
+        w1[5].dstBinding = 5;
+        w1[5].descriptorCount = 1;
+        w1[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        w1[5].pImageInfo = &gc_sampler_info;
+
+        w1[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w1[6].dstSet = ero_desc_sets[1];
+        w1[6].dstBinding = 6;
+        w1[6].descriptorCount = 1;
+        w1[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        w1[6].pImageInfo = &gw_info;
+
+        w1[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w1[7].dstSet = ero_desc_sets[1];
+        w1[7].dstBinding = 7;
+        w1[7].descriptorCount = 1;
+        w1[7].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        w1[7].pImageInfo = &gw_sampler_info;
+
+        vkUpdateDescriptorSets(device, 8, w1, 0, nullptr);
     }
 
     // Atmosphere descriptor sets (2 for ping-pong)
@@ -921,12 +1030,11 @@ int main()
     VkDescriptorSet atmo_desc_sets[2] = {};
     VK_CHECK(vkAllocateDescriptorSets(device, &atmo_ds_ai, atmo_desc_sets));
 
-    // Write atmosphere descriptors (3D volumes + 2D shadow)
+    // Write atmosphere descriptors (3D volumes + 2D shadow + ground outputs + samplers)
     {
-        VkDescriptorImageInfo terrain_sampler_info{};
-        terrain_sampler_info.sampler = terrain_linear_sampler;
-        terrain_sampler_info.imageView = heightmap_gpu.view;
-        terrain_sampler_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo terrain_tex_info{};
+        terrain_tex_info.imageView = heightmap_gpu.view;
+        terrain_tex_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkDescriptorImageInfo atmo_a_info{};
         atmo_a_info.imageView = atmo_state_a.view;
@@ -948,14 +1056,32 @@ int main()
         shadow_info.imageView = atmo_shadow.view;
         shadow_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
+        VkDescriptorImageInfo gc_out_info{};
+        gc_out_info.imageView = ground_cond.view;
+        gc_out_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo gw_out_info{};
+        gw_out_info.imageView = ground_wind.view;
+        gw_out_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo swe_out_atmo_info{};
+        swe_out_atmo_info.imageView = swe_output.view;
+        swe_out_atmo_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo terrain_samp_only{};
+        terrain_samp_only.sampler = terrain_linear_sampler;
+
+        VkDescriptorImageInfo swe_samp_only{};
+        swe_samp_only.sampler = sampler;
+
         // Set 0: state_read=a, state_write=b, wind_read=a, wind_write=b
-        VkWriteDescriptorSet aw0[6]{};
+        VkWriteDescriptorSet aw0[11]{};
         aw0[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         aw0[0].dstSet = atmo_desc_sets[0];
         aw0[0].dstBinding = 0;
         aw0[0].descriptorCount = 1;
-        aw0[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        aw0[0].pImageInfo = &terrain_sampler_info;
+        aw0[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        aw0[0].pImageInfo = &terrain_tex_info;
 
         aw0[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         aw0[1].dstSet = atmo_desc_sets[0];
@@ -992,16 +1118,51 @@ int main()
         aw0[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         aw0[5].pImageInfo = &shadow_info;
 
-        vkUpdateDescriptorSets(device, 6, aw0, 0, nullptr);
+        aw0[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        aw0[6].dstSet = atmo_desc_sets[0];
+        aw0[6].dstBinding = 6;
+        aw0[6].descriptorCount = 1;
+        aw0[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        aw0[6].pImageInfo = &gc_out_info;
+
+        aw0[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        aw0[7].dstSet = atmo_desc_sets[0];
+        aw0[7].dstBinding = 7;
+        aw0[7].descriptorCount = 1;
+        aw0[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        aw0[7].pImageInfo = &gw_out_info;
+
+        aw0[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        aw0[8].dstSet = atmo_desc_sets[0];
+        aw0[8].dstBinding = 8;
+        aw0[8].descriptorCount = 1;
+        aw0[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        aw0[8].pImageInfo = &swe_out_atmo_info;
+
+        aw0[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        aw0[9].dstSet = atmo_desc_sets[0];
+        aw0[9].dstBinding = 9;
+        aw0[9].descriptorCount = 1;
+        aw0[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        aw0[9].pImageInfo = &terrain_samp_only;
+
+        aw0[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        aw0[10].dstSet = atmo_desc_sets[0];
+        aw0[10].dstBinding = 10;
+        aw0[10].descriptorCount = 1;
+        aw0[10].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        aw0[10].pImageInfo = &swe_samp_only;
+
+        vkUpdateDescriptorSets(device, 11, aw0, 0, nullptr);
 
         // Set 1: state_read=b, state_write=a, wind_read=b, wind_write=a
-        VkWriteDescriptorSet aw1[6]{};
+        VkWriteDescriptorSet aw1[11]{};
         aw1[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         aw1[0].dstSet = atmo_desc_sets[1];
         aw1[0].dstBinding = 0;
         aw1[0].descriptorCount = 1;
-        aw1[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        aw1[0].pImageInfo = &terrain_sampler_info;
+        aw1[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        aw1[0].pImageInfo = &terrain_tex_info;
 
         aw1[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         aw1[1].dstSet = atmo_desc_sets[1];
@@ -1038,7 +1199,42 @@ int main()
         aw1[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         aw1[5].pImageInfo = &shadow_info;
 
-        vkUpdateDescriptorSets(device, 6, aw1, 0, nullptr);
+        aw1[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        aw1[6].dstSet = atmo_desc_sets[1];
+        aw1[6].dstBinding = 6;
+        aw1[6].descriptorCount = 1;
+        aw1[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        aw1[6].pImageInfo = &gc_out_info;
+
+        aw1[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        aw1[7].dstSet = atmo_desc_sets[1];
+        aw1[7].dstBinding = 7;
+        aw1[7].descriptorCount = 1;
+        aw1[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        aw1[7].pImageInfo = &gw_out_info;
+
+        aw1[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        aw1[8].dstSet = atmo_desc_sets[1];
+        aw1[8].dstBinding = 8;
+        aw1[8].descriptorCount = 1;
+        aw1[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        aw1[8].pImageInfo = &swe_out_atmo_info;
+
+        aw1[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        aw1[9].dstSet = atmo_desc_sets[1];
+        aw1[9].dstBinding = 9;
+        aw1[9].descriptorCount = 1;
+        aw1[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        aw1[9].pImageInfo = &terrain_samp_only;
+
+        aw1[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        aw1[10].dstSet = atmo_desc_sets[1];
+        aw1[10].dstBinding = 10;
+        aw1[10].descriptorCount = 1;
+        aw1[10].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        aw1[10].pImageInfo = &swe_samp_only;
+
+        vkUpdateDescriptorSets(device, 11, aw1, 0, nullptr);
     }
 
     // Sand compute descriptor sets (2 for wind ping-pong)
@@ -1064,18 +1260,15 @@ int main()
 
     // Write sand compute descriptors
     {
-        VkDescriptorImageInfo terrain_sampler_info{};
-        terrain_sampler_info.sampler = terrain_linear_sampler;
-        terrain_sampler_info.imageView = heightmap_gpu.view;
-        terrain_sampler_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo terrain_tex_info{};
+        terrain_tex_info.imageView = heightmap_gpu.view;
+        terrain_tex_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkDescriptorImageInfo wind_a_info{};
-        wind_a_info.sampler = sampler;
         wind_a_info.imageView = wind_field_a.view;
         wind_a_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
         VkDescriptorImageInfo wind_b_info{};
-        wind_b_info.sampler = sampler;
         wind_b_info.imageView = wind_field_b.view;
         wind_b_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
@@ -1084,25 +1277,33 @@ int main()
         sand_buf_info.offset = 0;
         sand_buf_info.range = SAND_MAX_PARTICLES * 32;
 
-        VkDescriptorImageInfo sand_dep_sim_info{};
-        sand_dep_sim_info.sampler = sampler;
-        sand_dep_sim_info.imageView = sand_deposit.view;
-        sand_dep_sim_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorImageInfo sand_dep_tex_info{};
+        sand_dep_tex_info.imageView = sand_deposit.view;
+        sand_dep_tex_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        // Set 0: terrain + wind_a + particles + sand_deposit
-        VkWriteDescriptorSet sw0[4]{};
+        VkDescriptorImageInfo terrain_samp_info{};
+        terrain_samp_info.sampler = terrain_linear_sampler;
+
+        VkDescriptorImageInfo wind_samp_info{};
+        wind_samp_info.sampler = sampler;
+
+        VkDescriptorImageInfo sand_dep_samp_info{};
+        sand_dep_samp_info.sampler = sampler;
+
+        // Set 0: terrain + wind_a + particles + sand_deposit + 3 samplers
+        VkWriteDescriptorSet sw0[7]{};
         sw0[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         sw0[0].dstSet = sand_sim_desc_sets[0];
         sw0[0].dstBinding = 0;
         sw0[0].descriptorCount = 1;
-        sw0[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        sw0[0].pImageInfo = &terrain_sampler_info;
+        sw0[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        sw0[0].pImageInfo = &terrain_tex_info;
 
         sw0[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         sw0[1].dstSet = sand_sim_desc_sets[0];
         sw0[1].dstBinding = 1;
         sw0[1].descriptorCount = 1;
-        sw0[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        sw0[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         sw0[1].pImageInfo = &wind_a_info;
 
         sw0[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1116,25 +1317,46 @@ int main()
         sw0[3].dstSet = sand_sim_desc_sets[0];
         sw0[3].dstBinding = 3;
         sw0[3].descriptorCount = 1;
-        sw0[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        sw0[3].pImageInfo = &sand_dep_sim_info;
+        sw0[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        sw0[3].pImageInfo = &sand_dep_tex_info;
 
-        vkUpdateDescriptorSets(device, 4, sw0, 0, nullptr);
+        sw0[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        sw0[4].dstSet = sand_sim_desc_sets[0];
+        sw0[4].dstBinding = 4;
+        sw0[4].descriptorCount = 1;
+        sw0[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        sw0[4].pImageInfo = &terrain_samp_info;
 
-        // Set 1: terrain + wind_b + particles + sand_deposit
-        VkWriteDescriptorSet sw1[4]{};
+        sw0[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        sw0[5].dstSet = sand_sim_desc_sets[0];
+        sw0[5].dstBinding = 5;
+        sw0[5].descriptorCount = 1;
+        sw0[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        sw0[5].pImageInfo = &wind_samp_info;
+
+        sw0[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        sw0[6].dstSet = sand_sim_desc_sets[0];
+        sw0[6].dstBinding = 6;
+        sw0[6].descriptorCount = 1;
+        sw0[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        sw0[6].pImageInfo = &sand_dep_samp_info;
+
+        vkUpdateDescriptorSets(device, 7, sw0, 0, nullptr);
+
+        // Set 1: terrain + wind_b + particles + sand_deposit + 3 samplers
+        VkWriteDescriptorSet sw1[7]{};
         sw1[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         sw1[0].dstSet = sand_sim_desc_sets[1];
         sw1[0].dstBinding = 0;
         sw1[0].descriptorCount = 1;
-        sw1[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        sw1[0].pImageInfo = &terrain_sampler_info;
+        sw1[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        sw1[0].pImageInfo = &terrain_tex_info;
 
         sw1[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         sw1[1].dstSet = sand_sim_desc_sets[1];
         sw1[1].dstBinding = 1;
         sw1[1].descriptorCount = 1;
-        sw1[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        sw1[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         sw1[1].pImageInfo = &wind_b_info;
 
         sw1[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1148,10 +1370,31 @@ int main()
         sw1[3].dstSet = sand_sim_desc_sets[1];
         sw1[3].dstBinding = 3;
         sw1[3].descriptorCount = 1;
-        sw1[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        sw1[3].pImageInfo = &sand_dep_sim_info;
+        sw1[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        sw1[3].pImageInfo = &sand_dep_tex_info;
 
-        vkUpdateDescriptorSets(device, 4, sw1, 0, nullptr);
+        sw1[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        sw1[4].dstSet = sand_sim_desc_sets[1];
+        sw1[4].dstBinding = 4;
+        sw1[4].descriptorCount = 1;
+        sw1[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        sw1[4].pImageInfo = &terrain_samp_info;
+
+        sw1[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        sw1[5].dstSet = sand_sim_desc_sets[1];
+        sw1[5].dstBinding = 5;
+        sw1[5].descriptorCount = 1;
+        sw1[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        sw1[5].pImageInfo = &wind_samp_info;
+
+        sw1[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        sw1[6].dstSet = sand_sim_desc_sets[1];
+        sw1[6].dstBinding = 6;
+        sw1[6].descriptorCount = 1;
+        sw1[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        sw1[6].pImageInfo = &sand_dep_samp_info;
+
+        vkUpdateDescriptorSets(device, 7, sw1, 0, nullptr);
     }
 
     // Write sand render descriptors
@@ -1582,8 +1825,8 @@ int main()
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
 
-        VkImageMemoryBarrier2 init_barriers[15]{};
-        for (int i = 0; i < 12; ++i) {
+        VkImageMemoryBarrier2 init_barriers[17]{};
+        for (int i = 0; i < 14; ++i) {
             init_barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
             init_barriers[i].srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
             init_barriers[i].srcAccessMask = VK_ACCESS_2_NONE;
@@ -1606,8 +1849,8 @@ int main()
         init_barriers[3].image = sediment_a.image;
         init_barriers[4].image = sediment_b.image;
 
-        // Atmosphere images (UNDEFINED -> GENERAL) — 4 3D volumes + 1 2D shadow
-        for (int i = 5; i < 10; ++i) {
+        // Atmosphere images (UNDEFINED -> GENERAL) — 4 3D volumes + 1 2D shadow + 2 ground output
+        for (int i = 5; i < 12; ++i) {
             init_barriers[i].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             init_barriers[i].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
         }
@@ -1616,29 +1859,31 @@ int main()
         init_barriers[7].image = wind_field_a.image;
         init_barriers[8].image = wind_field_b.image;
         init_barriers[9].image = atmo_shadow.image;
+        init_barriers[10].image = ground_cond.image;
+        init_barriers[11].image = ground_wind.image;
 
-        init_barriers[10] = init_barriers[3]; // copy template from sediment (TRANSFER_DST)
-        init_barriers[10].image = sand_deposit.image;
+        init_barriers[12] = init_barriers[3]; // copy template from sediment (TRANSFER_DST)
+        init_barriers[12].image = sand_deposit.image;
 
         // Tile pool (UNDEFINED -> GENERAL)
-        init_barriers[11].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        init_barriers[11].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-        init_barriers[11].image = clipmap_hm_image;
-        init_barriers[11].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PLANET_TILE_POOL};
+        init_barriers[13].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        init_barriers[13].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        init_barriers[13].image = clipmap_hm_image;
+        init_barriers[13].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PLANET_TILE_POOL};
 
         // Water tile pools (UNDEFINED -> GENERAL)
-        for (int i = 12; i < 15; ++i) {
+        for (int i = 14; i < 17; ++i) {
             init_barriers[i].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             init_barriers[i].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
             init_barriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PLANET_TILE_POOL};
         }
-        init_barriers[12].image = water_state_a_img;
-        init_barriers[13].image = water_state_b_img;
-        init_barriers[14].image = water_output_img;
+        init_barriers[14].image = water_state_a_img;
+        init_barriers[15].image = water_state_b_img;
+        init_barriers[16].image = water_output_img;
 
         VkDependencyInfo dep_init{};
         dep_init.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        dep_init.imageMemoryBarrierCount = 15;
+        dep_init.imageMemoryBarrierCount = 17;
         dep_init.pImageMemoryBarriers = init_barriers;
         vkCmdPipelineBarrier2(cmd, &dep_init);
 
@@ -3486,6 +3731,8 @@ int main()
     destroy_swe_image(device, allocator, sediment_a);
 
     destroy_swe_image(device, allocator, sand_deposit);
+    destroy_swe_image(device, allocator, ground_wind);
+    destroy_swe_image(device, allocator, ground_cond);
     destroy_swe_image(device, allocator, atmo_shadow);
     destroy_swe_image(device, allocator, wind_field_b);
     destroy_swe_image(device, allocator, wind_field_a);

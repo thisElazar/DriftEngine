@@ -4,7 +4,12 @@
 #include "morphology/bush.h"
 #include "morphology/tree.h"
 #include "morphology/lplant.h"
-#include "creature/herbivore.h"
+#include "creature/creature_profile.h"
+#include "animals/herbivore.h"
+#include "animals/predator.h"
+#include "animals/rabbit.h"
+#include "animals/bird.h"
+#include "animals/snake.h"
 #include <filesystem>
 #include <string>
 
@@ -52,12 +57,30 @@ bool load_lplant(const std::filesystem::path& path,
                  std::string& name,
                  LPlantExpression* expr = nullptr);
 
-bool save_herbivore(const std::filesystem::path& path,
-                    const HerbivoreProfile& profile,
-                    const std::string& name);
+bool save_creature(const std::filesystem::path& path,
+                   const CreatureProfile& profile,
+                   const std::string& name);
 
-bool load_herbivore(const std::filesystem::path& path,
-                    HerbivoreProfile& profile,
-                    std::string& name);
+bool load_creature(const std::filesystem::path& path,
+                   CreatureProfile& profile,
+                   std::string& name);
+
+bool save_animal(const std::filesystem::path& path,
+                 Archetype archetype,
+                 const HerbivoreParams* herb,
+                 const PredatorParams* pred,
+                 const RabbitParams* rabbit,
+                 const BirdParams* bird,
+                 const SnakeParams* snake,
+                 const std::string& name);
+
+bool load_animal(const std::filesystem::path& path,
+                 Archetype& archetype,
+                 HerbivoreParams& herb,
+                 PredatorParams& pred,
+                 RabbitParams& rabbit,
+                 BirdParams& bird,
+                 SnakeParams& snake,
+                 std::string& name);
 
 } // namespace bestiary

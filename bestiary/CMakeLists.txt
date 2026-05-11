@@ -8,8 +8,8 @@ add_library(bestiary STATIC
     morphology/bush.cpp
     morphology/tree.cpp
     morphology/lplant.cpp
-    creature/herbivore.cpp
-    creature/vegetation_field.cpp
+    morphology/wildflower.cpp
+    creature/creature_profile.cpp
     creature/creature_mesh.cpp
     skeleton/skeleton.cpp
     skeleton/animation.cpp
@@ -18,9 +18,13 @@ add_library(bestiary STATIC
     animals/herbivore.cpp
     animals/predator.cpp
     animals/rabbit.cpp
+    animals/bird.cpp
+    animals/snake.cpp
     animals/walks/herbivore_walk.cpp
     animals/walks/predator_walk.cpp
     animals/walks/rabbit_walk.cpp
+    animals/walks/bird_walk.cpp
+    animals/walks/snake_walk.cpp
     species_file.cpp
     environment.cpp
     distribution.cpp

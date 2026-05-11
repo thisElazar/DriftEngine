@@ -1,14 +1,10 @@
-#include "herbivore.h"
+#include "creature_profile.h"
 #include "spatial_grid.h"
 
 #include <algorithm>
 #include <cmath>
 
 namespace bestiary {
-
-// -----------------------------------------------------------------------
-// Deterministic hash (same as distribution.cpp)
-// -----------------------------------------------------------------------
 
 static uint32_t dhash(uint32_t x)
 {
@@ -25,10 +21,6 @@ static float dhash_float(uint32_t seed, uint32_t index)
     return static_cast<float>(dhash(seed ^ (index * 2654435761u))) /
            static_cast<float>(0xFFFFFFFFu);
 }
-
-// -----------------------------------------------------------------------
-// Steering helpers
-// -----------------------------------------------------------------------
 
 static float vec2_length(float x, float z)
 {
@@ -58,10 +50,6 @@ static float angle_toward(float from_heading, float tx, float tz, float turn_rat
     return from_heading + diff;
 }
 
-// -----------------------------------------------------------------------
-// Terrain queries
-// -----------------------------------------------------------------------
-
 static float sample_slope(const CreatureWorldView& world, float x, float z)
 {
     if (!world.terrain_height) return 0.0f;
@@ -80,12 +68,8 @@ static float sample_water(const CreatureWorldView& world, float x, float z)
     return std::max(0.0f, world.water_depth(x, z));
 }
 
-// -----------------------------------------------------------------------
-// Terrain-aware steering: water avoidance + slope penalty
-// -----------------------------------------------------------------------
-
 static void apply_terrain_steering(const Agent& agent,
-                                   const HerbivoreProfile& prof,
+                                   const CreatureProfile& prof,
                                    const CreatureWorldView& world,
                                    float& dir_x, float& dir_z)
 {
@@ -121,12 +105,39 @@ static void apply_terrain_steering(const Agent& agent,
     dir_z += avoid_z;
 }
 
-// -----------------------------------------------------------------------
-// Find nearest edible plant (using spatial grid)
-// -----------------------------------------------------------------------
+// 360° radial scan to find the driest reachable direction — used when already in water.
+static void steer_escape_water(const Agent& agent,
+                                const CreatureWorldView& world,
+                                float& dir_x, float& dir_z)
+{
+    constexpr float pi = 3.14159265f;
+    constexpr int   num_dirs = 8;
+    constexpr float probe_near = 6.0f;
+    constexpr float probe_far  = 12.0f;
+
+    float current_w = sample_water(world, agent.pos[0], agent.pos[1]);
+    float best_w = current_w;
+    dir_x = 0.0f;
+    dir_z = 0.0f;
+
+    for (int i = 0; i < num_dirs; ++i) {
+        float angle = (2.0f * pi * i) / num_dirs;
+        float sx = std::sin(angle), sz = std::cos(angle);
+        float w_near = sample_water(world, agent.pos[0] + sx * probe_near,
+                                           agent.pos[1] + sz * probe_near);
+        float w_far  = sample_water(world, agent.pos[0] + sx * probe_far,
+                                           agent.pos[1] + sz * probe_far);
+        float w = (w_near + w_far) * 0.5f;
+        if (w < best_w) {
+            best_w = w;
+            dir_x  = sx;
+            dir_z  = sz;
+        }
+    }
+}
 
 static int find_nearest_plant(const Agent& agent,
-                              const HerbivoreProfile& profile,
+                              const CreatureProfile& profile,
                               const std::vector<PlantInstance>& plants,
                               const SpatialGrid<PlantInstance>& plant_grid)
 {
@@ -150,7 +161,7 @@ static int find_nearest_plant(const Agent& agent,
 }
 
 static bool find_food_direction(const Agent& agent,
-                                const HerbivoreProfile& profile,
+                                const CreatureProfile& profile,
                                 const std::vector<PlantInstance>& plants,
                                 const SpatialGrid<PlantInstance>& plant_grid,
                                 float& out_dx, float& out_dz,
@@ -197,12 +208,8 @@ static bool find_food_direction(const Agent& agent,
     return true;
 }
 
-// -----------------------------------------------------------------------
-// Wander-circle steering
-// -----------------------------------------------------------------------
-
 static SteeringIntent steer_wander(const Agent& agent,
-                                   const HerbivoreProfile& profile,
+                                   const CreatureProfile& profile,
                                    uint32_t seed)
 {
     float fwd_x = std::sin(agent.heading);
@@ -222,10 +229,6 @@ static SteeringIntent steer_wander(const Agent& agent,
     return intent;
 }
 
-// -----------------------------------------------------------------------
-// Herd steering (boids: cohesion + separation + alignment)
-// -----------------------------------------------------------------------
-
 struct HerdIntent {
     float cohesion[2]    = {0.0f, 0.0f};
     float separation[2]  = {0.0f, 0.0f};
@@ -234,7 +237,7 @@ struct HerdIntent {
 };
 
 static HerdIntent compute_herd(const Agent& agent,
-                                const HerbivoreProfile& prof,
+                                const CreatureProfile& prof,
                                 const std::vector<Agent>& agents,
                                 const SpatialGrid<Agent>& agent_grid,
                                 size_t self_idx)
@@ -288,12 +291,8 @@ static HerdIntent compute_herd(const Agent& agent,
     return h;
 }
 
-// -----------------------------------------------------------------------
-// Find potential mate (spatial grid accelerated)
-// -----------------------------------------------------------------------
-
 static int find_mate(const Agent& agent,
-                     const HerbivoreProfile& prof,
+                     const CreatureProfile& prof,
                      const std::vector<Agent>& agents,
                      const SpatialGrid<Agent>& agent_grid,
                      size_t self_idx)
@@ -323,13 +322,39 @@ static int find_mate(const Agent& agent,
     return best;
 }
 
-// -----------------------------------------------------------------------
-// update_creatures
-// -----------------------------------------------------------------------
+static int find_prey(const Agent& predator,
+                     const CreatureProfile& prof,
+                     const std::vector<Agent>& agents,
+                     const std::vector<CreatureProfile>& profiles,
+                     const SpatialGrid<Agent>& agent_grid,
+                     size_t self_idx)
+{
+    float best_d2 = prof.hunt_radius * prof.hunt_radius;
+    int best = -1;
+
+    agent_grid.query_radius(predator.pos[0], predator.pos[1], prof.hunt_radius,
+        [&](uint32_t j) {
+            if (j == static_cast<uint32_t>(self_idx)) return;
+            const Agent& other = agents[j];
+            if (!other.alive) return;
+            if (other.species_id >= profiles.size()) return;
+            if (profiles[other.species_id].archetype == Archetype::Predator) return;
+
+            float dx = other.pos[0] - predator.pos[0];
+            float dz = other.pos[1] - predator.pos[1];
+            float d2 = dx * dx + dz * dz;
+            if (d2 < best_d2) {
+                best_d2 = d2;
+                best = static_cast<int>(j);
+            }
+        });
+
+    return best;
+}
 
 void update_creatures(
     std::vector<Agent>& agents,
-    const std::vector<HerbivoreProfile>& profiles,
+    const std::vector<CreatureProfile>& profiles,
     const CreatureWorldView& world,
     float dt,
     uint32_t tick_seed)
@@ -338,7 +363,6 @@ void update_creatures(
 
     auto& plants = *world.plant_population;
 
-    // Build spatial grids
     float grid_w = world.tile_half_x * 2.0f;
     float grid_h = world.tile_half_z * 2.0f;
     constexpr float AGENT_CELL = 10.0f;
@@ -366,14 +390,15 @@ void update_creatures(
         if (!a.alive) continue;
         if (a.species_id >= profiles.size()) continue;
 
-        const HerbivoreProfile& prof = profiles[a.species_id];
+        const CreatureProfile& prof = profiles[a.species_id];
+        bool is_predator = (prof.archetype == Archetype::Predator);
         uint32_t agent_seed = dhash(tick_seed ^ static_cast<uint32_t>(i * 2654435761u));
 
         if (a.mate_cooldown > 0.0f)
             a.mate_cooldown = std::max(0.0f, a.mate_cooldown - dt);
 
         // --- Threat detection: flee from brush ---
-        if (world.has_threat) {
+        if (world.has_threat && !is_predator) {
             float dx = a.pos[0] - world.threat_pos[0];
             float dz = a.pos[1] - world.threat_pos[1];
             float d2 = dx * dx + dz * dz;
@@ -387,9 +412,33 @@ void update_creatures(
             }
         }
 
+        // --- Prey flees from nearby hunting predators ---
+        if (!is_predator && a.state != AgentState::Flee) {
+            agent_grid.query_radius(a.pos[0], a.pos[1], prof.flee_radius,
+                [&](uint32_t j) {
+                    if (a.state == AgentState::Flee) return;
+                    if (j == static_cast<uint32_t>(i)) return;
+                    const Agent& other = agents[j];
+                    if (!other.alive) return;
+                    if (other.species_id >= profiles.size()) return;
+                    if (profiles[other.species_id].archetype != Archetype::Predator) return;
+                    if (other.state != AgentState::Hunt && other.state != AgentState::Chase) return;
+
+                    float dx = a.pos[0] - other.pos[0];
+                    float dz = a.pos[1] - other.pos[1];
+                    float d2 = dx * dx + dz * dz;
+                    if (d2 > 0.01f && d2 < prof.flee_radius * prof.flee_radius) {
+                        float d = std::sqrt(d2);
+                        a.flee_dir[0] = dx / d;
+                        a.flee_dir[1] = dz / d;
+                        a.flee_timer = prof.flee_duration;
+                        a.state = AgentState::Flee;
+                    }
+                });
+        }
+
         SteeringIntent intent{};
 
-        // --- State transitions + steering ---
         switch (a.state) {
         case AgentState::Wander: {
             if (a.energy >= prof.reproduce_threshold && a.mate_cooldown <= 0.0f) {
@@ -402,20 +451,31 @@ void update_creatures(
                 }
             }
 
-            if (a.energy < prof.hunger_threshold) {
-                float food_dx, food_dz;
-                int plant_idx = -1;
-                if (find_food_direction(a, prof, plants, plant_grid, food_dx, food_dz, plant_idx)) {
-                    float len = vec2_length(food_dx, food_dz);
-                    if (len < 0.01f) {
-                        a.state = AgentState::Graze;
-                        a.graze_timer = 0.0f;
+            if (is_predator) {
+                if (a.energy < prof.hunger_threshold) {
+                    int prey = find_prey(a, prof, agents, profiles, agent_grid, i);
+                    if (prey >= 0) {
+                        a.state = AgentState::Hunt;
+                        a.chase_target = static_cast<uint32_t>(prey);
                         break;
                     }
-                    intent.direction[0] = food_dx;
-                    intent.direction[1] = food_dz;
-                    intent.magnitude = 0.8f;
-                    break;
+                }
+            } else {
+                if (a.energy < prof.hunger_threshold) {
+                    float food_dx, food_dz;
+                    int plant_idx = -1;
+                    if (find_food_direction(a, prof, plants, plant_grid, food_dx, food_dz, plant_idx)) {
+                        float len = vec2_length(food_dx, food_dz);
+                        if (len < 0.01f) {
+                            a.state = AgentState::Graze;
+                            a.graze_timer = 0.0f;
+                            break;
+                        }
+                        intent.direction[0] = food_dx;
+                        intent.direction[1] = food_dz;
+                        intent.magnitude = 0.8f;
+                        break;
+                    }
                 }
             }
             intent = steer_wander(a, prof, agent_seed);
@@ -433,11 +493,12 @@ void update_creatures(
             float taken = std::min(plants[static_cast<size_t>(target)].health, bite);
             plants[static_cast<size_t>(target)].health -= taken;
 
-            // Caloric gain depends on plant species
             float caloric_value = prof.grass_caloric_value;
             int kind = plants[static_cast<size_t>(target)].kind;
-            if (kind == 1) caloric_value = prof.bush_caloric_value;
+            if (kind == 1)      caloric_value = prof.bush_caloric_value;
             else if (kind == 2) caloric_value = prof.tree_caloric_value;
+            else if (kind == 3) caloric_value = prof.reed_caloric_value;
+            else if (kind == 4) caloric_value = prof.wildflower_caloric_value;
 
             a.energy = std::min(a.energy + taken * prof.trophic_efficiency * caloric_value, 1.0f);
             a.graze_timer += dt;
@@ -495,17 +556,102 @@ void update_creatures(
             intent.magnitude = 1.0f;
             break;
         }
+
+        case AgentState::Hunt: {
+            if (a.chase_target >= agents.size() || !agents[a.chase_target].alive) {
+                int prey = find_prey(a, prof, agents, profiles, agent_grid, i);
+                if (prey < 0) {
+                    a.state = AgentState::Wander;
+                    a.chase_target = UINT32_MAX;
+                    break;
+                }
+                a.chase_target = static_cast<uint32_t>(prey);
+            }
+
+            const Agent& target = agents[a.chase_target];
+            float dx = target.pos[0] - a.pos[0];
+            float dz = target.pos[1] - a.pos[1];
+            float dist = vec2_length(dx, dz);
+
+            if (dist > prof.hunt_radius * 1.5f) {
+                a.state = AgentState::Wander;
+                a.chase_target = UINT32_MAX;
+                break;
+            }
+
+            if (dist < prof.hunt_radius * 0.5f) {
+                a.state = AgentState::Chase;
+                break;
+            }
+
+            intent.direction[0] = dx / dist;
+            intent.direction[1] = dz / dist;
+            intent.magnitude = prof.stalk_speed / prof.move_speed;
+            break;
+        }
+
+        case AgentState::Chase: {
+            if (a.chase_target >= agents.size() || !agents[a.chase_target].alive) {
+                a.state = AgentState::Wander;
+                a.chase_target = UINT32_MAX;
+                break;
+            }
+
+            Agent& target = agents[a.chase_target];
+            float dx = target.pos[0] - a.pos[0];
+            float dz = target.pos[1] - a.pos[1];
+            float dist = vec2_length(dx, dz);
+
+            if (dist < prof.attack_range) {
+                target.alive = false;
+                a.energy = std::min(a.energy + prof.kill_energy_gain, 1.0f);
+                a.state = AgentState::Consume;
+                a.consume_timer = prof.consume_duration;
+                a.chase_target = UINT32_MAX;
+                break;
+            }
+
+            if (dist > prof.hunt_radius * 2.0f) {
+                a.state = AgentState::Wander;
+                a.chase_target = UINT32_MAX;
+                break;
+            }
+
+            intent.direction[0] = dx / dist;
+            intent.direction[1] = dz / dist;
+            intent.magnitude = 1.0f;
+            break;
+        }
+
+        case AgentState::Consume: {
+            a.consume_timer -= dt;
+            if (a.consume_timer <= 0.0f) {
+                a.state = AgentState::Wander;
+            }
+            intent.magnitude = 0.0f;
+            break;
+        }
         }
 
         // --- Terrain avoidance steering ---
-        if (intent.magnitude > 0.01f) {
+        float w_current = sample_water(world, a.pos[0], a.pos[1]);
+        bool in_water = (w_current > 0.05f);
+
+        if (in_water) {
+            // Already submerged: override intent with escape direction
+            steer_escape_water(a, world, intent.direction[0], intent.direction[1]);
+            vec2_normalize(intent.direction[0], intent.direction[1]);
+            intent.magnitude = 1.0f;
+        } else if (intent.magnitude > 0.01f) {
             apply_terrain_steering(a, prof, world, intent.direction[0], intent.direction[1]);
             vec2_normalize(intent.direction[0], intent.direction[1]);
         }
 
         // --- Blend herd steering into movement intent ---
         if (intent.magnitude > 0.01f &&
-            a.state != AgentState::Flee && a.state != AgentState::SeekMate) {
+            a.state != AgentState::Flee &&
+            a.state != AgentState::SeekMate &&
+            a.state != AgentState::Chase) {
             HerdIntent herd = compute_herd(a, prof, agents, agent_grid, i);
             if (herd.neighbor_count > 0) {
                 intent.direction[0] += herd.cohesion[0]   * prof.herd_weight
@@ -519,12 +665,13 @@ void update_creatures(
         }
 
         // --- Integrate movement ---
-        float speed = (a.state == AgentState::Flee)
-                        ? prof.run_speed
-                        : prof.move_speed;
+        float speed;
+        if (a.state == AgentState::Flee)       speed = prof.run_speed;
+        else if (a.state == AgentState::Chase) speed = prof.chase_speed;
+        else                                   speed = prof.move_speed;
+
         float actual_speed = speed * intent.magnitude;
 
-        // Slope speed penalty
         float slope = sample_slope(world, a.pos[0], a.pos[1]);
         if (slope > prof.max_slope) {
             actual_speed *= 0.1f;
@@ -548,9 +695,10 @@ void update_creatures(
         a.pos[0] += a.vel[0] * dt;
         a.pos[1] += a.vel[1] * dt;
 
-        // Push out of water (hard constraint)
-        float w = sample_water(world, a.pos[0], a.pos[1]);
-        if (w > 0.05f) {
+        float w_new = sample_water(world, a.pos[0], a.pos[1]);
+        bool should_revert = (!in_water && w_new > 0.05f)   // prevent entering water
+                          || (in_water  && w_new > w_current); // prevent moving deeper
+        if (should_revert) {
             a.pos[0] -= a.vel[0] * dt;
             a.pos[1] -= a.vel[1] * dt;
             a.vel[0] = 0.0f;
@@ -563,6 +711,13 @@ void update_creatures(
         a.pos[1] = std::clamp(a.pos[1],
                               -world.tile_half_z + 1.0f,
                                world.tile_half_z - 1.0f);
+
+        // --- Passive drinking (near water) ---
+        float nearby_water = sample_water(world, a.pos[0], a.pos[1]);
+        if (nearby_water > 0.01f && nearby_water < 0.3f) {
+            float proximity = 1.0f - std::min(nearby_water / 0.3f, 1.0f);
+            a.energy = std::min(a.energy + prof.drink_rate * proximity * dt, 1.0f);
+        }
 
         // --- Energy drain (caloric model) ---
         float basal = prof.basal_rate;
@@ -581,18 +736,20 @@ void update_creatures(
     for (auto& child : offspring)
         agents.push_back(child);
 
-    // Compact dead agents periodically to prevent unbounded vector growth
+    // Compact dead agents periodically
     if ((tick_seed & 0x7F) == 0) {
         agents.erase(
             std::remove_if(agents.begin(), agents.end(),
                            [](const Agent& a) { return !a.alive; }),
             agents.end());
+
+        // Invalidate chase targets after compaction
+        for (auto& a : agents) {
+            if (a.chase_target != UINT32_MAX && a.chase_target >= agents.size())
+                a.chase_target = UINT32_MAX;
+        }
     }
 }
-
-// -----------------------------------------------------------------------
-// Spawning (terrain-aware: avoid water)
-// -----------------------------------------------------------------------
 
 void spawn_creatures(
     std::vector<Agent>& agents,
@@ -610,10 +767,8 @@ void spawn_creatures(
         float x = (dhash_float(s, 0) * 2.0f - 1.0f) * (tile_half_x - 2.0f);
         float z = (dhash_float(s, 1) * 2.0f - 1.0f) * (tile_half_z - 2.0f);
 
-        // Skip overly wet spawn points (moisture > 0.8 implies standing water)
         auto sample = env(x, z);
         if (sample.moisture > 0.8f) {
-            // Retry with offset seed
             s = dhash(s + 7u);
             x = (dhash_float(s, 0) * 2.0f - 1.0f) * (tile_half_x - 2.0f);
             z = (dhash_float(s, 1) * 2.0f - 1.0f) * (tile_half_z - 2.0f);
@@ -630,10 +785,6 @@ void spawn_creatures(
         agents.push_back(a);
     }
 }
-
-// -----------------------------------------------------------------------
-// Stats
-// -----------------------------------------------------------------------
 
 int count_alive(const std::vector<Agent>& agents)
 {

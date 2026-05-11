@@ -17,6 +17,7 @@ struct PredatorParams {
     float paw_size         = 0.04f;  // m
     float tail_length      = 0.45f;  // m — long bushy tail
     float coat_color[3]    = {0.45f, 0.42f, 0.38f};
+    float belly_color[3]   = {0.62f, 0.58f, 0.52f};
 
     float walk_period_seconds = 0.85f;
     float foot_lift_height    = 0.07f;

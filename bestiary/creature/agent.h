@@ -4,11 +4,23 @@
 
 namespace bestiary {
 
+enum class Archetype : uint8_t {
+    Herbivore,
+    Predator,
+    Rabbit,
+    Bird,
+    Raptor,
+    Snake,
+};
+
 enum class AgentState : uint8_t {
     Wander,
     Graze,
     Flee,
     SeekMate,
+    Hunt,
+    Chase,
+    Consume,
 };
 
 struct SteeringIntent {
@@ -33,6 +45,8 @@ struct Agent {
     uint16_t   species_id      = 0;
     bool       alive           = true;
     bool       female          = false;
+    uint32_t   chase_target    = UINT32_MAX;
+    float      consume_timer   = 0.0f;
 };
 
 } // namespace bestiary

@@ -6,8 +6,8 @@
 [[vk::binding(1, 0)]] Texture2D<float4>   state_read;
 [[vk::binding(2, 0)]] RWTexture2D<float4> state_write;
 [[vk::binding(3, 0)]] RWTexture2D<float4> output;
-[[vk::combinedImageSampler]][[vk::binding(4, 0)]] Texture2D<float4> ground_cond;
-[[vk::combinedImageSampler]][[vk::binding(4, 0)]] SamplerState      ground_cond_sampler;
+[[vk::binding(4, 0)]] Texture2D<float4> ground_cond;
+[[vk::binding(5, 0)]] SamplerState      ground_cond_sampler;
 
 [[vk::push_constant]]
 cbuffer PushConstants {

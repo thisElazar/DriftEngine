@@ -391,4 +391,14 @@ void append_path_tube(AnimalMesh& mesh,
     }
 }
 
+void countershade(AnimalMesh& mesh, const float belly[3])
+{
+    for (auto& v : mesh.vertices) {
+        float t = std::max(0.0f, std::min(1.0f, -v.normal[1] * 1.5f + 0.5f));
+        v.color[0] += (belly[0] - v.color[0]) * t;
+        v.color[1] += (belly[1] - v.color[1]) * t;
+        v.color[2] += (belly[2] - v.color[2]) * t;
+    }
+}
+
 } // namespace bestiary

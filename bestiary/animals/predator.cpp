@@ -189,6 +189,7 @@ AnimalMesh generate_predator_mesh(const PredatorParams& p)
     append_sphere(mesh, jp(23), tt*0.5f, p.coat_color, 23, 4, 3);
     append_sphere(mesh, jp(24), tt*0.55f, p.coat_color, 24, 4, 3);
 
+    countershade(mesh, p.belly_color);
     return mesh;
 }
 

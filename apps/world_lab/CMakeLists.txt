@@ -1,7 +1,8 @@
 # World Lab — single-tile ecosystem sandbox (terrain + water + plants + creatures).
 
-add_executable(world_lab main.cpp)
+add_executable(world_lab main.cpp world_lab.cpp)
 target_link_libraries(world_lab PRIVATE drift_engine_core bestiary)
+target_include_directories(world_lab PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 # --- HLSL -> SPIR-V for World Lab shaders ---
 # Engine shaders (swe_init, swe_step, terrain_brush) are already compiled

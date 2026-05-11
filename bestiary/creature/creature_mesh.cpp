@@ -1,6 +1,10 @@
 #include "creature_mesh.h"
-#include "herbivore.h"
+#include "creature_profile.h"
 #include "animals/herbivore.h"
+#include "animals/predator.h"
+#include "animals/rabbit.h"
+#include "animals/bird.h"
+#include "animals/snake.h"
 #include "skeleton/animation.h"
 #include "skeleton/skinning.h"
 
@@ -11,21 +15,113 @@
 
 namespace bestiary {
 
+enum CycleSlot : int {
+    CYCLE_WALK  = 0,
+    CYCLE_TROT  = 1,
+    CYCLE_RUN   = 2,
+    CYCLE_IDLE  = 3,
+    CYCLE_GRAZE = 4,
+    CYCLE_STALK = 5,
+    CYCLE_COUNT = 6,
+};
+
 struct CachedAnimalModel {
-    AnimalMesh       mesh;
-    WalkCycle        walk;
-    WalkCycle        trot;
-    WalkCycle        run;
-    WalkCycle        idle;
-    WalkCycle        graze;
-    HerbivoreParams  params;
-    bool             valid = false;
+    AnimalMesh  mesh;
+    WalkCycle   cycles[CYCLE_COUNT];
+    Archetype   archetype = Archetype::Herbivore;
+    bool        valid = false;
 };
 
 static std::vector<CachedAnimalModel> s_models;
 
+static HerbivoreParams make_herbivore_params(const CreatureProfile& profile)
+{
+    HerbivoreParams p{};
+    p.torso_length     = profile.body_length;
+    p.torso_girth      = profile.body_length * 0.35f;
+    p.neck_length      = profile.body_length * 0.4f;
+    p.head_length      = profile.body_length * 0.2f;
+    p.leg_length_front = profile.body_height * 0.6f;
+    p.leg_length_back  = profile.body_height * 0.6f;
+    p.leg_thickness    = profile.body_length * 0.035f;
+    p.hoof_size        = profile.body_length * 0.04f;
+    p.coat_color[0]    = profile.body_color[0];
+    p.coat_color[1]    = profile.body_color[1];
+    p.coat_color[2]    = profile.body_color[2];
+    p.walk_period_seconds = 0.9f;
+    p.foot_lift_height    = 0.08f;
+    return p;
+}
+
+static PredatorParams make_predator_params(const CreatureProfile& profile)
+{
+    PredatorParams p{};
+    p.torso_length     = profile.body_length;
+    p.chest_girth      = profile.body_length * 0.40f;
+    p.waist_girth      = profile.body_length * 0.28f;
+    p.neck_length      = profile.body_length * 0.35f;
+    p.snout_length     = profile.body_length * 0.30f;
+    p.head_width       = profile.body_length * 0.18f;
+    p.leg_length_front = profile.body_height * 0.55f;
+    p.leg_length_back  = profile.body_height * 0.60f;
+    p.leg_thickness    = profile.body_length * 0.035f;
+    p.paw_size         = profile.body_length * 0.04f;
+    p.tail_length      = profile.body_length * 0.45f;
+    p.coat_color[0]    = profile.body_color[0];
+    p.coat_color[1]    = profile.body_color[1];
+    p.coat_color[2]    = profile.body_color[2];
+    p.walk_period_seconds = 0.85f;
+    p.foot_lift_height    = 0.07f;
+    return p;
+}
+
+static RabbitParams make_rabbit_params(const CreatureProfile& profile)
+{
+    RabbitParams p{};
+    p.body_length      = profile.body_length;
+    p.body_girth       = profile.body_length * 0.47f;
+    p.neck_length      = profile.body_length * 0.2f;
+    p.head_length      = profile.body_length * 0.27f;
+    p.head_width       = profile.body_length * 0.23f;
+    p.ear_length       = profile.body_length * 0.4f;
+    p.leg_length_front = profile.body_height * 0.45f;
+    p.leg_length_back  = profile.body_height * 0.65f;
+    p.leg_thickness    = profile.body_length * 0.05f;
+    p.paw_size         = profile.body_length * 0.05f;
+    p.tail_size        = profile.body_length * 0.1f;
+    p.coat_color[0]    = profile.body_color[0];
+    p.coat_color[1]    = profile.body_color[1];
+    p.coat_color[2]    = profile.body_color[2];
+    p.hop_period_seconds = 0.45f;
+    p.hop_height         = 0.06f;
+    return p;
+}
+
+static BirdParams make_bird_params(const CreatureProfile& profile)
+{
+    BirdParams p{};
+    p.body_length      = profile.body_length;
+    p.body_girth       = profile.body_length * 0.47f;
+    p.neck_length      = profile.body_length * 0.4f;
+    p.head_size        = profile.body_length * 0.16f;
+    p.beak_length      = profile.body_length * 0.12f;
+    p.wing_length      = profile.body_length * 0.88f;
+    p.leg_length_upper = profile.body_height * 0.5f;
+    p.leg_length_lower = profile.body_height * 0.3f;
+    p.leg_thickness    = profile.body_length * 0.032f;
+    p.foot_size        = profile.body_length * 0.08f;
+    p.tail_length      = profile.body_length * 0.24f;
+    p.coat_color[0]    = profile.body_color[0];
+    p.coat_color[1]    = profile.body_color[1];
+    p.coat_color[2]    = profile.body_color[2];
+    p.walk_period_seconds = 0.5f;
+    p.foot_lift_height    = 0.03f;
+    p.hop_height          = 0.04f;
+    return p;
+}
+
 static CachedAnimalModel& ensure_model(uint16_t species_id,
-                                        const HerbivoreProfile& profile)
+                                        const CreatureProfile& profile)
 {
     if (s_models.size() <= species_id)
         s_models.resize(static_cast<size_t>(species_id) + 1);
@@ -33,29 +129,84 @@ static CachedAnimalModel& ensure_model(uint16_t species_id,
     auto& model = s_models[species_id];
     if (model.valid) return model;
 
-    HerbivoreParams params{};
-    params.torso_length     = profile.body_length;
-    params.torso_girth      = profile.body_length * 0.35f;
-    params.neck_length      = profile.body_length * 0.4f;
-    params.head_length      = profile.body_length * 0.2f;
-    params.leg_length_front = profile.body_height * 0.6f;
-    params.leg_length_back  = profile.body_height * 0.6f;
-    params.leg_thickness    = profile.body_length * 0.035f;
-    params.hoof_size        = profile.body_length * 0.04f;
-    params.coat_color[0]    = profile.body_color[0];
-    params.coat_color[1]    = profile.body_color[1];
-    params.coat_color[2]    = profile.body_color[2];
-    params.walk_period_seconds = 0.9f;
-    params.foot_lift_height    = 0.08f;
+    model.archetype = profile.archetype;
 
-    model.params = params;
-    model.mesh   = generate_herbivore_mesh(params);
-    model.walk   = make_herbivore_walk(params);
-    model.trot   = make_herbivore_trot(params);
-    model.run    = make_herbivore_run(params);
-    model.idle   = make_herbivore_idle(params);
-    model.graze  = make_herbivore_graze(params);
-    model.valid  = true;
+    switch (profile.archetype) {
+    case Archetype::Herbivore: {
+        auto p = make_herbivore_params(profile);
+        model.mesh = generate_herbivore_mesh(p);
+        model.cycles[CYCLE_WALK]  = make_herbivore_walk(p);
+        model.cycles[CYCLE_TROT]  = make_herbivore_trot(p);
+        model.cycles[CYCLE_RUN]   = make_herbivore_run(p);
+        model.cycles[CYCLE_IDLE]  = make_herbivore_idle(p);
+        model.cycles[CYCLE_GRAZE] = make_herbivore_graze(p);
+        model.cycles[CYCLE_STALK] = model.cycles[CYCLE_WALK];
+        break;
+    }
+    case Archetype::Predator: {
+        auto p = make_predator_params(profile);
+        model.mesh = generate_predator_mesh(p);
+        model.cycles[CYCLE_WALK]  = make_predator_walk(p);
+        model.cycles[CYCLE_TROT]  = make_predator_trot(p);
+        model.cycles[CYCLE_RUN]   = make_predator_run(p);
+        model.cycles[CYCLE_IDLE]  = make_predator_idle(p);
+        model.cycles[CYCLE_GRAZE] = model.cycles[CYCLE_IDLE];
+        model.cycles[CYCLE_STALK] = make_predator_stalk(p);
+        break;
+    }
+    case Archetype::Rabbit: {
+        auto p = make_rabbit_params(profile);
+        model.mesh = generate_rabbit_mesh(p);
+        model.cycles[CYCLE_WALK]  = make_rabbit_hop(p);
+        model.cycles[CYCLE_TROT]  = make_rabbit_hop(p);
+        model.cycles[CYCLE_RUN]   = make_rabbit_run(p);
+        model.cycles[CYCLE_IDLE]  = make_rabbit_idle(p);
+        model.cycles[CYCLE_GRAZE] = make_rabbit_graze(p);
+        model.cycles[CYCLE_STALK] = model.cycles[CYCLE_WALK];
+        break;
+    }
+    case Archetype::Bird: {
+        BirdParams p = make_bird_params(profile);
+        model.mesh = generate_bird_mesh(p);
+        model.cycles[CYCLE_WALK]  = make_bird_walk(p);
+        model.cycles[CYCLE_TROT]  = make_bird_hop(p);
+        model.cycles[CYCLE_RUN]   = make_bird_run(p);
+        model.cycles[CYCLE_IDLE]  = make_bird_idle(p);
+        model.cycles[CYCLE_GRAZE] = make_bird_peck(p);
+        model.cycles[CYCLE_STALK] = model.cycles[CYCLE_WALK];
+        break;
+    }
+    case Archetype::Raptor: {
+        BirdParams p = make_bird_params(profile);
+        model.mesh = generate_bird_mesh(p);
+        model.cycles[CYCLE_WALK]  = make_bird_walk(p);
+        model.cycles[CYCLE_TROT]  = make_bird_hop(p);
+        model.cycles[CYCLE_RUN]   = make_bird_soar(p);
+        model.cycles[CYCLE_IDLE]  = make_bird_idle(p);
+        model.cycles[CYCLE_GRAZE] = make_bird_dive(p);
+        model.cycles[CYCLE_STALK] = make_bird_soar(p);
+        break;
+    }
+    case Archetype::Snake: {
+        SnakeParams p;
+        p.body_length     = profile.body_length;
+        p.body_thickness  = profile.body_height * 0.05f;
+        p.head_width      = profile.body_height * 0.06f;
+        p.coat_color[0] = profile.body_color[0];
+        p.coat_color[1] = profile.body_color[1];
+        p.coat_color[2] = profile.body_color[2];
+        model.mesh = generate_snake_mesh(p);
+        model.cycles[CYCLE_WALK]  = make_snake_slither(p);
+        model.cycles[CYCLE_TROT]  = make_snake_slither(p);
+        model.cycles[CYCLE_RUN]   = make_snake_fast(p);
+        model.cycles[CYCLE_IDLE]  = make_snake_idle(p);
+        model.cycles[CYCLE_GRAZE] = make_snake_idle(p);
+        model.cycles[CYCLE_STALK] = make_snake_strike(p);
+        break;
+    }
+    }
+
+    model.valid = true;
     return model;
 }
 
@@ -81,16 +232,19 @@ static const WalkCycle* select_cycle(const CachedAnimalModel& model,
                                      AgentState state, float speed)
 {
     switch (state) {
-    case AgentState::Graze:    return &model.graze;
-    case AgentState::Flee:     return &model.run;
+    case AgentState::Graze:    return &model.cycles[CYCLE_GRAZE];
+    case AgentState::Consume:  return &model.cycles[CYCLE_IDLE];
+    case AgentState::Hunt:     return &model.cycles[CYCLE_STALK];
+    case AgentState::Flee:
+    case AgentState::Chase:    return &model.cycles[CYCLE_RUN];
     case AgentState::SeekMate:
     case AgentState::Wander:
-        if (speed > 4.0f)      return &model.run;
-        if (speed > 2.0f)      return &model.trot;
-        if (speed > 0.1f)      return &model.walk;
-        return &model.idle;
+        if (speed > 4.0f)      return &model.cycles[CYCLE_RUN];
+        if (speed > 2.0f)      return &model.cycles[CYCLE_TROT];
+        if (speed > 0.1f)      return &model.cycles[CYCLE_WALK];
+        return &model.cycles[CYCLE_IDLE];
     }
-    return &model.idle;
+    return &model.cycles[CYCLE_IDLE];
 }
 
 static void append_skinned_agent(VegetationMesh& mesh,
@@ -181,7 +335,7 @@ static void append_skinned_agent(VegetationMesh& mesh,
 
 VegetationMesh generate_creature_meshes(
     std::vector<Agent>& agents,
-    const std::vector<HerbivoreProfile>& profiles,
+    const std::vector<CreatureProfile>& profiles,
     std::function<float(float x, float z)> terrain_height,
     float dt)
 {

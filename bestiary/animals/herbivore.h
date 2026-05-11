@@ -14,6 +14,7 @@ struct HerbivoreParams {
     float leg_thickness    = 0.04f;  // m, 0.02..0.15
     float hoof_size        = 0.05f;  // m, 0.02..0.12
     float coat_color[3]    = {0.55f, 0.40f, 0.25f};
+    float belly_color[3]   = {0.72f, 0.62f, 0.48f};
 
     float walk_period_seconds = 0.9f;  // s, 0.3..3.0
     float foot_lift_height    = 0.08f; // m, 0.02..0.2

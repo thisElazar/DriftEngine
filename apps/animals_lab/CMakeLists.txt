@@ -1,6 +1,7 @@
 # Animals Lab — procedural animal model viewer + animation testbed.
 
-add_executable(animals_lab main.cpp)
+add_executable(animals_lab main.cpp animals_lab.cpp)
+target_include_directories(animals_lab PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.. )
 target_link_libraries(animals_lab PRIVATE drift_engine_core bestiary)
 
 # --- HLSL -> SPIR-V for Animals Lab shaders ---

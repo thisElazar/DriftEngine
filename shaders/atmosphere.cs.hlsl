@@ -6,8 +6,8 @@
 #define TWO_PI 6.28318530718
 #define PI 3.14159265359
 
-[[vk::combinedImageSampler]][[vk::binding(0, 0)]] Texture2D<float>   terrain_tex;
-[[vk::combinedImageSampler]][[vk::binding(0, 0)]] SamplerState        terrain_sampler;
+[[vk::binding(0, 0)]] Texture2D<float>   terrain_tex;
+[[vk::binding(7, 0)]] SamplerState       terrain_sampler;
 [[vk::binding(1, 0)]] Texture2D<float4>   state_read;
 [[vk::binding(2, 0)]] RWTexture2D<float4> state_write;
 [[vk::binding(3, 0)]] Texture2D<float2>   wind_read;
