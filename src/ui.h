@@ -14,6 +14,12 @@ struct UIState {
     uint32_t stamp_count = 0;
     uint32_t max_stamps = 0;
 
+    // Atmosphere debug (set by caller after readback)
+    float pressure_min = 0.0f;
+    float pressure_max = 0.0f;
+    float pressure_mean = 0.0f;
+    float wind_speed_max = 0.0f;
+
     // Water physics — defaults tuned for visible flow at planet scale.
     // (At level-8 cells of ~800 m, c = sqrt(g*h) ≈ 10 m/s, so flow takes
     // tens of seconds to traverse a tile; lower friction lets it actually move.)
@@ -54,13 +60,13 @@ struct UIState {
     float orographic_lift = 0.5f;
     float adiabatic_cooling = 0.0065f;
     float rain_shadow = 0.7f;
+    float k_pressure = 0.15f;
     bool request_atmo_reset = false;
 
-    // Sand
+    // Sand (particle system — consumer of wind field)
     bool sand_enabled = false;
     float sand_loft_threshold = 1.5f;
     float sand_loft_rate = 0.5f;
-    float sand_settling = 2.0f;
     float sand_streak = 0.05f;
     float sand_alpha = 0.8f;
     float sand_bounce = 0.3f;

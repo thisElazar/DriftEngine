@@ -1,0 +1,35 @@
+[species]
+kind = 'herbivore'
+name = 'meadow_grazer'
+
+[body]
+body_length = 0.8
+body_height = 0.6
+body_color = [0.55, 0.40, 0.25]
+
+[locomotion]
+move_speed = 2.0
+run_speed = 6.0
+turn_rate = 3.0
+
+[energy]
+body_mass = 30.0
+basal_rate = 0.008
+locomotion_cost = 0.003
+hunger_threshold = 0.5
+starve_threshold = 0.0
+trophic_efficiency = 0.10
+
+[grazing]
+graze_radius = 2.0
+graze_consume = 0.3
+graze_min_density = 0.1
+graze_duration = 3.0
+
+[wander]
+wander_radius = 8.0
+wander_jitter = 2.0
+
+[flee]
+flee_radius = 15.0
+flee_duration = 4.0

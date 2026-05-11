@@ -7,6 +7,8 @@
 
 namespace bestiary {
 
+struct VegetationDensityField;
+
 struct SpeciesSuitability {
     float moisture_min    = 0.0f;
     float moisture_opt_lo = 0.2f;
@@ -51,6 +53,53 @@ VegetationMesh generate_ecosystem(
     const ClumpParams& cp, const ClumpExpression& ce,
     const BushParams& bp, const BushExpression& be,
     const TreeParams& tp, const TreeExpression& te,
-    bool include_ground = true);
+    bool include_ground = true,
+    VegetationDensityField* veg_field = nullptr);
+
+VegetationMesh generate_ecosystem_density_modulated(
+    const EcosystemParams& eco,
+    const EnvironmentField& env,
+    const ClumpParams& cp, const ClumpExpression& ce,
+    const BushParams& bp, const BushExpression& be,
+    const TreeParams& tp, const TreeExpression& te,
+    const VegetationDensityField& veg_field);
+
+// -----------------------------------------------------------------------
+// Persistent plant population
+// -----------------------------------------------------------------------
+
+struct PlantInstance {
+    float    x, z;
+    int      kind;      // 0=grass, 1=bush, 2=tree
+    float    health;    // 0..1, drives visual scale; 0 = dead
+    uint32_t seed;
+};
+
+std::vector<PlantInstance> place_ecosystem(
+    const EcosystemParams& eco,
+    const EnvironmentField& env);
+
+void tick_plant_population(
+    std::vector<PlantInstance>& plants,
+    const EnvironmentField& env,
+    const EcosystemParams& eco,
+    float dt,
+    float growth_rate,
+    float decay_rate);
+
+void sprout_plants(
+    std::vector<PlantInstance>& plants,
+    const EcosystemParams& eco,
+    const EnvironmentField& env,
+    uint32_t seed,
+    int max_sprouts = 20);
+
+VegetationMesh generate_mesh_from_population(
+    const std::vector<PlantInstance>& plants,
+    const EnvironmentField& env,
+    const ClumpParams& cp, const ClumpExpression& ce,
+    const BushParams& bp, const BushExpression& be,
+    const TreeParams& tp, const TreeExpression& te,
+    float phenotype_variance);
 
 } // namespace bestiary

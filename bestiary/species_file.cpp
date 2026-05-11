@@ -690,4 +690,107 @@ bool load_lplant(const std::filesystem::path& path,
     return true;
 }
 
+// -----------------------------------------------------------------------
+// Herbivore
+// -----------------------------------------------------------------------
+
+bool save_herbivore(const std::filesystem::path& path,
+                    const HerbivoreProfile& profile,
+                    const std::string& name)
+{
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        std::fprintf(stderr, "Failed to open %s for writing\n", path.string().c_str());
+        return false;
+    }
+
+    out << "[species]\n"
+        << "kind = 'herbivore'\n"
+        << "name = '" << name << "'\n"
+        << "\n"
+        << "[body]\n"
+        << "body_length = " << fmt(profile.body_length) << "\n"
+        << "body_height = " << fmt(profile.body_height) << "\n"
+        << "body_color = [" << fmt(profile.body_color[0]) << ", "
+                            << fmt(profile.body_color[1]) << ", "
+                            << fmt(profile.body_color[2]) << "]\n"
+        << "\n"
+        << "[locomotion]\n"
+        << "move_speed = " << fmt(profile.move_speed) << "\n"
+        << "run_speed = "  << fmt(profile.run_speed)  << "\n"
+        << "turn_rate = "  << fmt(profile.turn_rate)  << "\n"
+        << "\n"
+        << "[energy]\n"
+        << "body_mass = "        << fmt(profile.body_mass)        << "\n"
+        << "basal_rate = "       << fmt(profile.basal_rate)       << "\n"
+        << "locomotion_cost = "  << fmt(profile.locomotion_cost)  << "\n"
+        << "hunger_threshold = " << fmt(profile.hunger_threshold) << "\n"
+        << "starve_threshold = " << fmt(profile.starve_threshold) << "\n"
+        << "trophic_efficiency = " << fmt(profile.trophic_efficiency) << "\n"
+        << "\n"
+        << "[grazing]\n"
+        << "graze_radius = "      << fmt(profile.graze_radius)      << "\n"
+        << "graze_consume = "     << fmt(profile.graze_consume)     << "\n"
+        << "graze_min_health = " << fmt(profile.graze_min_health) << "\n"
+        << "graze_duration = "    << fmt(profile.graze_duration)    << "\n"
+        << "\n"
+        << "[wander]\n"
+        << "wander_radius = " << fmt(profile.wander_radius) << "\n"
+        << "wander_jitter = " << fmt(profile.wander_jitter) << "\n"
+        << "\n"
+        << "[flee]\n"
+        << "flee_radius = "   << fmt(profile.flee_radius)   << "\n"
+        << "flee_duration = " << fmt(profile.flee_duration) << "\n";
+
+    return true;
+}
+
+bool load_herbivore(const std::filesystem::path& path,
+                    HerbivoreProfile& profile,
+                    std::string& name)
+{
+    auto tbl = parse_toml(path);
+    if (tbl.empty()) return false;
+
+    if (auto v = tbl["species"]["name"].value<std::string>())
+        name = *v;
+
+    auto f = [&](const char* section, const char* key, float& dst) {
+        if (auto v = tbl[section][key].value<double>())
+            dst = static_cast<float>(*v);
+    };
+
+    f("body", "body_length", profile.body_length);
+    f("body", "body_height", profile.body_height);
+
+    if (auto arr = tbl["body"]["body_color"].as_array(); arr && arr->size() >= 3)
+        for (int i = 0; i < 3; ++i)
+            if (auto v = (*arr)[static_cast<size_t>(i)].value<double>())
+                profile.body_color[i] = static_cast<float>(*v);
+
+    f("locomotion", "move_speed", profile.move_speed);
+    f("locomotion", "run_speed",  profile.run_speed);
+    f("locomotion", "turn_rate",  profile.turn_rate);
+
+    f("energy", "body_mass",          profile.body_mass);
+    f("energy", "basal_rate",        profile.basal_rate);
+    f("energy", "locomotion_cost",   profile.locomotion_cost);
+    f("energy", "hunger_threshold",  profile.hunger_threshold);
+    f("energy", "starve_threshold",  profile.starve_threshold);
+    f("energy", "trophic_efficiency", profile.trophic_efficiency);
+
+    f("grazing", "graze_radius",      profile.graze_radius);
+    f("grazing", "graze_consume",     profile.graze_consume);
+    f("grazing", "graze_min_health", profile.graze_min_health);
+    f("grazing", "graze_duration",    profile.graze_duration);
+
+    f("wander", "wander_radius", profile.wander_radius);
+    f("wander", "wander_jitter", profile.wander_jitter);
+
+    f("flee", "flee_radius",   profile.flee_radius);
+    f("flee", "flee_duration", profile.flee_duration);
+
+    return true;
+}
+
 } // namespace bestiary

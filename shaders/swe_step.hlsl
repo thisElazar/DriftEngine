@@ -6,6 +6,8 @@
 [[vk::binding(1, 0)]] Texture2D<float4>   state_read;
 [[vk::binding(2, 0)]] RWTexture2D<float4> state_write;
 [[vk::binding(3, 0)]] RWTexture2D<float4> output;
+[[vk::combinedImageSampler]][[vk::binding(4, 0)]] Texture2D<float4> ground_cond;
+[[vk::combinedImageSampler]][[vk::binding(4, 0)]] SamplerState      ground_cond_sampler;
 
 [[vk::push_constant]]
 cbuffer PushConstants {
@@ -16,7 +18,7 @@ cbuffer PushConstants {
     float dx;
     float sea_level;
     float damping;
-    float _pad0;
+    float k_rain;
     uint  grid_w;
     uint  grid_h;
     float pulse_x;
@@ -137,6 +139,13 @@ void main(uint3 ThreadId : SV_DispatchThreadID)
         state.r += pulse_amount * falloff;
     }
 
+    // Rain source term from atmosphere ground conditions (last frame's precipitation)
+    if (k_rain > 0.0f) {
+        float2 uv = (float2(coord) + 0.5) / float2(grid_w, grid_h);
+        float rain_rate = ground_cond.SampleLevel(ground_cond_sampler, uv, 0).r;
+        state.r += rain_rate * k_rain * dt;
+    }
+
     float h  = max(state.r, 0.0f);
     float hu = state.g;
     float hv = state.b;
@@ -245,22 +254,25 @@ void main(uint3 ThreadId : SV_DispatchThreadID)
         }
     }
 
-    // Sponge layer: absorbing boundary via friction-based drain
-    float sponge_width = 64.0f;
+    // Sponge layer: smooth absorbing boundary
+    float sponge_width = 16.0f;
     float2 distFromEdge = float2(
         min((float)coord.x, (float)(GRID_W - 1 - coord.x)),
         min((float)coord.y, (float)(GRID_H - 1 - coord.y))
     );
     float edge_dist = min(distFromEdge.x, distFromEdge.y);
-    float sponge_t = saturate(1.0f - edge_dist / sponge_width);
-    float sponge_str = sponge_t * sponge_t;
+    if (edge_dist < 1.0f) {
+        h_new = 0.0f; hu_new = 0.0f; hv_new = 0.0f;
+    } else if (edge_dist < sponge_width) {
+        float sponge_t = 1.0f - (edge_dist - 1.0f) / (sponge_width - 1.0f);
+        float sponge_str = sponge_t * sponge_t * sponge_t;
+        hu_new *= 1.0f / (1.0f + step_dt * 30.0f * sponge_str);
+        hv_new *= 1.0f / (1.0f + step_dt * 30.0f * sponge_str);
+        h_new *= max(0.0f, 1.0f - step_dt * 8.0f * sponge_str);
+    }
 
-    float sponge_decay = 1.0f / (1.0f + step_dt * 20.0f * sponge_str);
-    hu_new *= sponge_decay;
-    hv_new *= sponge_decay;
-    h_new *= max(0.0f, 1.0f - step_dt * 3.0f * sponge_str);
-
-    float edgeFade = 1.0f - sponge_str;
+    float edgeFade = (edge_dist < 1.0f) ? 0.0f :
+                     (edge_dist < sponge_width) ? (edge_dist - 1.0f) / (sponge_width - 1.0f) : 1.0f;
 
     // Global damping
     hu_new *= (1.0f - DAMPING * step_dt);

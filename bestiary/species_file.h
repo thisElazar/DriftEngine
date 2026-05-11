@@ -4,6 +4,7 @@
 #include "morphology/bush.h"
 #include "morphology/tree.h"
 #include "morphology/lplant.h"
+#include "creature/herbivore.h"
 #include <filesystem>
 #include <string>
 
@@ -50,5 +51,13 @@ bool load_lplant(const std::filesystem::path& path,
                  LPlantParams& params,
                  std::string& name,
                  LPlantExpression* expr = nullptr);
+
+bool save_herbivore(const std::filesystem::path& path,
+                    const HerbivoreProfile& profile,
+                    const std::string& name);
+
+bool load_herbivore(const std::filesystem::path& path,
+                    HerbivoreProfile& profile,
+                    std::string& name);
 
 } // namespace bestiary

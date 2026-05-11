@@ -1,44 +1,7 @@
-# World Lab — single-tile sandbox app.
-#
-# Brings together the existing single-tile shaders (swe_init, swe_step,
-# terrain_brush) with the bestiary plant pipeline so we can validate the
-# water -> moisture -> plant-density loop on a 256x256 tile before deploying
-# it on the planet.
+# World Lab — single-tile ecosystem sandbox (terrain + water + plants + creatures).
 
-add_executable(world_lab
-    main.cpp
-    ${CMAKE_SOURCE_DIR}/src/renderer.cpp
-    ${CMAKE_SOURCE_DIR}/src/resources.cpp
-    ${CMAKE_SOURCE_DIR}/src/vma_impl.cpp
-)
-
-target_include_directories(world_lab PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-)
-
-target_link_libraries(world_lab PRIVATE
-    bestiary
-    Vulkan::Vulkan
-    glfw
-    vk-bootstrap::vk-bootstrap
-    GPUOpen::VulkanMemoryAllocator
-    glm::glm
-    imgui
-)
-
-target_compile_definitions(world_lab PRIVATE GLFW_INCLUDE_NONE)
-
-if(MSVC)
-    target_compile_options(world_lab PRIVATE /W4 /permissive-)
-else()
-    target_compile_options(world_lab PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-if(APPLE)
-    target_compile_definitions(world_lab PRIVATE VK_USE_PLATFORM_METAL_EXT)
-    get_filename_component(_vulkan_lib_dir "${Vulkan_LIBRARIES}" DIRECTORY)
-    target_link_options(world_lab PRIVATE "LINKER:-rpath,${_vulkan_lib_dir}")
-endif()
+add_executable(world_lab main.cpp)
+target_link_libraries(world_lab PRIVATE drift_engine_core bestiary)
 
 # --- HLSL -> SPIR-V for World Lab shaders ---
 # Engine shaders (swe_init, swe_step, terrain_brush) are already compiled

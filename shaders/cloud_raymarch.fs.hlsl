@@ -18,9 +18,6 @@
 [[vk::combinedImageSampler]][[vk::binding(5, 0)]] Texture3D<float4> cloud_vol;
 [[vk::combinedImageSampler]][[vk::binding(5, 0)]] SamplerState      vol_sampler;
 
-[[vk::combinedImageSampler]][[vk::binding(6, 0)]] Texture3D<float4> wind_vol;
-[[vk::combinedImageSampler]][[vk::binding(6, 0)]] SamplerState      wind_sampler;
-
 [[vk::push_constant]]
 cbuffer RaymarchPC {
     float terrain_size;
@@ -122,11 +119,7 @@ float4 main(PSInput input) : SV_Target
             continue;
 
         float4 sample_val = cloud_vol.SampleLevel(vol_sampler, uvw, 0);
-        float cloud_density = sample_val.r * cloud_opacity;
-
-        float sand_density = wind_vol.SampleLevel(wind_sampler, uvw, 0).a * cloud_opacity;
-
-        float density = cloud_density + sand_density;
+        float density = sample_val.r * cloud_opacity;
         if (density < 0.001)
             continue;
 
@@ -143,8 +136,7 @@ float4 main(PSInput input) : SV_Target
             float3 suvw = world_to_vol_uvw(sp);
             if (suvw.z >= 0.0 && suvw.z <= 1.0) {
                 float sd = cloud_vol.SampleLevel(vol_sampler, suvw, 0).r;
-                float ss = wind_vol.SampleLevel(wind_sampler, suvw, 0).a;
-                sun_transmit *= exp(-(sd + ss) * EXTINCTION * sun_step * cloud_opacity * 0.5);
+                sun_transmit *= exp(-sd * EXTINCTION * sun_step * cloud_opacity * 0.5);
             }
         }
 
@@ -156,12 +148,7 @@ float4 main(PSInput input) : SV_Target
         float3 lighting = sun_color * sun_transmit * phase * SCATTER_COEFF;
         float3 ambient = float3(0.35, 0.4, 0.5);
 
-        // Blend cloud (white) and sand (amber) based on relative density
-        float3 cloud_color = float3(1.0, 1.0, 1.0);
-        float3 sand_color  = float3(0.85, 0.65, 0.35);
-        float sand_frac = (density > 0.001) ? sand_density / density : 0.0;
-        float3 mat_color = lerp(cloud_color, sand_color, sand_frac);
-        mat_color *= (lighting + ambient);
+        float3 mat_color = (lighting + ambient);
 
         // Precipitation darkening
         float precip_val = sample_val.a;

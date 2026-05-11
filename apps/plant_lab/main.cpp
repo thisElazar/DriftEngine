@@ -1,4 +1,4 @@
-// Species Lab — v0.0.5
+// Plant Lab — v0.0.5
 
 #include <vulkan/vulkan.h>
 #include <GLFW/glfw3.h>
@@ -13,6 +13,8 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include "renderer.h"
+#include "vk_util.h"
+#include "pipeline.h"
 
 #include "morphology/clump.h"
 #include "morphology/bush.h"
@@ -23,62 +25,11 @@
 #include "distribution.h"
 
 #include <filesystem>
-#include <fstream>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 namespace {
-
-// ---------------------------------------------------------------------------
-// SPIR-V loading (same as engine's pipeline.cpp)
-// ---------------------------------------------------------------------------
-std::vector<uint32_t> load_spirv(const char* path)
-{
-    std::ifstream file(path, std::ios::ate | std::ios::binary);
-    if (!file.is_open()) {
-        std::fprintf(stderr, "Failed to open SPIR-V file: %s\n", path);
-        std::abort();
-    }
-    auto size = static_cast<size_t>(file.tellg());
-    std::vector<uint32_t> buffer(size / sizeof(uint32_t));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(size));
-    return buffer;
-}
-
-// ---------------------------------------------------------------------------
-// GPU buffer helpers
-// ---------------------------------------------------------------------------
-struct GpuBuffer {
-    VkBuffer      buffer     = VK_NULL_HANDLE;
-    VmaAllocation allocation = VK_NULL_HANDLE;
-};
-
-GpuBuffer create_buffer(VmaAllocator allocator, VkDeviceSize size, VkBufferUsageFlags usage)
-{
-    VkBufferCreateInfo ci{};
-    ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    ci.size  = size;
-    ci.usage = usage;
-
-    VmaAllocationCreateInfo alloc_ci{};
-    alloc_ci.usage = VMA_MEMORY_USAGE_AUTO;
-    alloc_ci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-
-    GpuBuffer buf;
-    VK_CHECK(vmaCreateBuffer(allocator, &ci, &alloc_ci, &buf.buffer, &buf.allocation, nullptr));
-    return buf;
-}
-
-void destroy_buffer(VmaAllocator allocator, GpuBuffer& buf)
-{
-    if (buf.buffer != VK_NULL_HANDLE) {
-        vmaDestroyBuffer(allocator, buf.buffer, buf.allocation);
-        buf.buffer     = VK_NULL_HANDLE;
-        buf.allocation = VK_NULL_HANDLE;
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Orbit camera
@@ -143,13 +94,6 @@ struct ClumpPipeline {
     VkPipeline       pipeline = VK_NULL_HANDLE;
     VkShaderModule   vs       = VK_NULL_HANDLE;
     VkShaderModule   fs       = VK_NULL_HANDLE;
-};
-
-struct ClumpPC {
-    glm::mat4 mvp;
-    float wind_dir[2];
-    float wind_speed;
-    float time;
 };
 
 ClumpPipeline create_clump_pipeline(VkDevice device)
@@ -310,8 +254,8 @@ void upload_mesh(VmaAllocator allocator, MeshState& ms, const bestiary::Vegetati
     VkDeviceSize vb_size = mesh.vertices.size() * sizeof(bestiary::VegetationVertex);
     VkDeviceSize ib_size = mesh.indices.size()  * sizeof(uint32_t);
 
-    ms.vertex_buf = create_buffer(allocator, vb_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-    ms.index_buf  = create_buffer(allocator, ib_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    ms.vertex_buf = create_host_buffer(allocator, vb_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    ms.index_buf  = create_host_buffer(allocator, ib_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
 
     void* mapped = nullptr;
     VK_CHECK(vmaMapMemory(allocator, ms.vertex_buf.allocation, &mapped));
@@ -405,7 +349,7 @@ void draw_lab_panel(int& species_kind, int& view_mode,
 
     ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(360, 780), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Species Lab v0.0.5");
+    ImGui::Begin("Plant Lab v0.0.5");
 
     const char* kinds[] = {"Grass Clump", "Bush", "Tree", "L-Plant"};
     ImGui::Combo("species", &species_kind, kinds, 4);
@@ -932,7 +876,7 @@ void record_frame(Renderer& r, FrameData& frame, uint32_t image_index, VkExtent2
 int main()
 {
     Renderer renderer{};
-    renderer_init(renderer, 1280, 800, "Species Lab");
+    renderer_init(renderer, 1280, 800, "Plant Lab");
 
     glfwSetScrollCallback(renderer.window, scroll_cb);
     ImGui_ImplGlfw_InstallCallbacks(renderer.window);

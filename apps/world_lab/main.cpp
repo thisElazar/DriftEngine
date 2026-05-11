@@ -18,19 +18,24 @@
 
 #include "renderer.h"
 #include "resources.h"
+#include "vk_util.h"
+#include "grid_util.h"
+#include "pipeline.h"
 
 #include "morphology/clump.h"
 #include "morphology/bush.h"
 #include "morphology/tree.h"
 #include "environment.h"
 #include "distribution.h"
+#include "creature/agent.h"
+#include "creature/herbivore.h"
+#include "creature/creature_mesh.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -41,44 +46,6 @@ constexpr uint32_t GRID_H   = 256;
 constexpr float    DX       = 1.0f;        // 1 m per cell -> tile is 256m x 256m
 constexpr float    TILE_HALF_X = GRID_W * DX * 0.5f;
 constexpr float    TILE_HALF_Z = GRID_H * DX * 0.5f;
-
-// ---------------------------------------------------------------------------
-// PC structs (matching the existing engine shaders one-to-one)
-// ---------------------------------------------------------------------------
-struct SweInitPC {
-    uint32_t grid_w;
-    uint32_t grid_h;
-    float    initial_water_level;
-    float    _pad;
-};
-
-struct SweStepPC {
-    float    time;
-    float    dt;
-    float    gravity;
-    float    friction;
-    float    dx;
-    float    sea_level;
-    float    damping;
-    float    _pad0;
-    uint32_t grid_w;
-    uint32_t grid_h;
-    float    pulse_x;
-    float    pulse_y;
-    float    pulse_radius;
-    float    pulse_amount;
-};
-
-struct TerrainBrushPC {
-    float    brush_x;
-    float    brush_y;
-    float    brush_radius;
-    float    brush_amount;
-    uint32_t grid_w;
-    uint32_t grid_h;
-    uint32_t _pad0;
-    uint32_t _pad1;
-};
 
 struct WorldTerrainPC {
     glm::mat4 mvp;
@@ -96,143 +63,30 @@ struct WorldTerrainPC {
     float     _pad2;
 };
 
-struct ClumpPC {
-    glm::mat4 mvp;
-    float     wind_dir[2];
-    float     wind_speed;
-    float     time;
-};
-
 namespace {
 
-// ---------------------------------------------------------------------------
-// SPIR-V loader
-// ---------------------------------------------------------------------------
-std::vector<uint32_t> load_spirv(const char* path)
-{
-    std::ifstream file(path, std::ios::ate | std::ios::binary);
-    if (!file.is_open()) {
-        std::fprintf(stderr, "Failed to open SPIR-V file: %s\n", path);
-        std::abort();
-    }
-    auto size = static_cast<size_t>(file.tellg());
-    std::vector<uint32_t> buffer(size / sizeof(uint32_t));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(size));
-    return buffer;
-}
+float world_to_gx(float wx) { return (wx + TILE_HALF_X) / DX - 0.5f; }
+float world_to_gy(float wz) { return (wz + TILE_HALF_Z) / DX - 0.5f; }
 
-VkShaderModule make_shader(VkDevice device, const char* path)
-{
-    auto spv = load_spirv(path);
-    VkShaderModuleCreateInfo ci{};
-    ci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    ci.codeSize = spv.size() * sizeof(uint32_t);
-    ci.pCode    = spv.data();
-    VkShaderModule mod = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &mod));
-    return mod;
-}
+constexpr uint32_t ATMO_W = GRID_W;
+constexpr uint32_t ATMO_H = GRID_H;
+constexpr uint32_t ATMO_D = 32;
 
-// ---------------------------------------------------------------------------
-// Buffer helpers
-// ---------------------------------------------------------------------------
-struct GpuBuffer {
-    VkBuffer      buffer     = VK_NULL_HANDLE;
-    VmaAllocation allocation = VK_NULL_HANDLE;
+struct CameraUBO {
+    glm::mat4 view;
+    glm::mat4 proj;
+    glm::vec3 sun_dir;   float _p0;
+    glm::vec3 sun_color; float _p1;
+    glm::vec3 cam_pos;   float _p2;
+    glm::vec4 brush_world;
+    glm::vec4 brush_color;
+    glm::mat4 inv_view_proj;
 };
 
-GpuBuffer create_host_buffer(VmaAllocator alloc, VkDeviceSize size, VkBufferUsageFlags usage)
-{
-    VkBufferCreateInfo ci{};
-    ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    ci.size  = size;
-    ci.usage = usage;
-    VmaAllocationCreateInfo ai{};
-    ai.usage = VMA_MEMORY_USAGE_AUTO;
-    ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-
-    GpuBuffer b{};
-    VK_CHECK(vmaCreateBuffer(alloc, &ci, &ai, &b.buffer, &b.allocation, nullptr));
-    return b;
-}
-
-GpuBuffer create_readback_buffer(VmaAllocator alloc, VkDeviceSize size)
-{
-    VkBufferCreateInfo ci{};
-    ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    ci.size  = size;
-    ci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    VmaAllocationCreateInfo ai{};
-    ai.usage = VMA_MEMORY_USAGE_AUTO;
-    ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-             | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-
-    GpuBuffer b{};
-    VK_CHECK(vmaCreateBuffer(alloc, &ci, &ai, &b.buffer, &b.allocation, nullptr));
-    return b;
-}
-
-void destroy_buffer(VmaAllocator alloc, GpuBuffer& b)
-{
-    if (b.buffer) { vmaDestroyBuffer(alloc, b.buffer, b.allocation); b = {}; }
-}
-
-// ---------------------------------------------------------------------------
-// One-shot command buffer helper
-// ---------------------------------------------------------------------------
-struct OneShot {
-    VkDevice      device;
-    VkQueue       queue;
-    VkCommandPool pool;
-    VkCommandBuffer cmd;
-};
-
-OneShot oneshot_begin(VkDevice device, VkQueue queue, uint32_t family)
-{
-    OneShot s{device, queue, VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkCommandPoolCreateInfo pci{};
-    pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    pci.queueFamilyIndex = family;
-    VK_CHECK(vkCreateCommandPool(device, &pci, nullptr, &s.pool));
-
-    VkCommandBufferAllocateInfo cai{};
-    cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cai.commandPool = s.pool;
-    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(device, &cai, &s.cmd));
-
-    VkCommandBufferBeginInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CHECK(vkBeginCommandBuffer(s.cmd, &bi));
-    return s;
-}
-
-void oneshot_end(OneShot& s)
-{
-    VK_CHECK(vkEndCommandBuffer(s.cmd));
-    VkFenceCreateInfo fci{};
-    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    VkFence fence = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateFence(s.device, &fci, nullptr, &fence));
-
-    VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &s.cmd;
-    VK_CHECK(vkQueueSubmit(s.queue, 1, &si, fence));
-    VK_CHECK(vkWaitForFences(s.device, 1, &fence, VK_TRUE, UINT64_MAX));
-    vkDestroyFence(s.device, fence, nullptr);
-    vkDestroyCommandPool(s.device, s.pool, nullptr);
-}
-
-void image_barrier(VkCommandBuffer cmd, VkImage img,
-                   VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
-                   VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access,
-                   VkImageLayout old_layout, VkImageLayout new_layout)
+void volume_barrier(VkCommandBuffer cmd, VkImage img,
+                    VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                    VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access,
+                    VkImageLayout old_layout, VkImageLayout new_layout)
 {
     VkImageMemoryBarrier2 b{};
     b.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -244,7 +98,6 @@ void image_barrier(VkCommandBuffer cmd, VkImage img,
     b.newLayout     = new_layout;
     b.image         = img;
     b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-
     VkDependencyInfo di{};
     di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     di.imageMemoryBarrierCount = 1;
@@ -252,78 +105,16 @@ void image_barrier(VkCommandBuffer cmd, VkImage img,
     vkCmdPipelineBarrier2(cmd, &di);
 }
 
-// Upload float data into an existing R32_SFLOAT image (assumes GENERAL layout
-// in/out, image was created with TRANSFER_DST_BIT — upload_heightmap does this).
-void update_r32_image(VkDevice device, VmaAllocator alloc,
-                     VkQueue queue, uint32_t family,
-                     VkImage img, const std::vector<float>& data,
-                     uint32_t w, uint32_t h)
-{
-    VkDeviceSize bytes = VkDeviceSize{w} * h * sizeof(float);
-    VkBufferCreateInfo bci{};
-    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size  = bytes;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    VmaAllocationCreateInfo ai{};
-    ai.usage = VMA_MEMORY_USAGE_AUTO;
-    ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-             | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    VkBuffer staging = VK_NULL_HANDLE;
-    VmaAllocation staging_alloc = VK_NULL_HANDLE;
-    VmaAllocationInfo staging_info{};
-    VK_CHECK(vmaCreateBuffer(alloc, &bci, &ai, &staging, &staging_alloc, &staging_info));
-    std::memcpy(staging_info.pMappedData, data.data(), bytes);
-    vmaFlushAllocation(alloc, staging_alloc, 0, VK_WHOLE_SIZE);
-
-    OneShot s = oneshot_begin(device, queue, family);
-    VkImageMemoryBarrier2 b1{};
-    b1.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    b1.srcStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-    b1.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    b1.dstStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
-    b1.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    b1.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
-    b1.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b1.image         = img;
-    b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    VkDependencyInfo d1{};
-    d1.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    d1.imageMemoryBarrierCount = 1; d1.pImageMemoryBarriers = &b1;
-    vkCmdPipelineBarrier2(s.cmd, &d1);
-
-    VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent = {w, h, 1};
-    vkCmdCopyBufferToImage(s.cmd, staging, img,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-
-    VkImageMemoryBarrier2 b2 = b1;
-    b2.srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
-    b2.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    b2.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-    b2.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    b2.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b2.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
-    VkDependencyInfo d2{};
-    d2.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    d2.imageMemoryBarrierCount = 1; d2.pImageMemoryBarriers = &b2;
-    vkCmdPipelineBarrier2(s.cmd, &d2);
-    oneshot_end(s);
-    vmaDestroyBuffer(alloc, staging, staging_alloc);
-}
-
-void compute_memory_barrier(VkCommandBuffer cmd)
+void compute_to_graphics_barrier(VkCommandBuffer cmd)
 {
     VkMemoryBarrier2 mb{};
     mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
     mb.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    mb.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    mb.dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                     | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
     mb.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
-                     | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-                     | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                     | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
     VkDependencyInfo di{};
     di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     di.memoryBarrierCount = 1;
@@ -331,70 +122,63 @@ void compute_memory_barrier(VkCommandBuffer cmd)
     vkCmdPipelineBarrier2(cmd, &di);
 }
 
-// ---------------------------------------------------------------------------
-// Compute pipelines
-// ---------------------------------------------------------------------------
-struct ComputePipeline {
-    VkShaderModule   shader      = VK_NULL_HANDLE;
-    VkDescriptorSetLayout dsl    = VK_NULL_HANDLE;
-    VkPipelineLayout layout      = VK_NULL_HANDLE;
-    VkPipeline       pipeline    = VK_NULL_HANDLE;
-};
-
-ComputePipeline make_compute_pipeline(VkDevice device, const char* spv,
-                                      const std::vector<VkDescriptorType>& bindings,
-                                      uint32_t push_size)
+SweImage create_volume_image_readback(VkDevice device, VmaAllocator allocator,
+                                      uint32_t w, uint32_t h, uint32_t d, VkFormat format)
 {
-    ComputePipeline cp{};
-    cp.shader = make_shader(device, spv);
-
-    std::vector<VkDescriptorSetLayoutBinding> b(bindings.size());
-    for (size_t i = 0; i < bindings.size(); ++i) {
-        b[i].binding         = static_cast<uint32_t>(i);
-        b[i].descriptorType  = bindings[i];
-        b[i].descriptorCount = 1;
-        b[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-    }
-    VkDescriptorSetLayoutCreateInfo dslci{};
-    dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslci.bindingCount = static_cast<uint32_t>(b.size());
-    dslci.pBindings    = b.data();
-    VK_CHECK(vkCreateDescriptorSetLayout(device, &dslci, nullptr, &cp.dsl));
-
-    VkPushConstantRange push{};
-    push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    push.size       = push_size;
-
-    VkPipelineLayoutCreateInfo plci{};
-    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    plci.setLayoutCount         = 1;
-    plci.pSetLayouts            = &cp.dsl;
-    plci.pushConstantRangeCount = 1;
-    plci.pPushConstantRanges    = &push;
-    VK_CHECK(vkCreatePipelineLayout(device, &plci, nullptr, &cp.layout));
-
-    VkPipelineShaderStageCreateInfo stage{};
-    stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-    stage.module = cp.shader;
-    stage.pName  = "main";
-
-    VkComputePipelineCreateInfo cpci{};
-    cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    cpci.stage  = stage;
-    cpci.layout = cp.layout;
-    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpci, nullptr, &cp.pipeline));
-
-    return cp;
+    VkImageCreateInfo img_ci{};
+    img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_ci.imageType = VK_IMAGE_TYPE_3D;
+    img_ci.format = format;
+    img_ci.extent = {w, h, d};
+    img_ci.mipLevels = 1;
+    img_ci.arrayLayers = 1;
+    img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    img_ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                 | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VmaAllocationCreateInfo alloc_ci{};
+    alloc_ci.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_ci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    SweImage img{};
+    VK_CHECK(vmaCreateImage(allocator, &img_ci, &alloc_ci, &img.image, &img.allocation, nullptr));
+    VkImageViewCreateInfo view_ci{};
+    view_ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_ci.image = img.image;
+    view_ci.viewType = VK_IMAGE_VIEW_TYPE_3D;
+    view_ci.format = format;
+    view_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(device, &view_ci, nullptr, &img.view));
+    return img;
 }
 
-void destroy_compute_pipeline(VkDevice device, ComputePipeline& cp)
+SweImage create_shadow_image(VkDevice device, VmaAllocator allocator,
+                             uint32_t w, uint32_t h)
 {
-    vkDestroyPipeline(device, cp.pipeline, nullptr);
-    vkDestroyPipelineLayout(device, cp.layout, nullptr);
-    vkDestroyDescriptorSetLayout(device, cp.dsl, nullptr);
-    vkDestroyShaderModule(device, cp.shader, nullptr);
-    cp = {};
+    VkImageCreateInfo img_ci{};
+    img_ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    img_ci.imageType = VK_IMAGE_TYPE_2D;
+    img_ci.format = VK_FORMAT_R16_SFLOAT;
+    img_ci.extent = {w, h, 1};
+    img_ci.mipLevels = 1;
+    img_ci.arrayLayers = 1;
+    img_ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    img_ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    img_ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    img_ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VmaAllocationCreateInfo alloc_ci{};
+    alloc_ci.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_ci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    SweImage img{};
+    VK_CHECK(vmaCreateImage(allocator, &img_ci, &alloc_ci, &img.image, &img.allocation, nullptr));
+    VkImageViewCreateInfo view_ci{};
+    view_ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_ci.image = img.image;
+    view_ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_ci.format = VK_FORMAT_R16_SFLOAT;
+    view_ci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(device, &view_ci, nullptr, &img.view));
+    return img;
 }
 
 // ---------------------------------------------------------------------------
@@ -673,61 +457,137 @@ void destroy_clump_pipeline(VkDevice device, ClumpPipeline& p)
 }
 
 // ---------------------------------------------------------------------------
-// Static terrain mesh: GRID_W x GRID_H quads, vertices are integer grid coords.
+// Cloud raymarch pipeline (fullscreen, alpha-blended, no depth, no vertex input)
 // ---------------------------------------------------------------------------
-struct StaticGridMesh {
-    GpuBuffer vbo{};
-    GpuBuffer ibo{};
-    uint32_t  index_count = 0;
+struct CloudPipeline {
+    VkShaderModule        vs       = VK_NULL_HANDLE;
+    VkShaderModule        fs       = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl      = VK_NULL_HANDLE;
+    VkPipelineLayout      layout   = VK_NULL_HANDLE;
+    VkPipeline            pipeline = VK_NULL_HANDLE;
 };
 
-StaticGridMesh build_grid_mesh(VmaAllocator alloc)
+CloudPipeline create_cloud_pipeline(VkDevice device)
 {
-    const uint32_t W = GRID_W;
-    const uint32_t H = GRID_H;
-    const uint32_t verts_x = W + 1;
-    const uint32_t verts_y = H + 1;
+    CloudPipeline p{};
+    p.vs = make_shader(device, "shaders/cloud_raymarch_vs.spv");
+    p.fs = make_shader(device, "shaders/cloud_raymarch_fs.spv");
 
-    std::vector<float> verts;
-    verts.reserve(verts_x * verts_y * 2);
-    for (uint32_t y = 0; y <= H; ++y) {
-        for (uint32_t x = 0; x <= W; ++x) {
-            verts.push_back(static_cast<float>(x));
-            verts.push_back(static_cast<float>(y));
-        }
-    }
+    VkDescriptorSetLayoutBinding b[3]{};
+    b[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    b[1] = {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    b[2] = {5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
 
-    std::vector<uint32_t> idx;
-    idx.reserve(W * H * 6);
-    for (uint32_t y = 0; y < H; ++y) {
-        for (uint32_t x = 0; x < W; ++x) {
-            uint32_t i00 = y * verts_x + x;
-            uint32_t i10 = i00 + 1;
-            uint32_t i01 = i00 + verts_x;
-            uint32_t i11 = i01 + 1;
-            idx.push_back(i00); idx.push_back(i10); idx.push_back(i11);
-            idx.push_back(i00); idx.push_back(i11); idx.push_back(i01);
-        }
-    }
+    VkDescriptorSetLayoutCreateInfo dslci{};
+    dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslci.bindingCount = 3;
+    dslci.pBindings    = b;
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &dslci, nullptr, &p.dsl));
 
-    StaticGridMesh m{};
-    m.index_count = static_cast<uint32_t>(idx.size());
+    VkPushConstantRange push{};
+    push.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    push.size       = sizeof(RaymarchPC);
 
-    VkDeviceSize vbs = verts.size() * sizeof(float);
-    VkDeviceSize ibs = idx.size()   * sizeof(uint32_t);
-    m.vbo = create_host_buffer(alloc, vbs, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-    m.ibo = create_host_buffer(alloc, ibs, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount         = 1;
+    plci.pSetLayouts            = &p.dsl;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &push;
+    VK_CHECK(vkCreatePipelineLayout(device, &plci, nullptr, &p.layout));
 
-    void* mapped = nullptr;
-    VK_CHECK(vmaMapMemory(alloc, m.vbo.allocation, &mapped));
-    std::memcpy(mapped, verts.data(), vbs);
-    vmaUnmapMemory(alloc, m.vbo.allocation);
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = p.vs;
+    stages[0].pName  = "main";
+    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = p.fs;
+    stages[1].pName  = "main";
 
-    VK_CHECK(vmaMapMemory(alloc, m.ibo.allocation, &mapped));
-    std::memcpy(mapped, idx.data(), ibs);
-    vmaUnmapMemory(alloc, m.ibo.allocation);
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
 
-    return m;
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vpstate{};
+    vpstate.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vpstate.viewportCount = 1;
+    vpstate.scissorCount  = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode    = VK_CULL_MODE_NONE;
+    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth   = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable  = VK_FALSE;
+    ds.depthWriteEnable = VK_FALSE;
+
+    VkPipelineColorBlendAttachmentState ba{};
+    ba.blendEnable         = VK_TRUE;
+    ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    ba.colorBlendOp        = VK_BLEND_OP_ADD;
+    ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    ba.alphaBlendOp        = VK_BLEND_OP_ADD;
+    ba.colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                           | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments    = &ba;
+
+    VkDynamicState dyns[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = 2;
+    dyn.pDynamicStates    = dyns;
+
+    VkFormat color_fmt = VK_FORMAT_B8G8R8A8_UNORM;
+    VkPipelineRenderingCreateInfo rci{};
+    rci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    rci.colorAttachmentCount    = 1;
+    rci.pColorAttachmentFormats = &color_fmt;
+
+    VkGraphicsPipelineCreateInfo gp{};
+    gp.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.pNext               = &rci;
+    gp.stageCount          = 2;
+    gp.pStages             = stages;
+    gp.pVertexInputState   = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState      = &vpstate;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState   = &ms;
+    gp.pDepthStencilState  = &ds;
+    gp.pColorBlendState    = &cb;
+    gp.pDynamicState       = &dyn;
+    gp.layout              = p.layout;
+    VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gp, nullptr, &p.pipeline));
+    return p;
+}
+
+void destroy_cloud_pipeline(VkDevice device, CloudPipeline& p)
+{
+    vkDestroyPipeline(device, p.pipeline, nullptr);
+    vkDestroyPipelineLayout(device, p.layout, nullptr);
+    vkDestroyDescriptorSetLayout(device, p.dsl, nullptr);
+    vkDestroyShaderModule(device, p.fs, nullptr);
+    vkDestroyShaderModule(device, p.vs, nullptr);
+    p = {};
 }
 
 // ---------------------------------------------------------------------------
@@ -767,174 +627,6 @@ void upload_plant_mesh(VmaAllocator alloc, PlantMesh& dst, const bestiary::Veget
     VK_CHECK(vmaMapMemory(alloc, dst.ibo.allocation, &mapped));
     std::memcpy(mapped, src.indices.data(), ibs);
     vmaUnmapMemory(alloc, dst.ibo.allocation);
-}
-
-// ---------------------------------------------------------------------------
-// Heightmap CPU mirror — kept in sync with GPU brush dispatches.
-// We replay the same falloff as terrain_brush.hlsl so we don't need readback.
-// ---------------------------------------------------------------------------
-void cpu_apply_brush(std::vector<float>& hm,
-                     float bx, float by, float radius, float amount)
-{
-    int cx = static_cast<int>(bx);
-    int cy = static_cast<int>(by);
-    int half = static_cast<int>(std::ceil(radius * 3.0f));
-    int x0 = std::max(0, cx - half);
-    int x1 = std::min(static_cast<int>(GRID_W) - 1, cx + half);
-    int y0 = std::max(0, cy - half);
-    int y1 = std::min(static_cast<int>(GRID_H) - 1, cy + half);
-    float r2 = radius * radius;
-    for (int y = y0; y <= y1; ++y) {
-        for (int x = x0; x <= x1; ++x) {
-            float dx_ = static_cast<float>(x) - bx;
-            float dy_ = static_cast<float>(y) - by;
-            float d2 = dx_ * dx_ + dy_ * dy_;
-            float falloff = std::exp(-d2 / r2);
-            if (falloff < 0.001f) continue;
-            hm[y * GRID_W + x] += amount * falloff;
-        }
-    }
-}
-
-float sample_hm_bilinear(const std::vector<float>& hm, float wx, float wz)
-{
-    float gx = (wx + TILE_HALF_X) / DX - 0.5f;
-    float gy = (wz + TILE_HALF_Z) / DX - 0.5f;
-    int x0 = std::clamp(static_cast<int>(std::floor(gx)), 0, static_cast<int>(GRID_W) - 1);
-    int y0 = std::clamp(static_cast<int>(std::floor(gy)), 0, static_cast<int>(GRID_H) - 1);
-    int x1 = std::min(x0 + 1, static_cast<int>(GRID_W) - 1);
-    int y1 = std::min(y0 + 1, static_cast<int>(GRID_H) - 1);
-    float fx = gx - x0;
-    float fy = gy - y0;
-    float h00 = hm[y0 * GRID_W + x0];
-    float h10 = hm[y0 * GRID_W + x1];
-    float h01 = hm[y1 * GRID_W + x0];
-    float h11 = hm[y1 * GRID_W + x1];
-    return (1 - fx) * (1 - fy) * h00 + fx * (1 - fy) * h10
-         + (1 - fx) * fy       * h01 + fx * fy       * h11;
-}
-
-// ---------------------------------------------------------------------------
-// Half-float (RGBA16F) decoder — water_state stores .r as half float
-// ---------------------------------------------------------------------------
-float half_to_float(uint16_t h)
-{
-    uint32_t s = (h & 0x8000u) << 16;
-    uint32_t e = (h & 0x7C00u) >> 10;
-    uint32_t m =  h & 0x03FFu;
-    uint32_t f;
-    if (e == 0) {
-        if (m == 0) {
-            f = s;
-        } else {
-            // subnormal -> normalize
-            while ((m & 0x0400u) == 0) { m <<= 1; --e; }
-            ++e; m &= 0x03FFu;
-            f = s | ((e + (127 - 15)) << 23) | (m << 13);
-        }
-    } else if (e == 31) {
-        f = s | 0x7F800000u | (m << 13);
-    } else {
-        f = s | ((e + (127 - 15)) << 23) | (m << 13);
-    }
-    float out;
-    std::memcpy(&out, &f, sizeof(out));
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// Build moisture field from water depth grid (and a small capillary blur).
-// ---------------------------------------------------------------------------
-std::vector<float> build_moisture_grid(const std::vector<float>& water_depth,
-                                       float capillary_depth,
-                                       int   capillary_blur_radius)
-{
-    std::vector<float> raw(GRID_W * GRID_H, 0.0f);
-    for (size_t i = 0; i < raw.size(); ++i) {
-        // Where there's standing water -> saturate moisture quickly.
-        float d = std::max(0.0f, water_depth[i]);
-        raw[i] = std::clamp(d / capillary_depth, 0.0f, 1.0f);
-    }
-
-    if (capillary_blur_radius <= 0) return raw;
-
-    // Box blur to spread moisture into adjacent dry cells (capillary effect).
-    std::vector<float> tmp(GRID_W * GRID_H, 0.0f);
-    int r = capillary_blur_radius;
-    auto idx = [](int x, int y) {
-        return y * static_cast<int>(GRID_W) + x;
-    };
-    for (int y = 0; y < (int)GRID_H; ++y) {
-        for (int x = 0; x < (int)GRID_W; ++x) {
-            float sum = 0.0f;
-            int count = 0;
-            for (int dy = -r; dy <= r; ++dy) {
-                int yy = std::clamp(y + dy, 0, (int)GRID_H - 1);
-                for (int dx = -r; dx <= r; ++dx) {
-                    int xx = std::clamp(x + dx, 0, (int)GRID_W - 1);
-                    sum += raw[idx(xx, yy)];
-                    ++count;
-                }
-            }
-            tmp[idx(x, y)] = sum / count;
-        }
-    }
-    // Take the max of raw and blurred — water cells stay saturated, dry-but-near
-    // cells gain moisture from neighbors.
-    for (size_t i = 0; i < tmp.size(); ++i)
-        tmp[i] = std::max(raw[i], tmp[i]);
-    return tmp;
-}
-
-// ---------------------------------------------------------------------------
-// Read water depth (state_a layer 0, channel R) back to CPU float array.
-// state image is RGBA16F; we only care about .r.
-// ---------------------------------------------------------------------------
-std::vector<float> readback_water_depth(VkDevice device, VmaAllocator alloc,
-                                        VkQueue queue, uint32_t family,
-                                        VkImage state_img)
-{
-    constexpr VkDeviceSize bytes = VkDeviceSize{GRID_W} * GRID_H * 8; // RGBA16F = 8 bytes/pixel
-    GpuBuffer staging = create_readback_buffer(alloc, bytes);
-
-    OneShot s = oneshot_begin(device, queue, family);
-
-    image_barrier(s.cmd, state_img,
-                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                  VK_PIPELINE_STAGE_2_COPY_BIT,
-                  VK_ACCESS_2_TRANSFER_READ_BIT,
-                  VK_IMAGE_LAYOUT_GENERAL,
-                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-
-    VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copy.imageExtent      = {GRID_W, GRID_H, 1};
-    vkCmdCopyImageToBuffer(s.cmd, state_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           staging.buffer, 1, &copy);
-
-    image_barrier(s.cmd, state_img,
-                  VK_PIPELINE_STAGE_2_COPY_BIT,
-                  VK_ACCESS_2_TRANSFER_READ_BIT,
-                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                  VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-                    | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                  VK_IMAGE_LAYOUT_GENERAL);
-
-    oneshot_end(s);
-
-    VmaAllocationInfo ai{};
-    vmaGetAllocationInfo(alloc, staging.allocation, &ai);
-    auto* hp = static_cast<const uint16_t*>(ai.pMappedData);
-
-    std::vector<float> depth(GRID_W * GRID_H, 0.0f);
-    for (size_t i = 0; i < depth.size(); ++i) {
-        depth[i] = half_to_float(hp[i * 4 + 0]); // .r channel
-    }
-
-    destroy_buffer(alloc, staging);
-    return depth;
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,20 +718,46 @@ int main()
     VkQueue gqueue    = renderer.graphics_queue;
     uint32_t gfamily  = renderer.gfx_family;
 
-    // ---- Heightmap (initial: a gentle bowl) -------------------------------
+    // ---- Heightmap (watershed: ridges, valley, watering hole) --------------
     HeightmapData hm_data{};
     hm_data.width = GRID_W; hm_data.height = GRID_H;
     hm_data.values.assign(GRID_W * GRID_H, 0.0f);
+    // Spring location (grid coords) — on a hillside, feeds water downhill
+    constexpr float SPRING_GX = 70.0f;
+    constexpr float SPRING_GY = 80.0f;
+    constexpr float SPRING_RATE = 0.15f;
+    // Watering hole center (grid coords)
+    constexpr float POOL_GX = 140.0f;
+    constexpr float POOL_GY = 150.0f;
     {
         float cx = GRID_W * 0.5f, cy = GRID_H * 0.5f;
         for (uint32_t y = 0; y < GRID_H; ++y) {
             for (uint32_t x = 0; x < GRID_W; ++x) {
-                float dx_ = static_cast<float>(x) - cx;
-                float dy_ = static_cast<float>(y) - cy;
-                float r  = std::sqrt(dx_ * dx_ + dy_ * dy_);
-                // Bowl: deep center, rising rim. ~20m total relief so the
-                // shape reads at the default 220m camera distance.
-                float h = -8.0f + 0.0008f * r * r;
+                float fx = static_cast<float>(x);
+                float fy = static_cast<float>(y);
+                float dx_ = fx - cx;
+                float dy_ = fy - cy;
+                float r = std::sqrt(dx_ * dx_ + dy_ * dy_);
+
+                // base: rim rises at edges (bowl)
+                float h = -4.0f + 0.0005f * r * r;
+
+                // ridge running NW-SE — creates two drainage basins
+                float ridge_dist = std::abs((fx - cx) * 0.7f + (fy - cy) * 0.7f);
+                h += 3.0f * std::exp(-ridge_dist * ridge_dist / 1800.0f);
+
+                // hillside near spring (raised area NW)
+                float sp_dx = fx - SPRING_GX;
+                float sp_dy = fy - SPRING_GY;
+                float sp_r = std::sqrt(sp_dx * sp_dx + sp_dy * sp_dy);
+                h += 6.0f * std::exp(-sp_r * sp_r / 2000.0f);
+
+                // depression at watering hole (SE area)
+                float pool_dx = fx - POOL_GX;
+                float pool_dy = fy - POOL_GY;
+                float pool_r = std::sqrt(pool_dx * pool_dx + pool_dy * pool_dy);
+                h -= 3.0f * std::exp(-pool_r * pool_r / 800.0f);
+
                 hm_data.values[y * GRID_W + x] = h;
             }
         }
@@ -1083,6 +801,77 @@ int main()
         oneshot_end(s);
     }
 
+    // ---- Atmosphere 3D images -----------------------------------------------
+    SweImage atmo_state[2] = {
+        create_volume_image(device, alloc, ATMO_W, ATMO_H, ATMO_D, VK_FORMAT_R16G16B16A16_SFLOAT),
+        create_volume_image(device, alloc, ATMO_W, ATMO_H, ATMO_D, VK_FORMAT_R16G16B16A16_SFLOAT),
+    };
+    SweImage wind_field[2] = {
+        create_volume_image_readback(device, alloc, ATMO_W, ATMO_H, ATMO_D, VK_FORMAT_R16G16B16A16_SFLOAT),
+        create_volume_image_readback(device, alloc, ATMO_W, ATMO_H, ATMO_D, VK_FORMAT_R16G16B16A16_SFLOAT),
+    };
+    SweImage atmo_shadow = create_shadow_image(device, alloc, ATMO_W, ATMO_H);
+    SweImage ground_cond = create_swe_image(device, alloc, ATMO_W, ATMO_H);
+    SweImage ground_wind = create_wind_image(device, alloc, ATMO_W, ATMO_H);
+
+    {
+        OneShot s = oneshot_begin(device, gqueue, gfamily);
+        VkImage atmo_imgs[] = {
+            atmo_state[0].image, atmo_state[1].image,
+            wind_field[0].image, wind_field[1].image,
+            atmo_shadow.image,
+            ground_cond.image, ground_wind.image
+        };
+        for (VkImage img : atmo_imgs) {
+            volume_barrier(s.cmd, img,
+                           VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                             | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                           VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        }
+        oneshot_end(s);
+    }
+
+    // ---- Sediment images for erosion ----------------------------------------
+    SweImage sediment[2] = {
+        create_sediment_image(device, alloc, GRID_W, GRID_H),
+        create_sediment_image(device, alloc, GRID_W, GRID_H),
+    };
+    {
+        OneShot s = oneshot_begin(device, gqueue, gfamily);
+        for (int i = 0; i < 2; ++i) {
+            image_barrier(s.cmd, sediment[i].image,
+                          VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
+                          VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        }
+        VkClearColorValue sed_clr{}; sed_clr.float32[0] = 0.0f;
+        VkImageSubresourceRange sed_rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        for (int i = 0; i < 2; ++i) {
+            vkCmdClearColorImage(s.cmd, sediment[i].image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &sed_clr, 1, &sed_rng);
+            image_barrier(s.cmd, sediment[i].image,
+                          VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                            | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+        }
+        oneshot_end(s);
+    }
+
+    // ---- Wind/ground condition readback staging buffers ---------------------
+    constexpr VkDeviceSize WIND_READBACK_SIZE = VkDeviceSize{ATMO_W} * ATMO_H * 4 * sizeof(uint16_t);
+    constexpr VkDeviceSize GCOND_READBACK_SIZE = VkDeviceSize{ATMO_W} * ATMO_H * 4 * sizeof(uint16_t);
+    constexpr uint32_t FRAMES_IN_FLIGHT = 2;
+    GpuBuffer wind_readback[FRAMES_IN_FLIGHT];
+    GpuBuffer gcond_readback[FRAMES_IN_FLIGHT];
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        wind_readback[i] = create_readback_buffer(alloc, WIND_READBACK_SIZE);
+        gcond_readback[i] = create_readback_buffer(alloc, GCOND_READBACK_SIZE);
+    }
+
     // ---- Sampler (for graphics) ------------------------------------------
     VkSampler sampler = VK_NULL_HANDLE;
     {
@@ -1103,26 +892,51 @@ int main()
         sizeof(SweInitPC));
 
     ComputePipeline pipe_swe_step = make_compute_pipeline(device, "shaders/swe_step.spv",
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,           // 0: terrain
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,            // 1: state_read
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 2: state_write
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 3: output
+         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},  // 4: ground_cond
         sizeof(SweStepPC));
 
     ComputePipeline pipe_brush = make_compute_pipeline(device, "shaders/terrain_brush.spv",
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
         sizeof(TerrainBrushPC));
 
+    ComputePipeline pipe_atmo = make_compute_pipeline(device, "shaders/atmosphere3d_cs.spv",
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,  // 0: terrain heightmap
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,            // 1: state_read
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 2: state_write
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,            // 3: wind_read
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 4: wind_write
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 5: shadow_out
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 6: ground_cond_out
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 7: ground_wind_out
+         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},  // 8: swe_output
+        sizeof(Atmo3DPC));
+
+    ComputePipeline pipe_erosion = make_compute_pipeline(device, "shaders/erosion.spv",
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 0: terrain (heightmap RW)
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,            // 1: swe_state
+         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,            // 2: sediment_in
+         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,            // 3: sediment_out
+         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,   // 4: ground_cond
+         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},  // 5: ground_wind
+        sizeof(ErosionPC));
+
     // ---- Descriptor pool --------------------------------------------------
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     {
         VkDescriptorPoolSize pool_sizes[] = {
-            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,        16},
-            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,         8},
-            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8},
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,         32},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,         32},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          4},
         };
         VkDescriptorPoolCreateInfo pci{};
         pci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        pci.maxSets       = 16;
-        pci.poolSizeCount = 3;
+        pci.maxSets       = 32;
+        pci.poolSizeCount = 4;
         pci.pPoolSizes    = pool_sizes;
         VK_CHECK(vkCreateDescriptorPool(device, &pci, nullptr, &desc_pool));
     }
@@ -1169,14 +983,54 @@ int main()
     write_image(ds_swe_step[0], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, state_a.view, VK_NULL_HANDLE);
     write_image(ds_swe_step[0], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, state_b.view, VK_NULL_HANDLE);
     write_image(ds_swe_step[0], 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, water_out.view, VK_NULL_HANDLE);
+    write_image(ds_swe_step[0], 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ground_cond.view, sampler);
 
     // step set 1: read B -> write A
     write_image(ds_swe_step[1], 0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, hm_gpu.view,  VK_NULL_HANDLE);
     write_image(ds_swe_step[1], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, state_b.view, VK_NULL_HANDLE);
     write_image(ds_swe_step[1], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, state_a.view, VK_NULL_HANDLE);
     write_image(ds_swe_step[1], 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, water_out.view, VK_NULL_HANDLE);
+    write_image(ds_swe_step[1], 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ground_cond.view, sampler);
 
     write_image(ds_brush, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, hm_gpu.view, VK_NULL_HANDLE);
+
+    // ---- Atmosphere descriptor sets (ping-ponged) -----------------------
+    VkDescriptorSet ds_atmo[2] = { alloc_set(pipe_atmo.dsl), alloc_set(pipe_atmo.dsl) };
+    write_image(ds_atmo[0], 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, hm_gpu.view,         sampler);
+    write_image(ds_atmo[0], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          atmo_state[0].view,   VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          atmo_state[1].view,   VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          wind_field[0].view,   VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          wind_field[1].view,   VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          atmo_shadow.view,     VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          ground_cond.view,     VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          ground_wind.view,     VK_NULL_HANDLE);
+    write_image(ds_atmo[0], 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, water_out.view,       sampler);
+
+    write_image(ds_atmo[1], 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, hm_gpu.view,         sampler);
+    write_image(ds_atmo[1], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          atmo_state[1].view,   VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          atmo_state[0].view,   VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          wind_field[1].view,   VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          wind_field[0].view,   VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          atmo_shadow.view,     VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          ground_cond.view,     VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          ground_wind.view,     VK_NULL_HANDLE);
+    write_image(ds_atmo[1], 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, water_out.view,       sampler);
+
+    // ---- Erosion descriptor sets (ping-ponged on sediment) --------------
+    VkDescriptorSet ds_erosion[2] = { alloc_set(pipe_erosion.dsl), alloc_set(pipe_erosion.dsl) };
+    write_image(ds_erosion[0], 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  hm_gpu.view,       VK_NULL_HANDLE);
+    write_image(ds_erosion[0], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  state_a.view,      VK_NULL_HANDLE);
+    write_image(ds_erosion[0], 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  sediment[0].view,  VK_NULL_HANDLE);
+    write_image(ds_erosion[0], 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  sediment[1].view,  VK_NULL_HANDLE);
+    write_image(ds_erosion[0], 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ground_cond.view, sampler);
+    write_image(ds_erosion[0], 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ground_wind.view, sampler);
+
+    write_image(ds_erosion[1], 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  hm_gpu.view,       VK_NULL_HANDLE);
+    write_image(ds_erosion[1], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  state_b.view,      VK_NULL_HANDLE);
+    write_image(ds_erosion[1], 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,  sediment[1].view,  VK_NULL_HANDLE);
+    write_image(ds_erosion[1], 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  sediment[0].view,  VK_NULL_HANDLE);
+    write_image(ds_erosion[1], 4, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ground_cond.view, sampler);
+    write_image(ds_erosion[1], 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, ground_wind.view, sampler);
 
     // ---- Graphics pipelines ---------------------------------------------
     TerrainPipeline pipe_terrain = create_terrain_pipeline(device);
@@ -1187,7 +1041,47 @@ int main()
     write_image(ds_terrain, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, water_out.view, sampler);
     write_image(ds_terrain, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, moist_gpu.view, sampler);
 
-    StaticGridMesh terrain_mesh = build_grid_mesh(alloc);
+    // ---- Cloud pipeline + camera UBO ----------------------------------------
+    CloudPipeline pipe_cloud = create_cloud_pipeline(device);
+
+    VkBuffer camera_ubo = VK_NULL_HANDLE;
+    VmaAllocation camera_ubo_alloc = VK_NULL_HANDLE;
+    VmaAllocationInfo camera_ubo_info{};
+    {
+        VkBufferCreateInfo bci{};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size  = sizeof(CameraUBO);
+        bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        VmaAllocationCreateInfo ai{};
+        ai.usage = VMA_MEMORY_USAGE_AUTO;
+        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+                 | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VK_CHECK(vmaCreateBuffer(alloc, &bci, &ai,
+            &camera_ubo, &camera_ubo_alloc, &camera_ubo_info));
+    }
+
+    VkDescriptorSet ds_cloud[2] = {alloc_set(pipe_cloud.dsl), alloc_set(pipe_cloud.dsl)};
+    for (int cs = 0; cs < 2; ++cs) {
+        VkDescriptorBufferInfo buf_info{};
+        buf_info.buffer = camera_ubo;
+        buf_info.offset = 0;
+        buf_info.range  = sizeof(CameraUBO);
+        VkWriteDescriptorSet w{};
+        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet          = ds_cloud[cs];
+        w.dstBinding      = 0;
+        w.descriptorCount = 1;
+        w.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w.pBufferInfo     = &buf_info;
+        vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
+
+        write_image(ds_cloud[cs], 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    hm_gpu.view, sampler);
+        write_image(ds_cloud[cs], 5, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    atmo_state[cs].view, sampler);
+    }
+
+    StaticGridMesh terrain_mesh = build_grid_mesh(alloc, GRID_W, GRID_H);
 
     // ---- Run swe_init once -----------------------------------------------
     {
@@ -1246,6 +1140,44 @@ int main()
     bool  ui_show_moisture      = false;
     int   replant_pending       = 0;     // counts down frames after stroke release
 
+    // Atmosphere params
+    bool  ui_atmo_enabled        = false;
+    float ui_cloud_opacity       = 1.0f;
+    float ui_orographic_lift     = 0.15f;
+    float ui_adiabatic_cooling   = 0.0065f;
+    float ui_rain_shadow         = 0.3f;
+    float ui_k_pressure          = 1.0f;
+    float ui_wind_strength       = 1.0f;
+    float ui_k_evaporation       = 0.3f;
+    float ui_cloud_base          = -10.0f;
+    float ui_layer_height        = 10.0f;
+    bool  ui_atmo_reset          = false;
+
+    // Erosion params
+    bool  ui_erosion_enabled     = false;
+    float ui_k_erosion           = 0.01f;
+    float ui_k_deposit           = 0.02f;
+    float ui_k_capacity          = 0.5f;
+    float ui_min_slope           = 0.001f;
+    float ui_k_wind              = 0.05f;
+    float ui_k_thermal           = 0.02f;
+    float ui_wind_threshold      = 1.0f;
+
+    // Water physics (newly exposed)
+    float ui_k_rain              = 0.0f;
+
+    // Ping-pong state
+    int   atmo_ping_pong  = 0;
+    int   ero_ping_pong   = 0;
+    bool  atmo_force_init = true;
+
+    // Debug readback
+    float debug_pressure_min = 0, debug_pressure_mean = 0, debug_pressure_max = 0;
+    float debug_wind_speed_max = 0;
+    float debug_precip_max = 0, debug_precip_mean = 0;
+    float debug_temp_mean = 0, debug_humidity_mean = 0;
+    float debug_gc_wind_mean = 0, debug_gc_wind_max = 0;
+
     bool brushing      = false;          // any modifier currently editing terrain
     bool brushed_this_stroke = false;
     bool prev_lmb      = false;
@@ -1254,18 +1186,156 @@ int main()
     int   swe_ping_pong = 0;
     int   wt_water_pulse_active = 0;
 
-    // Initial plant placement (no water -> all dry)
-    auto run_replant = [&](){
-        // Freshest state slot: each step swaps; after N steps from slot A,
-        // ping_pong & 1 == 0 means A is current.
+    // ---- Creature state -----------------------------------------------------
+    std::vector<bestiary::Agent> agents;
+    std::vector<bestiary::HerbivoreProfile> creature_profiles;
+    {
+        // Species 0: Sprinter — small, fast, eats grass, short-lived
+        bestiary::HerbivoreProfile sprinter{};
+        sprinter.body_length = 0.6f;
+        sprinter.body_height = 0.45f;
+        sprinter.body_color[0] = 0.72f; sprinter.body_color[1] = 0.58f; sprinter.body_color[2] = 0.38f;
+        sprinter.move_speed = 2.8f;
+        sprinter.run_speed  = 8.0f;
+        sprinter.turn_rate  = 4.5f;
+        sprinter.body_mass = 12.0f;
+        sprinter.basal_rate = 0.012f;
+        sprinter.locomotion_cost = 0.002f;
+        sprinter.graze_consume = 0.08f;
+        sprinter.graze_duration = 2.0f;
+        sprinter.graze_radius = 2.5f;
+        sprinter.trophic_efficiency = 0.12f;
+        sprinter.grass_caloric_value = 0.8f;
+        sprinter.bush_caloric_value  = 0.5f;
+        sprinter.tree_caloric_value  = 0.1f;
+        sprinter.herd_weight = 0.5f;
+        sprinter.separation_weight = 0.6f;
+        sprinter.separation_radius = 1.5f;
+        sprinter.reproduce_threshold = 0.65f;
+        sprinter.reproduce_cost = 0.20f;
+        sprinter.reproduce_cooldown = 20.0f;
+        sprinter.offspring_energy = 0.35f;
+        sprinter.water_avoidance = 10.0f;
+        sprinter.max_slope = 0.9f;
+        sprinter.slope_cost_factor = 1.5f;
+        sprinter.max_age = 180.0f;
+        creature_profiles.push_back(sprinter);
+
+        // Species 1: Grazer — medium, balanced, the original profile
+        bestiary::HerbivoreProfile grazer{};
+        grazer.body_length = 1.0f;
+        grazer.body_height = 0.7f;
+        grazer.body_color[0] = 0.55f; grazer.body_color[1] = 0.40f; grazer.body_color[2] = 0.25f;
+        grazer.move_speed = 1.8f;
+        grazer.run_speed  = 6.0f;
+        grazer.body_mass = 30.0f;
+        grazer.basal_rate = 0.008f;
+        grazer.locomotion_cost = 0.003f;
+        grazer.graze_consume = 0.12f;
+        grazer.graze_duration = 4.0f;
+        grazer.graze_radius = 3.0f;
+        grazer.trophic_efficiency = 0.10f;
+        grazer.herd_weight = 0.4f;
+        grazer.separation_weight = 0.5f;
+        grazer.reproduce_threshold = 0.75f;
+        grazer.reproduce_cost = 0.25f;
+        grazer.reproduce_cooldown = 30.0f;
+        grazer.offspring_energy = 0.40f;
+        grazer.water_avoidance = 8.0f;
+        grazer.max_slope = 0.7f;
+        grazer.slope_cost_factor = 2.0f;
+        grazer.max_age = 300.0f;
+        creature_profiles.push_back(grazer);
+
+        // Species 2: Browser — large, slow, prefers bushes, long-lived
+        bestiary::HerbivoreProfile browser{};
+        browser.body_length = 1.6f;
+        browser.body_height = 1.1f;
+        browser.body_color[0] = 0.38f; browser.body_color[1] = 0.32f; browser.body_color[2] = 0.22f;
+        browser.move_speed = 1.2f;
+        browser.run_speed  = 4.0f;
+        browser.turn_rate  = 2.0f;
+        browser.body_mass = 80.0f;
+        browser.basal_rate = 0.006f;
+        browser.locomotion_cost = 0.004f;
+        browser.graze_consume = 0.18f;
+        browser.graze_duration = 6.0f;
+        browser.graze_radius = 4.0f;
+        browser.trophic_efficiency = 0.08f;
+        browser.grass_caloric_value = 0.3f;
+        browser.bush_caloric_value  = 1.2f;
+        browser.tree_caloric_value  = 0.8f;
+        browser.herd_weight = 0.2f;
+        browser.separation_weight = 0.4f;
+        browser.separation_radius = 3.0f;
+        browser.herd_radius = 25.0f;
+        browser.reproduce_threshold = 0.80f;
+        browser.reproduce_cost = 0.30f;
+        browser.reproduce_cooldown = 45.0f;
+        browser.offspring_energy = 0.45f;
+        browser.water_avoidance = 6.0f;
+        browser.max_slope = 0.5f;
+        browser.slope_cost_factor = 3.0f;
+        browser.max_age = 450.0f;
+        creature_profiles.push_back(browser);
+    }
+
+    PlantMesh creature_mesh_gpu{};
+    std::vector<float> persistent_water_depth(GRID_W * GRID_H, 0.0f);
+    bestiary::EnvironmentField persistent_env;
+    bool  ui_creatures_enabled = true;
+    int   ui_creature_count    = 20;
+    float ui_creature_speed    = 1.0f;
+    float veg_rebuild_timer    = 0.0f;
+    constexpr float VEG_REBUILD_INTERVAL = 2.0f;
+    uint32_t creature_tick = 0;
+
+    // ---- Plant population (persistent individuals) -------------------------
+    std::vector<bestiary::PlantInstance> plant_population;
+    float plant_growth_rate = 0.08f;
+    float plant_decay_rate  = 0.04f;
+    uint32_t sprout_seed    = 100;
+
+    // ---- Autorun state ------------------------------------------------------
+    bool  ui_autorun          = true;
+    bool  ui_spring_enabled   = true;
+    float ui_spring_rate      = SPRING_RATE;
+    float auto_replant_timer  = 0.0f;
+    constexpr float AUTO_REPLANT_INTERVAL = 8.0f;
+    bool  initial_spawn_done  = false;
+
+    // Rebuild plant mesh from persistent population
+    auto rebuild_plant_mesh = [&](){
+        bestiary::VegetationMesh m = bestiary::generate_mesh_from_population(
+            plant_population, persistent_env,
+            clump_params, clump_expr,
+            bush_params, bush_expr,
+            tree_params, tree_expr,
+            eco_params.phenotype_variance);
+
+        constexpr float plant_lift = 0.01f;
+        for (auto& v : m.vertices) {
+            float y = sample_hm_bilinear(hm_cpu, GRID_W, GRID_H,
+                                         world_to_gx(v.position[0]),
+                                         world_to_gy(v.position[2]));
+            v.position[1] += y + plant_lift;
+        }
+
+        vkDeviceWaitIdle(device);
+        destroy_plant_mesh(alloc, plants);
+        upload_plant_mesh(alloc, plants, m);
+    };
+
+    // Refresh environment from current water state
+    auto refresh_env = [&](){
         VkImage fresh = (swe_ping_pong & 1) ? state_b.image : state_a.image;
-        std::vector<float> water_depth = readback_water_depth(
-            device, alloc, gqueue, gfamily, fresh);
+        persistent_water_depth = readback_water_depth(
+            device, alloc, gqueue, gfamily, fresh, GRID_W, GRID_H);
 
         std::vector<float> moisture = build_moisture_grid(
-            water_depth, ui_capillary_depth, ui_capillary_blur);
+            persistent_water_depth, GRID_W, GRID_H,
+            ui_capillary_depth, ui_capillary_blur);
 
-        // Push the new moisture grid to GPU for the debug overlay.
         update_r32_image(device, alloc, gqueue, gfamily,
                          moist_gpu.image, moisture, GRID_W, GRID_H);
 
@@ -1276,31 +1346,19 @@ int main()
             int ix = std::clamp((int)std::floor(gx), 0, (int)GRID_W - 1);
             int iy = std::clamp((int)std::floor(gy), 0, (int)GRID_H - 1);
             float m = moisture[iy * GRID_W + ix];
-            // Temperature: subtly cooler at low elevations (proxy field), so
-            // the suitability function has something other than moisture to lean on.
             float h = hm_cpu[iy * GRID_W + ix];
             float t = std::clamp(0.5f + 0.05f * h, 0.0f, 1.0f);
             return {m, t};
         };
+        persistent_env = env;
+    };
 
-        bestiary::VegetationMesh m = bestiary::generate_ecosystem(
-            eco_params, env,
-            clump_params, clump_expr,
-            bush_params, bush_expr,
-            tree_params, tree_expr,
-            /*include_ground=*/false);
-
-        // Displace plant vertices' y by terrain height at their (x,z).
-        // Add a small bias so blade bases don't z-fight with the ground mesh.
-        constexpr float plant_lift = 0.01f;
-        for (auto& v : m.vertices) {
-            float y = sample_hm_bilinear(hm_cpu, v.position[0], v.position[2]);
-            v.position[1] += y + plant_lift;
-        }
-
-        vkDeviceWaitIdle(device);
-        destroy_plant_mesh(alloc, plants);
-        upload_plant_mesh(alloc, plants, m);
+    // Full replant: re-seed plant population from scratch
+    auto run_replant = [&](){
+        refresh_env();
+        plant_population = bestiary::place_ecosystem(eco_params, persistent_env);
+        rebuild_plant_mesh();
+        veg_rebuild_timer = 0.0f;
     };
 
     run_replant();
@@ -1315,7 +1373,57 @@ int main()
         last_time = now;
         accumulated_time += dt;
 
+        // ---- Debug readback from previous frame --------------------------
+        if (ui_atmo_enabled) {
+            uint32_t prev_frame = (renderer.current_frame + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
+            VmaAllocationInfo rb_info{};
+            vmaGetAllocationInfo(alloc, wind_readback[prev_frame].allocation, &rb_info);
+            if (rb_info.pMappedData) {
+                const uint16_t* hp = static_cast<const uint16_t*>(rb_info.pMappedData);
+                float p_min = 1e30f, p_max = -1e30f, p_sum = 0.0f, ws_max = 0.0f;
+                uint32_t count = ATMO_W * ATMO_H;
+                for (uint32_t i = 0; i < count; ++i) {
+                    float vx = half_to_float(hp[i * 4 + 0]);
+                    float vy = half_to_float(hp[i * 4 + 1]);
+                    float pressure = half_to_float(hp[i * 4 + 3]);
+                    float speed = std::sqrt(vx * vx + vy * vy);
+                    if (pressure < p_min) p_min = pressure;
+                    if (pressure > p_max) p_max = pressure;
+                    p_sum += pressure;
+                    if (speed > ws_max) ws_max = speed;
+                }
+                debug_pressure_min  = p_min;
+                debug_pressure_max  = p_max;
+                debug_pressure_mean = p_sum / static_cast<float>(count);
+                debug_wind_speed_max = ws_max;
+            }
+            VmaAllocationInfo gc_info{};
+            vmaGetAllocationInfo(alloc, gcond_readback[prev_frame].allocation, &gc_info);
+            if (gc_info.pMappedData) {
+                const uint16_t* gp = static_cast<const uint16_t*>(gc_info.pMappedData);
+                float pr_max = 0, pr_sum = 0, t_sum = 0, h_sum = 0, gw_max = 0, gw_sum = 0;
+                uint32_t count = ATMO_W * ATMO_H;
+                for (uint32_t i = 0; i < count; ++i) {
+                    float precip   = half_to_float(gp[i * 4 + 0]);
+                    float temp_k   = half_to_float(gp[i * 4 + 1]);
+                    float humidity = half_to_float(gp[i * 4 + 2]);
+                    float gc_wind  = half_to_float(gp[i * 4 + 3]);
+                    pr_sum += precip; if (precip > pr_max) pr_max = precip;
+                    t_sum += temp_k; h_sum += humidity;
+                    gw_sum += gc_wind; if (gc_wind > gw_max) gw_max = gc_wind;
+                }
+                debug_precip_max    = pr_max;
+                debug_precip_mean   = pr_sum / static_cast<float>(count);
+                debug_temp_mean     = t_sum / static_cast<float>(count);
+                debug_humidity_mean = h_sum / static_cast<float>(count);
+                debug_gc_wind_mean  = gw_sum / static_cast<float>(count);
+                debug_gc_wind_max   = gw_max;
+            }
+        }
+
         glfwPollEvents();
+        if (glfwGetKey(renderer.window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+            glfwSetWindowShouldClose(renderer.window, GLFW_TRUE);
         update_orbit(camera, renderer.window);
 
         // Cursor pick
@@ -1376,12 +1484,165 @@ int main()
         ImGui::SliderFloat("r_min",      &eco_params.r_min, 0.5f, 4.0f, "%.2f m");
         ImGui::SliderFloat("r_max",      &eco_params.r_max, 1.0f, 10.0f, "%.2f m");
         if (ImGui::Button("Replant now")) replant_pending = 1;
+        ImGui::SameLine();
+        if (ImGui::Button("Reset terrain")) {
+            float cx = float(GRID_W) * 0.5f;
+            float cy = float(GRID_H) * 0.5f;
+            for (uint32_t y = 0; y < GRID_H; ++y) {
+                for (uint32_t x = 0; x < GRID_W; ++x) {
+                    float fx = float(x), fy = float(y);
+                    float dx_ = fx - cx, dy_ = fy - cy;
+                    float r = std::sqrt(dx_ * dx_ + dy_ * dy_);
+                    float h = -4.0f + 0.0005f * r * r;
+                    float ridge_dist = std::abs((fx - cx) * 0.7f + (fy - cy) * 0.7f);
+                    h += 3.0f * std::exp(-ridge_dist * ridge_dist / 1800.0f);
+                    float sp_dx = fx - SPRING_GX, sp_dy = fy - SPRING_GY;
+                    h += 6.0f * std::exp(-(sp_dx * sp_dx + sp_dy * sp_dy) / 2000.0f);
+                    float pool_dx = fx - POOL_GX, pool_dy = fy - POOL_GY;
+                    h -= 3.0f * std::exp(-(pool_dx * pool_dx + pool_dy * pool_dy) / 800.0f);
+                    hm_cpu[y * GRID_W + x] = h;
+                }
+            }
+            update_r32_image(device, alloc, gqueue, gfamily,
+                             hm_gpu.image, hm_cpu, GRID_W, GRID_H);
+
+            // Re-init SWE (clears all water)
+            {
+                OneShot s = oneshot_begin(device, gqueue, gfamily);
+                vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_swe_init.pipeline);
+                vkCmdBindDescriptorSets(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                        pipe_swe_init.layout, 0, 1, &ds_swe_init, 0, nullptr);
+                SweInitPC pc{GRID_W, GRID_H, -10000.0f, 0.0f};
+                vkCmdPushConstants(s.cmd, pipe_swe_init.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                                   0, sizeof(pc), &pc);
+                vkCmdDispatch(s.cmd, (GRID_W + 7) / 8, (GRID_H + 7) / 8, 1);
+                oneshot_end(s);
+            }
+            swe_ping_pong = 0;
+            agents.clear();
+            replant_pending = 1;
+        }
 
         ImGui::Separator();
         ImGui::Text("plants: %u verts / %u tris",
                     plants.vertex_count, plants.index_count / 3);
         if (have_pick)
             ImGui::Text("cursor: (%.1f, %.1f) cells", pick_gx, pick_gy);
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("Ecosystem autorun");
+        ImGui::Checkbox("autorun", &ui_autorun);
+        ImGui::Checkbox("spring", &ui_spring_enabled);
+        ImGui::SliderFloat("spring rate", &ui_spring_rate, 0.01f, 1.0f, "%.2f");
+        ImGui::Text("time: %.0f s  replant in: %.1f s",
+                    static_cast<double>(accumulated_time),
+                    static_cast<double>(AUTO_REPLANT_INTERVAL - auto_replant_timer));
+
+        ImGui::Separator();
+        ImGui::TextUnformatted("Creatures");
+        ImGui::Checkbox("enable creatures", &ui_creatures_enabled);
+        ImGui::SliderInt("creature count", &ui_creature_count, 1, 100);
+        ImGui::SliderFloat("speed mult", &ui_creature_speed, 0.0f, 5.0f, "%.1f");
+        ImGui::SliderFloat("plant growth", &plant_growth_rate, 0.0f, 0.3f, "%.3f");
+        ImGui::SliderFloat("plant decay", &plant_decay_rate, 0.0f, 0.2f, "%.3f");
+
+        ImGui::Separator();
+        static int ui_species_sel = 0;
+        const char* species_names[] = {"Sprinter", "Grazer", "Browser"};
+        ImGui::Combo("species", &ui_species_sel, species_names, 3);
+        auto& sp = creature_profiles[static_cast<size_t>(ui_species_sel)];
+
+        ImGui::TextUnformatted("Energy (caloric)");
+        ImGui::SliderFloat("body mass", &sp.body_mass,
+                           5.0f, 200.0f, "%.0f kg");
+        ImGui::SliderFloat("basal rate", &sp.basal_rate,
+                           0.001f, 0.05f, "%.3f");
+        ImGui::SliderFloat("locomotion cost", &sp.locomotion_cost,
+                           0.001f, 0.02f, "%.4f");
+        ImGui::SliderFloat("trophic eff", &sp.trophic_efficiency,
+                           0.01f, 0.50f, "%.2f");
+        ImGui::SliderFloat("graze consume", &sp.graze_consume,
+                           0.01f, 0.50f, "%.2f");
+        ImGui::SliderFloat("reproduce at", &sp.reproduce_threshold,
+                           0.40f, 0.95f, "%.2f");
+        ImGui::SliderFloat("max age (s)", &sp.max_age,
+                           30.0f, 600.0f, "%.0f");
+        ImGui::Separator();
+        ImGui::TextUnformatted("Terrain");
+        ImGui::SliderFloat("water avoid", &sp.water_avoidance,
+                           0.0f, 20.0f, "%.1f");
+        ImGui::SliderFloat("max slope", &sp.max_slope,
+                           0.2f, 1.5f, "%.2f");
+        ImGui::SliderFloat("slope cost", &sp.slope_cost_factor,
+                           0.0f, 5.0f, "%.1f");
+
+        ImGui::Separator();
+        ImGui::Text("plants: %d individuals",
+                    static_cast<int>(plant_population.size()));
+        if (ImGui::Button("Spawn All")) {
+            agents.clear();
+            int per = ui_creature_count / 3;
+            int extra = ui_creature_count - per * 3;
+            bestiary::spawn_creatures(agents, 0, per + (extra > 0 ? 1 : 0),
+                persistent_env, TILE_HALF_X, TILE_HALF_Z, 42u);
+            bestiary::spawn_creatures(agents, 1, per + (extra > 1 ? 1 : 0),
+                persistent_env, TILE_HALF_X, TILE_HALF_Z, 137u);
+            bestiary::spawn_creatures(agents, 2, per,
+                persistent_env, TILE_HALF_X, TILE_HALF_Z, 271u);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear")) {
+            agents.clear();
+        }
+        int alive = bestiary::count_alive(agents);
+        int n_plants = static_cast<int>(plant_population.size());
+        int s0 = bestiary::count_alive_species(agents, 0);
+        int s1 = bestiary::count_alive_species(agents, 1);
+        int s2 = bestiary::count_alive_species(agents, 2);
+        ImGui::Text("alive: %d  (S:%d G:%d B:%d)  plants: %d",
+                    alive, s0, s1, s2, n_plants);
+        ImGui::Text("energy — avg: %.2f  min: %.2f  max: %.2f",
+                    static_cast<double>(bestiary::avg_energy(agents)),
+                    static_cast<double>(bestiary::min_energy(agents)),
+                    static_cast<double>(bestiary::max_energy(agents)));
+
+        if (ImGui::CollapsingHeader("Atmosphere")) {
+            ImGui::Checkbox("enable atmosphere", &ui_atmo_enabled);
+            ImGui::SliderFloat("cloud opacity",   &ui_cloud_opacity,     0.0f, 2.0f);
+            ImGui::SliderFloat("orographic lift",  &ui_orographic_lift,   0.0f, 1.0f);
+            ImGui::SliderFloat("adiabatic cool",   &ui_adiabatic_cooling, 0.0f, 0.02f);
+            ImGui::SliderFloat("rain shadow",      &ui_rain_shadow,       0.0f, 1.0f);
+            ImGui::SliderFloat("k_pressure",       &ui_k_pressure,        0.0f, 5.0f);
+            ImGui::SliderFloat("wind strength",    &ui_wind_strength,     0.0f, 10.0f);
+            ImGui::SliderFloat("k_evaporation",    &ui_k_evaporation,     0.0f, 2.0f);
+            ImGui::SliderFloat("cloud base (m)",   &ui_cloud_base,        -20.0f, 100.0f);
+            ImGui::SliderFloat("layer height (m)", &ui_layer_height,      1.0f, 50.0f);
+            if (ImGui::Button("Reset atmosphere")) ui_atmo_reset = true;
+        }
+
+        if (ImGui::CollapsingHeader("Erosion")) {
+            ImGui::Checkbox("enable erosion", &ui_erosion_enabled);
+            ImGui::SliderFloat("k_erosion",   &ui_k_erosion,     0.0f, 0.1f);
+            ImGui::SliderFloat("k_deposit",   &ui_k_deposit,     0.0f, 0.1f);
+            ImGui::SliderFloat("k_capacity",  &ui_k_capacity,    0.0f, 2.0f);
+            ImGui::SliderFloat("min_slope",   &ui_min_slope,     0.0f, 0.01f);
+            ImGui::SliderFloat("k_wind ero",  &ui_k_wind,        0.0f, 0.5f);
+            ImGui::SliderFloat("wind thresh", &ui_wind_threshold, 0.0f, 3.0f);
+            ImGui::SliderFloat("k_thermal",   &ui_k_thermal,     0.0f, 0.2f);
+        }
+
+        ImGui::SliderFloat("k_rain (SWE)", &ui_k_rain, 0.0f, 2.0f);
+
+        if (ui_atmo_enabled && ImGui::CollapsingHeader("Debug Readback")) {
+            ImGui::Text("pressure — min:%.2f mean:%.2f max:%.2f",
+                        (double)debug_pressure_min, (double)debug_pressure_mean, (double)debug_pressure_max);
+            ImGui::Text("wind speed max: %.2f", (double)debug_wind_speed_max);
+            ImGui::Text("precip — mean:%.4f max:%.4f", (double)debug_precip_mean, (double)debug_precip_max);
+            ImGui::Text("temp mean: %.1f K (%.1f C)", (double)debug_temp_mean, (double)(debug_temp_mean - 273.15f));
+            ImGui::Text("humidity mean: %.3f", (double)debug_humidity_mean);
+            ImGui::Text("ground wind — mean:%.2f max:%.2f", (double)debug_gc_wind_mean, (double)debug_gc_wind_max);
+        }
+
         ImGui::End();
         ImGui::Render();
 
@@ -1414,7 +1675,7 @@ int main()
             compute_memory_barrier(cmd);
 
             // CPU mirror (replay same falloff)
-            cpu_apply_brush(hm_cpu, pick_gx, pick_gy, bpc.brush_radius, bpc.brush_amount);
+            cpu_apply_brush(hm_cpu, GRID_W, GRID_H, pick_gx, pick_gy, bpc.brush_radius, bpc.brush_amount);
             brushed_this_stroke = true;
         }
 
@@ -1432,7 +1693,7 @@ int main()
                 pc.friction = 0.05f;
                 pc.dx       = DX;
                 pc.sea_level = -10000.0f; // disable static sea floor
-                pc.damping  = 0.0f;
+                pc.k_rain   = ui_k_rain;
                 pc.grid_w   = GRID_W;
                 pc.grid_h   = GRID_H;
                 if (rain_key && have_pick) {
@@ -1441,6 +1702,11 @@ int main()
                     pc.pulse_radius = static_cast<float>(ui_brush_radius_cells);
                     pc.pulse_amount = 0.5f;
                     wt_water_pulse_active = 1;
+                } else if (ui_spring_enabled) {
+                    pc.pulse_x      = SPRING_GX;
+                    pc.pulse_y      = SPRING_GY;
+                    pc.pulse_radius = 6.0f;
+                    pc.pulse_amount = ui_spring_rate;
                 }
                 vkCmdPushConstants(cmd, pipe_swe_step.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                    0, sizeof(pc), &pc);
@@ -1450,10 +1716,176 @@ int main()
             }
         }
 
-        // Detect LMB release for replant
+        // ---- Atmosphere 3D dispatch ----------------------------------------
+        if (ui_atmo_enabled) {
+            int acur = atmo_ping_pong & 1;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_atmo.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pipe_atmo.layout, 0, 1, &ds_atmo[acur], 0, nullptr);
+            Atmo3DPC apc{};
+            apc.dt                    = dt;
+            apc.accumulated_time      = accumulated_time;
+            apc.grid_w                = ATMO_W;
+            apc.grid_h                = ATMO_H;
+            apc.grid_d                = ATMO_D;
+            apc.terrain_scale         = static_cast<float>(GRID_W) * DX;
+            apc.layer_height          = ui_layer_height;
+            apc.max_elevation         = 50.0f;
+            apc.orographic_lift_coeff = ui_orographic_lift;
+            apc.adiabatic_cooling_rate = ui_adiabatic_cooling;
+            apc.rain_shadow_intensity = ui_rain_shadow;
+            apc.force_init            = (ui_atmo_reset || atmo_force_init) ? 1u : 0u;
+            apc.k_pressure            = ui_k_pressure;
+            apc.wind_strength         = ui_wind_strength;
+            apc.k_evaporation         = ui_k_evaporation;
+            vkCmdPushConstants(cmd, pipe_atmo.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(apc), &apc);
+            vkCmdDispatch(cmd, (ATMO_W + 3) / 4, (ATMO_H + 3) / 4, (ATMO_D + 3) / 4);
+            compute_memory_barrier(cmd);
+            ++atmo_ping_pong;
+            atmo_force_init = false;
+            ui_atmo_reset = false;
+
+            int wind_write_idx = acur ^ 1;
+            VkImage wind_src = wind_field[wind_write_idx].image;
+            uint32_t cur_frame_idx = renderer.current_frame;
+
+            volume_barrier(cmd, wind_src,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                           VK_PIPELINE_STAGE_2_COPY_BIT,
+                           VK_ACCESS_2_TRANSFER_READ_BIT,
+                           VK_IMAGE_LAYOUT_GENERAL,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+            VkBufferImageCopy wind_copy{};
+            wind_copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            wind_copy.imageExtent = {ATMO_W, ATMO_H, 1};
+            vkCmdCopyImageToBuffer(cmd, wind_src,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   wind_readback[cur_frame_idx].buffer, 1, &wind_copy);
+
+            volume_barrier(cmd, wind_src,
+                           VK_PIPELINE_STAGE_2_COPY_BIT,
+                           VK_ACCESS_2_TRANSFER_READ_BIT,
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                             | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           VK_IMAGE_LAYOUT_GENERAL);
+
+            image_barrier(cmd, ground_cond.image,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                          VK_PIPELINE_STAGE_2_COPY_BIT,
+                          VK_ACCESS_2_TRANSFER_READ_BIT,
+                          VK_IMAGE_LAYOUT_GENERAL,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+            VkBufferImageCopy gc_copy{};
+            gc_copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            gc_copy.imageExtent = {ATMO_W, ATMO_H, 1};
+            vkCmdCopyImageToBuffer(cmd, ground_cond.image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   gcond_readback[cur_frame_idx].buffer, 1, &gc_copy);
+
+            image_barrier(cmd, ground_cond.image,
+                          VK_PIPELINE_STAGE_2_COPY_BIT,
+                          VK_ACCESS_2_TRANSFER_READ_BIT,
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                            | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          VK_IMAGE_LAYOUT_GENERAL);
+        }
+
+        // ---- Erosion dispatch -----------------------------------------------
+        if (ui_erosion_enabled) {
+            int ero_cur = ero_ping_pong & 1;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_erosion.pipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pipe_erosion.layout, 0, 1, &ds_erosion[ero_cur], 0, nullptr);
+            ErosionPC epc{};
+            epc.dt          = dt;
+            epc.dx          = DX;
+            epc.grid_w      = GRID_W;
+            epc.grid_h      = GRID_H;
+            epc.k_erosion   = ui_k_erosion;
+            epc.k_deposit   = ui_k_deposit;
+            epc.k_capacity  = ui_k_capacity;
+            epc.min_slope   = ui_min_slope;
+            epc.min_depth   = 0.001f;
+            epc.max_change  = 0.1f;
+            epc.max_sediment = 1.0f;
+            epc.k_wind      = ui_k_wind;
+            epc.k_thermal   = ui_k_thermal;
+            epc.wind_threshold = ui_wind_threshold;
+            vkCmdPushConstants(cmd, pipe_erosion.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(epc), &epc);
+            vkCmdDispatch(cmd, (GRID_W + 15) / 16, (GRID_H + 15) / 16, 1);
+            ++ero_ping_pong;
+        }
+
+        compute_to_graphics_barrier(cmd);
+
+        // Track brush stroke end (no longer triggers replant — plants evolve gradually)
         if (prev_lmb && !lmb && brushed_this_stroke) {
-            replant_pending = 1; // schedule for next frame so the latest brush stroke is on GPU
             brushed_this_stroke = false;
+        }
+
+        // ---- Plant population tick (always, independent of creatures) --------
+        bestiary::tick_plant_population(plant_population, persistent_env,
+                                        eco_params, dt,
+                                        plant_growth_rate, plant_decay_rate);
+
+        veg_rebuild_timer += dt;
+        if (veg_rebuild_timer >= VEG_REBUILD_INTERVAL) {
+            veg_rebuild_timer = 0.0f;
+            rebuild_plant_mesh();
+        }
+
+        // ---- Creature tick ---------------------------------------------------
+        if (ui_creatures_enabled && !agents.empty()) {
+            bestiary::CreatureWorldView world_view{};
+            world_view.plant_population = &plant_population;
+            world_view.env_field    = &persistent_env;
+            world_view.terrain_height = [&hm_cpu](float x, float z) {
+                return sample_hm_bilinear(hm_cpu, GRID_W, GRID_H,
+                                          world_to_gx(x), world_to_gy(z));
+            };
+            world_view.water_depth = [&persistent_water_depth](float x, float z) {
+                float gx = (x + TILE_HALF_X) / DX;
+                float gz = (z + TILE_HALF_Z) / DX;
+                int ix = std::clamp(static_cast<int>(std::floor(gx)), 0, static_cast<int>(GRID_W) - 1);
+                int iz = std::clamp(static_cast<int>(std::floor(gz)), 0, static_cast<int>(GRID_H) - 1);
+                return persistent_water_depth[static_cast<size_t>(iz * GRID_W + ix)];
+            };
+            world_view.tile_half_x  = TILE_HALF_X;
+            world_view.tile_half_z  = TILE_HALF_Z;
+            world_view.has_threat   = brush_apply_now;
+            world_view.threat_pos[0] = pick_gx * DX - TILE_HALF_X;
+            world_view.threat_pos[1] = pick_gy * DX - TILE_HALF_Z;
+            world_view.threat_radius = static_cast<float>(ui_brush_radius_cells) * DX + 10.0f;
+
+            float sim_dt = dt * ui_creature_speed;
+            bestiary::update_creatures(agents, creature_profiles,
+                                       world_view,
+                                       sim_dt, creature_tick);
+            ++creature_tick;
+
+            // Rebuild creature meshes every frame (cheap for <100 agents)
+            auto cm = bestiary::generate_creature_meshes(
+                agents, creature_profiles,
+                [&hm_cpu](float x, float z) {
+                    return sample_hm_bilinear(hm_cpu, GRID_W, GRID_H,
+                                              world_to_gx(x), world_to_gy(z));
+                }, dt);
+
+            vkDeviceWaitIdle(device);
+            destroy_plant_mesh(alloc, creature_mesh_gpu);
+            if (!cm.vertices.empty()) {
+                upload_plant_mesh(alloc, creature_mesh_gpu, cm);
+            }
         }
 
         // ---- Color attachment + depth barriers ---------------------------
@@ -1552,7 +1984,67 @@ int main()
             vkCmdBindIndexBuffer(cmd, plants.ibo.buffer, 0, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(cmd, plants.index_count, 1, 0, 0, 0);
         }
+
+        // Creatures (same pipeline as plants — height_t=0 means no wind sway)
+        if (ui_creatures_enabled && creature_mesh_gpu.index_count > 0) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_clump.pipeline);
+            ClumpPC cpc{};
+            cpc.mvp = mvp;
+            cpc.wind_dir[0] = 0.0f;
+            cpc.wind_dir[1] = 0.0f;
+            cpc.wind_speed  = 0.0f;
+            cpc.time = accumulated_time;
+            vkCmdPushConstants(cmd, pipe_clump.layout, VK_SHADER_STAGE_VERTEX_BIT,
+                               0, sizeof(cpc), &cpc);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &creature_mesh_gpu.vbo.buffer, &zero);
+            vkCmdBindIndexBuffer(cmd, creature_mesh_gpu.ibo.buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, creature_mesh_gpu.index_count, 1, 0, 0, 0);
+        }
         vkCmdEndRendering(cmd);
+
+        // ---- Cloud raymarch pass (alpha-blended, no depth) ---------------
+        if (ui_atmo_enabled && ui_cloud_opacity > 0.0f) {
+            CameraUBO cam_ubo{};
+            cam_ubo.view      = view;
+            cam_ubo.proj      = proj;
+            cam_ubo.sun_dir   = glm::normalize(glm::vec3(0.4f, 0.7f, -0.3f));
+            cam_ubo.sun_color = glm::vec3(1.0f, 0.95f, 0.85f);
+            cam_ubo.cam_pos   = glm::vec3(0.0f);
+            cam_ubo.inv_view_proj = glm::inverse(proj * view);
+            std::memcpy(camera_ubo_info.pMappedData, &cam_ubo, sizeof(cam_ubo));
+            vmaFlushAllocation(alloc, camera_ubo_alloc, 0, VK_WHOLE_SIZE);
+
+            VkRenderingAttachmentInfo cloud_color = color;
+            cloud_color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            VkRenderingInfo cloud_ri{};
+            cloud_ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            cloud_ri.renderArea           = {{0, 0}, extent};
+            cloud_ri.layerCount           = 1;
+            cloud_ri.colorAttachmentCount = 1;
+            cloud_ri.pColorAttachments    = &cloud_color;
+            vkCmdBeginRendering(cmd, &cloud_ri);
+            VkViewport cloud_vp{0, 0, float(extent.width), float(extent.height), 0, 1};
+            vkCmdSetViewport(cmd, 0, 1, &cloud_vp);
+            VkRect2D cloud_sc{{0, 0}, extent};
+            vkCmdSetScissor(cmd, 0, 1, &cloud_sc);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe_cloud.pipeline);
+            int cloud_set_idx = atmo_ping_pong & 1;
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    pipe_cloud.layout, 0, 1, &ds_cloud[cloud_set_idx], 0, nullptr);
+            RaymarchPC rpc{};
+            rpc.terrain_size  = static_cast<float>(GRID_W) * DX;
+            rpc.max_elevation = 50.0f;
+            rpc.cloud_opacity = ui_cloud_opacity;
+            rpc.cloud_base    = ui_cloud_base;
+            rpc.vol_w         = ATMO_W;
+            rpc.vol_h         = ATMO_H;
+            rpc.vol_d         = ATMO_D;
+            rpc.layer_height  = ui_layer_height;
+            vkCmdPushConstants(cmd, pipe_cloud.layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(rpc), &rpc);
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+            vkCmdEndRendering(cmd);
+        }
 
         // ---- ImGui pass --------------------------------------------------
         VkRenderingAttachmentInfo ig_color = color;
@@ -1587,20 +2079,66 @@ int main()
                 run_replant();
             }
         }
+
+        // ---- Autorun: refresh environment + sprout + creature spawn ---------
+        if (ui_autorun) {
+            auto_replant_timer += dt;
+            if (auto_replant_timer >= AUTO_REPLANT_INTERVAL) {
+                auto_replant_timer = 0.0f;
+
+                refresh_env();
+
+                // Sprout new plants where conditions are favorable
+                bestiary::sprout_plants(plant_population, eco_params,
+                                         persistent_env, sprout_seed);
+                ++sprout_seed;
+            }
+
+            if (!initial_spawn_done && accumulated_time > 3.0f) {
+                initial_spawn_done = true;
+                agents.clear();
+                int per = ui_creature_count / 3;
+                int extra = ui_creature_count - per * 3;
+                bestiary::spawn_creatures(agents, 0, per + (extra > 0 ? 1 : 0),
+                    persistent_env, TILE_HALF_X, TILE_HALF_Z, 42u);
+                bestiary::spawn_creatures(agents, 1, per + (extra > 1 ? 1 : 0),
+                    persistent_env, TILE_HALF_X, TILE_HALF_Z, 137u);
+                bestiary::spawn_creatures(agents, 2, per,
+                    persistent_env, TILE_HALF_X, TILE_HALF_Z, 271u);
+            }
+        }
     }
 
     vkDeviceWaitIdle(device);
     destroy_plant_mesh(alloc, plants);
+    destroy_plant_mesh(alloc, creature_mesh_gpu);
     destroy_buffer(alloc, terrain_mesh.vbo);
     destroy_buffer(alloc, terrain_mesh.ibo);
+    destroy_cloud_pipeline(device, pipe_cloud);
+    vmaDestroyBuffer(alloc, camera_ubo, camera_ubo_alloc);
     destroy_clump_pipeline(device, pipe_clump);
     destroy_terrain_pipeline(device, pipe_terrain);
+    destroy_compute_pipeline(device, pipe_erosion);
+    destroy_compute_pipeline(device, pipe_atmo);
     destroy_compute_pipeline(device, pipe_brush);
     destroy_compute_pipeline(device, pipe_swe_step);
     destroy_compute_pipeline(device, pipe_swe_init);
 
     vkDestroyDescriptorPool(device, desc_pool, nullptr);
     vkDestroySampler(device, sampler, nullptr);
+
+    for (uint32_t i = 0; i < FRAMES_IN_FLIGHT; ++i) {
+        destroy_buffer(alloc, wind_readback[i]);
+        destroy_buffer(alloc, gcond_readback[i]);
+    }
+    for (int i = 0; i < 2; ++i) {
+        destroy_swe_image(device, alloc, sediment[i]);
+        destroy_swe_image(device, alloc, wind_field[i]);
+        destroy_swe_image(device, alloc, atmo_state[i]);
+    }
+    destroy_swe_image(device, alloc, atmo_shadow);
+    destroy_swe_image(device, alloc, ground_cond);
+    destroy_swe_image(device, alloc, ground_wind);
 
     destroy_swe_image(device, alloc, water_out);
     destroy_swe_image(device, alloc, state_b);

@@ -73,18 +73,22 @@ void ui_draw(UIState& s)
                 ImGui::SliderFloat("Orographic lift", &s.orographic_lift, 0.0f, 2.0f);
                 ImGui::SliderFloat("Adiabatic cooling", &s.adiabatic_cooling, 0.0f, 0.02f, "%.5f");
                 ImGui::SliderFloat("Rain shadow", &s.rain_shadow, 0.0f, 1.0f);
+                ImGui::SliderFloat("Pressure force", &s.k_pressure, 0.0f, 1.0f, "%.3f");
                 ImGui::Separator();
                 ImGui::Checkbox("Sand enabled", &s.sand_enabled);
                 if (s.sand_enabled) {
                     ImGui::SliderFloat("Loft threshold", &s.sand_loft_threshold, 0.5f, 4.0f);
                     ImGui::SliderFloat("Loft rate", &s.sand_loft_rate, 0.1f, 3.0f);
-                    ImGui::SliderFloat("Settling speed", &s.sand_settling, 0.5f, 10.0f);
                     ImGui::SliderFloat("Streak length", &s.sand_streak, 0.01f, 0.3f, "%.3f");
                     ImGui::SliderFloat("Particle alpha", &s.sand_alpha, 0.1f, 1.0f);
                     ImGui::SliderFloat("Bounce energy", &s.sand_bounce, 0.0f, 0.8f);
                     ImGui::SliderFloat("Gravity", &s.sand_gravity, 1.0f, 20.0f);
                 }
                 if (ImGui::Button("Reset atmosphere")) s.request_atmo_reset = true;
+                ImGui::Separator();
+                ImGui::Text("Pressure: %.1f / %.1f / %.1f hPa",
+                            s.pressure_min, s.pressure_mean, s.pressure_max);
+                ImGui::Text("Max wind: %.2f m/s", s.wind_speed_max);
             }
         }
 

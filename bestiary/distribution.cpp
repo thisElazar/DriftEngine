@@ -1,4 +1,5 @@
 #include "distribution.h"
+#include "creature/vegetation_field.h"
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -299,9 +300,15 @@ VegetationMesh generate_ecosystem(
     const ClumpParams& cp, const ClumpExpression& ce,
     const BushParams& bp, const BushExpression& be,
     const TreeParams& tp, const TreeExpression& te,
-    bool include_ground)
+    bool include_ground,
+    VegetationDensityField* veg_field)
 {
     VegetationMesh mesh;
+
+    if (veg_field) {
+        size_t n = static_cast<size_t>(veg_field->grid_w) * veg_field->grid_h;
+        veg_field->capacity.assign(n, 0.0f);
+    }
 
     auto points = poisson_disk(eco.region_size, eco.r_min, eco.r_max,
                                env, eco, eco.seed);
@@ -316,6 +323,11 @@ VegetationMesh generate_ecosystem(
 
         int kind = select_species(sample, eco, rand_val);
         if (kind < 0) continue;
+
+        if (veg_field) {
+            float weight = (kind == 0) ? 0.05f : (kind == 1) ? 0.03f : 0.01f;
+            accumulate_vegetation_capacity(*veg_field, x, z, weight);
+        }
 
         VegetationMesh sub;
         switch (kind) {
@@ -351,6 +363,299 @@ VegetationMesh generate_ecosystem(
 
     if (include_ground)
         emit_environment_ground(mesh, eco.region_size, env);
+
+    return mesh;
+}
+
+VegetationMesh generate_ecosystem_density_modulated(
+    const EcosystemParams& eco,
+    const EnvironmentField& env,
+    const ClumpParams& cp, const ClumpExpression& ce,
+    const BushParams& bp, const BushExpression& be,
+    const TreeParams& tp, const TreeExpression& te,
+    const VegetationDensityField& veg_field)
+{
+    VegetationMesh mesh;
+
+    auto points = poisson_disk(eco.region_size, eco.r_min, eco.r_max,
+                               env, eco, eco.seed);
+
+    for (size_t i = 0; i < points.size(); ++i) {
+        float x = points[i].x;
+        float z = points[i].z;
+
+        float fullness = sample_vegetation_fullness(veg_field, x, z);
+        if (fullness < 0.05f) continue;
+
+        auto sample = env(x, z);
+        uint32_t pt_seed = dhash(eco.seed ^ static_cast<uint32_t>(i * 2654435761u));
+        float rand_val = dhash_float(pt_seed, 0u);
+
+        int kind = select_species(sample, eco, rand_val);
+        if (kind < 0) continue;
+
+        VegetationMesh sub;
+        switch (kind) {
+        case 0: {
+            auto resolved = evaluate_expression(cp, ce, sample.moisture);
+            if (eco.phenotype_variance > 0.001f)
+                jitter_clump(resolved, eco.phenotype_variance, pt_seed);
+            resolved.blade_height *= fullness;
+            resolved.blade_count = std::max(1,
+                static_cast<int>(static_cast<float>(resolved.blade_count) * fullness));
+            sub = generate_clump(resolved, pt_seed, false, x, z);
+            break;
+        }
+        case 1: {
+            auto resolved = evaluate_bush_expression(bp, be, sample.moisture);
+            if (eco.phenotype_variance > 0.001f)
+                jitter_bush(resolved, eco.phenotype_variance, pt_seed);
+            resolved.bush_height *= fullness;
+            resolved.leaf_count = std::max(1,
+                static_cast<int>(static_cast<float>(resolved.leaf_count) * fullness));
+            sub = generate_bush(resolved, pt_seed, false, x, z);
+            break;
+        }
+        case 2: {
+            auto resolved = evaluate_tree_expression(tp, te, sample.moisture);
+            if (eco.phenotype_variance > 0.001f)
+                jitter_tree(resolved, eco.phenotype_variance, pt_seed);
+            resolved.tree_height *= fullness;
+            resolved.leaf_count = std::max(1,
+                static_cast<int>(static_cast<float>(resolved.leaf_count) * fullness));
+            sub = generate_tree(resolved, pt_seed, false, x, z);
+            break;
+        }
+        }
+
+        auto vert_offset = static_cast<uint32_t>(mesh.vertices.size());
+        mesh.vertices.insert(mesh.vertices.end(),
+                             sub.vertices.begin(), sub.vertices.end());
+        for (uint32_t idx : sub.indices)
+            mesh.indices.push_back(idx + vert_offset);
+    }
+
+    return mesh;
+}
+
+// -----------------------------------------------------------------------
+// Persistent plant population
+// -----------------------------------------------------------------------
+
+std::vector<PlantInstance> place_ecosystem(
+    const EcosystemParams& eco,
+    const EnvironmentField& env)
+{
+    std::vector<PlantInstance> plants;
+
+    auto points = poisson_disk(eco.region_size, eco.r_min, eco.r_max,
+                               env, eco, eco.seed);
+
+    for (size_t i = 0; i < points.size(); ++i) {
+        float x = points[i].x;
+        float z = points[i].z;
+
+        auto sample = env(x, z);
+        uint32_t pt_seed = dhash(eco.seed ^ static_cast<uint32_t>(i * 2654435761u));
+        float rand_val = dhash_float(pt_seed, 0u);
+
+        int kind = select_species(sample, eco, rand_val);
+        if (kind < 0) continue;
+
+        plants.push_back({x, z, kind, 0.01f, pt_seed});
+    }
+
+    return plants;
+}
+
+void tick_plant_population(
+    std::vector<PlantInstance>& plants,
+    const EnvironmentField& env,
+    const EcosystemParams& eco,
+    float dt,
+    float growth_rate,
+    float decay_rate)
+{
+    for (auto& p : plants) {
+        if (p.health <= 0.0f) continue;
+
+        auto sample = env(p.x, p.z);
+        const SpeciesSuitability* suit = nullptr;
+        switch (p.kind) {
+        case 0: suit = &eco.grass_suit; break;
+        case 1: suit = &eco.bush_suit;  break;
+        case 2: suit = &eco.tree_suit;  break;
+        }
+        if (!suit) continue;
+
+        float s = compute_suitability(*suit, sample);
+
+        if (s > 0.1f) {
+            p.health = std::min(p.health + growth_rate * s * dt, 1.0f);
+        } else {
+            p.health -= decay_rate * dt;
+            if (p.health <= 0.0f) p.health = 0.0f;
+        }
+    }
+
+    // Remove dead plants
+    plants.erase(
+        std::remove_if(plants.begin(), plants.end(),
+                        [](const PlantInstance& p) { return p.health <= 0.0f; }),
+        plants.end());
+}
+
+void sprout_plants(
+    std::vector<PlantInstance>& plants,
+    const EcosystemParams& eco,
+    const EnvironmentField& env,
+    uint32_t seed,
+    int max_sprouts)
+{
+    float half = eco.region_size * 0.5f;
+    float min_dist2 = eco.r_min * eco.r_min;
+    constexpr float pi = 3.14159265f;
+
+    // Index existing plants by kind for parent selection
+    std::vector<size_t> grass_idx, bush_idx, tree_idx;
+    for (size_t i = 0; i < plants.size(); ++i) {
+        if (plants[i].health < 0.3f) continue; // only healthy plants reproduce
+        switch (plants[i].kind) {
+        case 0: grass_idx.push_back(i); break;
+        case 1: bush_idx.push_back(i);  break;
+        case 2: tree_idx.push_back(i);  break;
+        }
+    }
+
+    int sprouted = 0;
+
+    for (int attempt = 0; attempt < max_sprouts * 5 && sprouted < max_sprouts; ++attempt) {
+        uint32_t s = dhash(seed ^ static_cast<uint32_t>(attempt * 2654435761u));
+
+        // Weighted species selection: more grass sprouts, fewer trees
+        float species_roll = dhash_float(s, 10);
+        int kind;
+        if (species_roll < 0.55f)       kind = 0; // grass: 55%
+        else if (species_roll < 0.80f)  kind = 1; // bush: 25%
+        else                            kind = 2; // tree: 20%
+
+        if (kind == 0 && !eco.grass_enabled) continue;
+        if (kind == 1 && !eco.bush_enabled)  continue;
+        if (kind == 2 && !eco.tree_enabled)  continue;
+
+        float x, z;
+
+        if (kind == 0 && !grass_idx.empty()) {
+            // Grass: spread from existing grass (runner/rhizome, 1-3m)
+            size_t pi_idx = static_cast<size_t>(
+                dhash_float(s, 0) * static_cast<float>(grass_idx.size()));
+            if (pi_idx >= grass_idx.size()) pi_idx = grass_idx.size() - 1;
+            const auto& parent = plants[grass_idx[pi_idx]];
+            float angle = dhash_float(s, 1) * 2.0f * pi;
+            float dist = 1.0f + dhash_float(s, 2) * 2.0f;
+            x = parent.x + std::cos(angle) * dist;
+            z = parent.z + std::sin(angle) * dist;
+        } else if (kind == 2 && !tree_idx.empty() && dhash_float(s, 3) < 0.85f) {
+            // Trees: seed shadow near parent (3-8m), 85% of the time
+            size_t pi_idx = static_cast<size_t>(
+                dhash_float(s, 0) * static_cast<float>(tree_idx.size()));
+            if (pi_idx >= tree_idx.size()) pi_idx = tree_idx.size() - 1;
+            const auto& parent = plants[tree_idx[pi_idx]];
+            float angle = dhash_float(s, 1) * 2.0f * pi;
+            float dist = 3.0f + dhash_float(s, 2) * 5.0f;
+            x = parent.x + std::cos(angle) * dist;
+            z = parent.z + std::sin(angle) * dist;
+        } else {
+            // Bushes + fallback: random placement (wind/bird dispersal)
+            x = (dhash_float(s, 0) * 2.0f - 1.0f) * half;
+            z = (dhash_float(s, 1) * 2.0f - 1.0f) * half;
+        }
+
+        // Bounds check
+        if (x < -half || x > half || z < -half || z > half) continue;
+
+        auto sample = env(x, z);
+        const SpeciesSuitability* suit = nullptr;
+        switch (kind) {
+        case 0: suit = &eco.grass_suit; break;
+        case 1: suit = &eco.bush_suit;  break;
+        case 2: suit = &eco.tree_suit;  break;
+        }
+        if (!suit) continue;
+        if (compute_suitability(*suit, sample) < 0.3f) continue;
+
+        bool too_close = false;
+        for (const auto& p : plants) {
+            float dx = p.x - x;
+            float dz = p.z - z;
+            if (dx * dx + dz * dz < min_dist2) {
+                too_close = true;
+                break;
+            }
+        }
+        if (too_close) continue;
+
+        uint32_t pt_seed = dhash(s ^ 0x12345678u);
+        plants.push_back({x, z, kind, 0.01f, pt_seed});
+        ++sprouted;
+    }
+}
+
+VegetationMesh generate_mesh_from_population(
+    const std::vector<PlantInstance>& plants,
+    const EnvironmentField& env,
+    const ClumpParams& cp, const ClumpExpression& ce,
+    const BushParams& bp, const BushExpression& be,
+    const TreeParams& tp, const TreeExpression& te,
+    float phenotype_variance)
+{
+    VegetationMesh mesh;
+
+    for (const auto& p : plants) {
+        if (p.health < 0.01f) continue;
+
+        auto sample = env(p.x, p.z);
+
+        VegetationMesh sub;
+        switch (p.kind) {
+        case 0: {
+            auto resolved = evaluate_expression(cp, ce, sample.moisture);
+            if (phenotype_variance > 0.001f)
+                jitter_clump(resolved, phenotype_variance, p.seed);
+            resolved.blade_height *= p.health;
+            resolved.blade_count = std::max(1,
+                static_cast<int>(static_cast<float>(resolved.blade_count) * p.health));
+            sub = generate_clump(resolved, p.seed, false, p.x, p.z);
+            break;
+        }
+        case 1: {
+            auto resolved = evaluate_bush_expression(bp, be, sample.moisture);
+            if (phenotype_variance > 0.001f)
+                jitter_bush(resolved, phenotype_variance, p.seed);
+            resolved.bush_height *= p.health;
+            resolved.leaf_count = std::max(1,
+                static_cast<int>(static_cast<float>(resolved.leaf_count) * p.health));
+            sub = generate_bush(resolved, p.seed, false, p.x, p.z);
+            break;
+        }
+        case 2: {
+            auto resolved = evaluate_tree_expression(tp, te, sample.moisture);
+            if (phenotype_variance > 0.001f)
+                jitter_tree(resolved, phenotype_variance, p.seed);
+            resolved.tree_height *= p.health;
+            resolved.leaf_count = std::max(1,
+                static_cast<int>(static_cast<float>(resolved.leaf_count) * p.health));
+            sub = generate_tree(resolved, p.seed, false, p.x, p.z);
+            break;
+        }
+        }
+
+        auto vert_offset = static_cast<uint32_t>(mesh.vertices.size());
+        mesh.vertices.insert(mesh.vertices.end(),
+                             sub.vertices.begin(), sub.vertices.end());
+        for (uint32_t idx : sub.indices)
+            mesh.indices.push_back(idx + vert_offset);
+    }
 
     return mesh;
 }

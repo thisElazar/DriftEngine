@@ -2,6 +2,10 @@
 [[vk::binding(1, 0)]] Texture2D<float4>  swe_state;
 [[vk::binding(2, 0)]] Texture2D<float>   sediment_in;
 [[vk::binding(3, 0)]] RWTexture2D<float> sediment_out;
+[[vk::combinedImageSampler]][[vk::binding(4, 0)]] Texture2D<float4> ground_cond;
+[[vk::combinedImageSampler]][[vk::binding(4, 0)]] SamplerState      ground_cond_sampler;
+[[vk::combinedImageSampler]][[vk::binding(5, 0)]] Texture2D<float2> ground_wind;
+[[vk::combinedImageSampler]][[vk::binding(5, 0)]] SamplerState      ground_wind_sampler;
 
 [[vk::push_constant]]
 cbuffer PC {
@@ -18,6 +22,11 @@ cbuffer PC {
     float min_depth;
     float max_change;
     float max_sediment;
+    float k_wind;
+
+    float k_thermal;
+    float wind_threshold;
+    uint  _pad0;
     uint  _pad1;
 };
 
@@ -94,6 +103,32 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         float dump = min(advected, max_delta);
         terrain_delta  += dump;
         sediment_delta -= dump;
+    }
+
+    // --- Wind shear erosion (exposed dry terrain) ---
+    if (k_wind > 0.0 && depth < min_depth) {
+        float2 uv = (float2(c) + 0.5) / float2(grid_w, grid_h);
+        float4 gc = ground_cond.SampleLevel(ground_cond_sampler, uv, 0);
+        float wind_speed = gc.a;
+        float excess_wind = wind_speed - wind_threshold;
+        if (excess_wind > 0.0) {
+            float wind_erosion = k_wind * excess_wind * slope * dt;
+            wind_erosion = min(wind_erosion, max_change * dt);
+            terrain_delta -= wind_erosion;
+            sediment_delta += wind_erosion;
+        }
+
+        // --- Thermal erosion (freeze-thaw near 273K on steep slopes) ---
+        if (k_thermal > 0.0) {
+            float temperature = gc.g;
+            float freeze_thaw = saturate(1.0 - abs(temperature - 273.15) / 5.0);
+            if (freeze_thaw > 0.0 && slope > min_slope * 2.0) {
+                float thermal_erosion = k_thermal * freeze_thaw * slope * dt;
+                thermal_erosion = min(thermal_erosion, max_change * dt);
+                terrain_delta -= thermal_erosion;
+                sediment_delta += thermal_erosion;
+            }
+        }
     }
 
     terrain_delta *= edge_factor;

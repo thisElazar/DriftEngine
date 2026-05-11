@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <vector>
 
+#include <glm/glm.hpp>
+
 struct RaymarchPC {
     float terrain_size;
     float max_elevation;
@@ -37,7 +39,7 @@ struct SweStepPC {
     float    dx;
     float    sea_level;
     float    damping;
-    float    _pad0;
+    float    k_rain;
     uint32_t grid_w;
     uint32_t grid_h;
     float    pulse_x;
@@ -69,6 +71,10 @@ struct ErosionPC {
     float    min_depth;
     float    max_change;
     float    max_sediment;
+    float    k_wind;
+    float    k_thermal;
+    float    wind_threshold;
+    uint32_t _pad0;
     uint32_t _pad1;
 };
 
@@ -85,10 +91,9 @@ struct Atmo3DPC {
     float    adiabatic_cooling_rate;
     float    rain_shadow_intensity;
     uint32_t force_init;
-    uint32_t sand_enabled;
-    float    sand_loft_threshold;
-    float    sand_loft_rate;
-    float    sand_settling;
+    float    k_pressure;
+    float    wind_strength;
+    float    k_evaporation;
 };
 
 struct SandSimPC {
@@ -212,6 +217,17 @@ struct WaterStamp {
     float    _pad0, _pad1;
 };
 
+struct ClumpPC {
+    glm::mat4 mvp;
+    float     wind_dir[2];
+    float     wind_speed;
+    float     time;
+};
+
+static_assert(sizeof(SweStepPC) == 56, "SweStepPC layout must match shader");
+static_assert(sizeof(TerrainBrushPC) == 32, "TerrainBrushPC layout must match shader");
+static_assert(sizeof(ErosionPC) == 64, "ErosionPC layout must match shader");
+
 constexpr uint32_t MAX_STAMPS = 4096;
 constexpr uint32_t MAX_WATER_STAMPS = 4096;
 
@@ -280,7 +296,6 @@ struct Pipelines {
     VkPipeline planet_swe_h_adjust_pipeline = VK_NULL_HANDLE;
 };
 
-std::vector<uint32_t> load_spirv(const char* path);
 void pipelines_create(Pipelines& p, VkDevice device);
 void pipelines_reload(Pipelines& p, VkDevice device);
 void pipelines_destroy(Pipelines& p, VkDevice device);

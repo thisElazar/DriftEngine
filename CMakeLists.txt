@@ -92,6 +92,43 @@ message(STATUS "Vulkan include dir: ${Vulkan_INCLUDE_DIRS}")
 message(STATUS "Vulkan library:     ${Vulkan_LIBRARIES}")
 
 # ---------------------------------------------------------------------------
+# Engine core library — shared Vulkan infrastructure for all apps
+# ---------------------------------------------------------------------------
+add_library(drift_engine_core STATIC
+    src/renderer.cpp
+    src/resources.cpp
+    src/vk_util.cpp
+    src/grid_util.cpp
+    src/vma_impl.cpp
+)
+
+target_include_directories(drift_engine_core PUBLIC src)
+
+target_link_libraries(drift_engine_core PUBLIC
+    Vulkan::Vulkan
+    glfw
+    vk-bootstrap::vk-bootstrap
+    GPUOpen::VulkanMemoryAllocator
+    glm::glm
+    imgui
+)
+
+target_compile_definitions(drift_engine_core PUBLIC GLFW_INCLUDE_NONE)
+target_compile_features(drift_engine_core PUBLIC cxx_std_20)
+
+if(MSVC)
+    target_compile_options(drift_engine_core PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(drift_engine_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(APPLE)
+    target_compile_definitions(drift_engine_core PUBLIC VK_USE_PLATFORM_METAL_EXT)
+    get_filename_component(_vulkan_lib_dir "${Vulkan_LIBRARIES}" DIRECTORY)
+    target_link_options(drift_engine_core PUBLIC "LINKER:-rpath,${_vulkan_lib_dir}")
+endif()
+
+# ---------------------------------------------------------------------------
 # Engine target
 # ---------------------------------------------------------------------------
 add_executable(drift_engine
@@ -100,37 +137,16 @@ add_executable(drift_engine
     src/input.cpp
     src/pipeline.cpp
     src/planet.cpp
-    src/renderer.cpp
-    src/resources.cpp
     src/terrain.cpp
     src/ui.cpp
-    src/vma_impl.cpp
 )
 
-target_link_libraries(drift_engine PRIVATE
-    Vulkan::Vulkan
-    glfw
-    vk-bootstrap::vk-bootstrap
-    GPUOpen::VulkanMemoryAllocator
-    glm::glm
-    imgui
-)
-target_compile_definitions(drift_engine PRIVATE GLFW_INCLUDE_NONE)
+target_link_libraries(drift_engine PRIVATE drift_engine_core)
 
-# Strict-ish warnings; expand later
 if(MSVC)
     target_compile_options(drift_engine PRIVATE /W4 /permissive-)
 else()
     target_compile_options(drift_engine PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# macOS: ensure we link against the right SDK frameworks if/when we add them
-if(APPLE)
-    target_compile_definitions(drift_engine PRIVATE VK_USE_PLATFORM_METAL_EXT)
-    # GLFW and vk-bootstrap dlopen libvulkan at runtime; the Homebrew loader
-    # isn't in the default search path, so embed an rpath.
-    get_filename_component(_vulkan_lib_dir "${Vulkan_LIBRARIES}" DIRECTORY)
-    target_link_options(drift_engine PRIVATE "LINKER:-rpath,${_vulkan_lib_dir}")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -178,8 +194,10 @@ add_custom_target(shaders ALL DEPENDS ${SPV_OUTPUTS})
 add_dependencies(drift_engine shaders)
 
 # ---------------------------------------------------------------------------
-# Bestiary library + Species Lab app
+# Bestiary library + Plant Lab app
 # ---------------------------------------------------------------------------
 add_subdirectory(bestiary)
-add_subdirectory(apps/species_lab)
+add_subdirectory(apps/plant_lab)
+add_subdirectory(apps/animals_lab)
 add_subdirectory(apps/world_lab)
+add_subdirectory(apps/simCoupleTesting)

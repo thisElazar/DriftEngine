@@ -1,21 +1,7 @@
 #include "pipeline.h"
-#include <fstream>
+#include "vk_util.h"
 #include <cstdio>
 #include <cstring>
-
-std::vector<uint32_t> load_spirv(const char* path)
-{
-    std::ifstream file(path, std::ios::ate | std::ios::binary);
-    if (!file.is_open()) {
-        std::fprintf(stderr, "Failed to open SPIR-V file: %s\n", path);
-        std::abort();
-    }
-    size_t size = static_cast<size_t>(file.tellg());
-    std::vector<uint32_t> buffer(size / sizeof(uint32_t));
-    file.seekg(0);
-    file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(size));
-    return buffer;
-}
 
 void pipelines_create(Pipelines& p, VkDevice device)
 {

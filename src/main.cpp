@@ -330,6 +330,23 @@ int main()
             &edge_flags_buf, &edge_flags_alloc, &edge_flags_info));
     }
 
+    // ---- Atmosphere debug readback (bottom layer of wind field for pressure stats) ----
+    VkBuffer atmo_debug_buf = VK_NULL_HANDLE;
+    VmaAllocation atmo_debug_alloc = VK_NULL_HANDLE;
+    VmaAllocationInfo atmo_debug_info{};
+    {
+        VkBufferCreateInfo bci{};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = ATMO_W * ATMO_H * sizeof(uint16_t) * 4;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        VmaAllocationCreateInfo ai{};
+        ai.usage = VMA_MEMORY_USAGE_AUTO;
+        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+                 | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VK_CHECK(vmaCreateBuffer(allocator, &bci, &ai,
+            &atmo_debug_buf, &atmo_debug_alloc, &atmo_debug_info));
+    }
+
     // ---- SWE images (ping-pong state + output) ------------------------------
     SweImage swe_state_a = create_swe_image(device, allocator, SWE_GRID_W, SWE_GRID_H);
     SweImage swe_state_b = create_swe_image(device, allocator, SWE_GRID_W, SWE_GRID_H);
@@ -1789,6 +1806,46 @@ int main()
                 double swe_ms = static_cast<double>(timestamps[1] - timestamps[0]) * ns_per_tick / 1e6;
                 gpu_times[timing_index] = swe_ms;
             }
+
+            // Atmosphere pressure debug readback
+            if (atmo_debug_info.pMappedData && g_ui.atmosphere_enabled) {
+                const uint16_t* px = static_cast<const uint16_t*>(atmo_debug_info.pMappedData);
+                float p_min = 1e30f, p_max = -1e30f, p_sum = 0.0f;
+                float ws_max = 0.0f;
+                uint32_t count = 0;
+                for (uint32_t i = 0; i < ATMO_W * ATMO_H; ++i) {
+                    uint16_t hx = px[i * 4 + 0];
+                    uint16_t hy = px[i * 4 + 1];
+                    uint16_t hp = px[i * 4 + 3];
+                    // IEEE 754 half-to-float conversion
+                    auto h2f = [](uint16_t h) -> float {
+                        uint32_t sign = (h >> 15) & 1;
+                        uint32_t exp  = (h >> 10) & 0x1F;
+                        uint32_t mant = h & 0x3FF;
+                        if (exp == 0) return sign ? -0.0f : 0.0f;
+                        if (exp == 31) return sign ? -1e30f : 1e30f;
+                        float f = std::ldexp(static_cast<float>(1024 + mant), static_cast<int>(exp) - 25);
+                        return sign ? -f : f;
+                    };
+                    float pressure = h2f(hp);
+                    float wx = h2f(hx);
+                    float wy = h2f(hy);
+                    if (pressure > 10.0f) {
+                        p_min = std::min(p_min, pressure);
+                        p_max = std::max(p_max, pressure);
+                        p_sum += pressure;
+                        ++count;
+                    }
+                    float ws = std::sqrt(wx * wx + wy * wy);
+                    ws_max = std::max(ws_max, ws);
+                }
+                if (count > 0) {
+                    g_ui.pressure_min = p_min;
+                    g_ui.pressure_max = p_max;
+                    g_ui.pressure_mean = p_sum / count;
+                    g_ui.wind_speed_max = ws_max;
+                }
+            }
         }
 
         double frame_start = glfwGetTime();
@@ -2865,100 +2922,8 @@ int main()
             }
         }
 
-        // ---- Atmosphere 3D dispatch ----
-        if (g_ui.atmosphere_enabled) {
-            g_accumulated_atmo_time += dt * g_ui.time_scale;
-
-            Atmo3DPC apc{};
-            apc.dt = std::min(dt, 0.033f) * g_ui.time_scale;
-            apc.accumulated_time = g_accumulated_atmo_time;
-            apc.grid_w = ATMO_W;
-            apc.grid_h = ATMO_H;
-            apc.grid_d = ATMO_D;
-            apc.terrain_scale = bp.cell_spacing;
-            apc.layer_height = ATMO_LAYER_HEIGHT;
-            apc.max_elevation = 2000.0f;
-            apc.orographic_lift_coeff = g_ui.orographic_lift;
-            apc.adiabatic_cooling_rate = g_ui.adiabatic_cooling;
-            apc.rain_shadow_intensity = g_ui.rain_shadow;
-            apc.force_init = (atmo_needs_init || g_ui.request_atmo_reset) ? 1u : 0u;
-            apc.sand_enabled = g_ui.sand_enabled ? 1u : 0u;
-            apc.sand_loft_threshold = g_ui.sand_loft_threshold;
-            apc.sand_loft_rate = g_ui.sand_loft_rate;
-            apc.sand_settling = g_ui.sand_settling;
-
-            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines.atmo_pipeline);
-            vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                pipelines.atmo_pipeline_layout, 0, 1, &atmo_desc_sets[atmo_ping_pong], 0, nullptr);
-            vkCmdPushConstants(frame.cmd, pipelines.atmo_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                0, sizeof(Atmo3DPC), &apc);
-            vkCmdDispatch(frame.cmd, (ATMO_W + 3) / 4, (ATMO_H + 3) / 4, (ATMO_D + 3) / 4);
-
-            // Barrier: atmosphere writes -> SWE reads + fragment reads
-            VkMemoryBarrier2 atmo_bar{};
-            atmo_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            atmo_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            atmo_bar.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
-            atmo_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-            atmo_bar.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-
-            VkDependencyInfo atmo_dep{};
-            atmo_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            atmo_dep.memoryBarrierCount = 1;
-            atmo_dep.pMemoryBarriers = &atmo_bar;
-            vkCmdPipelineBarrier2(frame.cmd, &atmo_dep);
-
-            atmo_ping_pong ^= 1;
-
-            if (atmo_needs_init || g_ui.request_atmo_reset) {
-                atmo_needs_init = false;
-                g_ui.request_atmo_reset = false;
-            }
-        }
-
-        // ---- Sand particle dispatch ----
-        if (g_ui.atmosphere_enabled && g_ui.sand_enabled) {
-            static uint32_t sand_emit_offset = 0;
-
-            SandSimPC spc{};
-            spc.dt = std::min(dt, 0.033f) * g_ui.time_scale;
-            spc.terrain_size = terrain_size;
-            spc.loft_threshold = g_ui.sand_loft_threshold;
-            spc.loft_rate = g_ui.sand_loft_rate;
-            spc.gravity = g_ui.sand_gravity;
-            spc.accumulated_time = g_accumulated_atmo_time;
-            spc.max_particles = SAND_MAX_PARTICLES;
-            spc.emit_offset = sand_emit_offset;
-            spc.emit_count = SAND_EMIT_PER_FRAME;
-            spc.grid_d = ATMO_D;
-            spc.layer_height = ATMO_LAYER_HEIGHT;
-            spc.bounce_energy = g_ui.sand_bounce;
-
-            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines.sand_sim_pipeline);
-            vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                pipelines.sand_sim_pipeline_layout, 0, 1, &sand_sim_desc_sets[atmo_ping_pong], 0, nullptr);
-            vkCmdPushConstants(frame.cmd, pipelines.sand_sim_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-                0, sizeof(SandSimPC), &spc);
-            vkCmdDispatch(frame.cmd, (SAND_MAX_PARTICLES + 63) / 64, 1, 1);
-
-            // Barrier: sand compute -> vertex read
-            VkMemoryBarrier2 sand_bar{};
-            sand_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-            sand_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            sand_bar.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
-            sand_bar.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-            sand_bar.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
-
-            VkDependencyInfo sand_dep{};
-            sand_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            sand_dep.memoryBarrierCount = 1;
-            sand_dep.pMemoryBarriers = &sand_bar;
-            vkCmdPipelineBarrier2(frame.cmd, &sand_dep);
-
-            sand_emit_offset = (sand_emit_offset + SAND_EMIT_PER_FRAME) % SAND_MAX_PARTICLES;
-        }
-
         // ---- SWE step dispatch (CFL sub-stepping) — flat grid, disabled when ocean is on ----
+        // Authority: fastest phenomenon — water responds to brush edits immediately
         if (!g_ui.ocean_enabled) {
             vkCmdResetQueryPool(frame.cmd, renderer.query_pool, current_frame * 2, 2);
 
@@ -3002,7 +2967,7 @@ int main()
                 swe_pc.dx = bp.cell_spacing;
                 swe_pc.sea_level = bp.floor_height + bp.initial_water;
                 swe_pc.damping = g_ui.damping;
-                swe_pc._pad0 = 0.0f;
+                swe_pc.k_rain = 0.0f;
                 swe_pc.grid_w = SWE_GRID_W;
                 swe_pc.grid_h = SWE_GRID_H;
 
@@ -3037,7 +3002,76 @@ int main()
                                 renderer.query_pool, current_frame * 2 + 1);
         }
 
-        // ---- Erosion dispatch (after SWE, before graphics) ----
+        // ---- Atmosphere 3D dispatch ----
+        // Authority: slower phenomenon — reads terrain + water state, computes pressure/wind/rain
+        if (g_ui.atmosphere_enabled) {
+            g_accumulated_atmo_time += dt * g_ui.time_scale;
+
+            Atmo3DPC apc{};
+            apc.dt = std::min(dt, 0.033f) * g_ui.time_scale;
+            apc.accumulated_time = g_accumulated_atmo_time;
+            apc.grid_w = ATMO_W;
+            apc.grid_h = ATMO_H;
+            apc.grid_d = ATMO_D;
+            apc.terrain_scale = bp.cell_spacing;
+            apc.layer_height = ATMO_LAYER_HEIGHT;
+            apc.max_elevation = 2000.0f;
+            apc.orographic_lift_coeff = g_ui.orographic_lift;
+            apc.adiabatic_cooling_rate = g_ui.adiabatic_cooling;
+            apc.rain_shadow_intensity = g_ui.rain_shadow;
+            apc.force_init = (atmo_needs_init || g_ui.request_atmo_reset) ? 1u : 0u;
+            apc.k_pressure = g_ui.k_pressure;
+            apc.wind_strength = 1.0f;
+            apc.k_evaporation = 0.0f;
+
+            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines.atmo_pipeline);
+            vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipelines.atmo_pipeline_layout, 0, 1, &atmo_desc_sets[atmo_ping_pong], 0, nullptr);
+            vkCmdPushConstants(frame.cmd, pipelines.atmo_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                0, sizeof(Atmo3DPC), &apc);
+            vkCmdDispatch(frame.cmd, (ATMO_W + 3) / 4, (ATMO_H + 3) / 4, (ATMO_D + 3) / 4);
+
+            // Barrier: atmosphere writes -> erosion reads + fragment reads
+            VkMemoryBarrier2 atmo_bar{};
+            atmo_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            atmo_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            atmo_bar.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+            atmo_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            atmo_bar.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+
+            VkDependencyInfo atmo_dep{};
+            atmo_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            atmo_dep.memoryBarrierCount = 1;
+            atmo_dep.pMemoryBarriers = &atmo_bar;
+            vkCmdPipelineBarrier2(frame.cmd, &atmo_dep);
+
+            // Copy bottom layer of wind field for CPU pressure debug readback
+            {
+                SweImage& wind_src = (atmo_ping_pong == 0) ? wind_field_b : wind_field_a;
+                VkBufferImageCopy2 region{};
+                region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
+                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                region.imageExtent = {ATMO_W, ATMO_H, 1};
+                VkCopyImageToBufferInfo2 copy{};
+                copy.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2;
+                copy.srcImage = wind_src.image;
+                copy.srcImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                copy.dstBuffer = atmo_debug_buf;
+                copy.regionCount = 1;
+                copy.pRegions = &region;
+                vkCmdCopyImageToBuffer2(frame.cmd, &copy);
+            }
+
+            atmo_ping_pong ^= 1;
+
+            if (atmo_needs_init || g_ui.request_atmo_reset) {
+                atmo_needs_init = false;
+                g_ui.request_atmo_reset = false;
+            }
+        }
+
+        // ---- Erosion dispatch (after SWE + atmosphere) ----
+        // Authority: geological timescale — reads water flow + ground conditions
         if (g_ui.erosion_enabled) {
             VkMemoryBarrier2 swe_to_ero{};
             swe_to_ero.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
@@ -3068,6 +3102,9 @@ int main()
             ero_pc.min_depth = g_ui.min_erosion_depth;
             ero_pc.max_change = g_ui.max_change_m;
             ero_pc.max_sediment = g_ui.max_sediment;
+            ero_pc.k_wind = 0.0f;
+            ero_pc.k_thermal = 0.0f;
+            ero_pc.wind_threshold = 1.0f;
 
             vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines.erosion_pipeline);
             vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -3078,6 +3115,48 @@ int main()
             vkCmdDispatch(frame.cmd, (SWE_GRID_W + 15) / 16, (SWE_GRID_H + 15) / 16, 1);
 
             sediment_ping_pong ^= 1;
+        }
+
+        // ---- Sand particle dispatch (consumer — after all authority systems) ----
+        if (g_ui.atmosphere_enabled && g_ui.sand_enabled) {
+            static uint32_t sand_emit_offset = 0;
+
+            SandSimPC spc{};
+            spc.dt = std::min(dt, 0.033f) * g_ui.time_scale;
+            spc.terrain_size = terrain_size;
+            spc.loft_threshold = g_ui.sand_loft_threshold;
+            spc.loft_rate = g_ui.sand_loft_rate;
+            spc.gravity = g_ui.sand_gravity;
+            spc.accumulated_time = g_accumulated_atmo_time;
+            spc.max_particles = SAND_MAX_PARTICLES;
+            spc.emit_offset = sand_emit_offset;
+            spc.emit_count = SAND_EMIT_PER_FRAME;
+            spc.grid_d = ATMO_D;
+            spc.layer_height = ATMO_LAYER_HEIGHT;
+            spc.bounce_energy = g_ui.sand_bounce;
+
+            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines.sand_sim_pipeline);
+            vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipelines.sand_sim_pipeline_layout, 0, 1, &sand_sim_desc_sets[atmo_ping_pong], 0, nullptr);
+            vkCmdPushConstants(frame.cmd, pipelines.sand_sim_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                0, sizeof(SandSimPC), &spc);
+            vkCmdDispatch(frame.cmd, (SAND_MAX_PARTICLES + 63) / 64, 1, 1);
+
+            // Barrier: sand compute -> vertex read
+            VkMemoryBarrier2 sand_bar{};
+            sand_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            sand_bar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            sand_bar.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+            sand_bar.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+            sand_bar.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+
+            VkDependencyInfo sand_dep{};
+            sand_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            sand_dep.memoryBarrierCount = 1;
+            sand_dep.pMemoryBarriers = &sand_bar;
+            vkCmdPipelineBarrier2(frame.cmd, &sand_dep);
+
+            sand_emit_offset = (sand_emit_offset + SAND_EMIT_PER_FRAME) % SAND_MAX_PARTICLES;
         }
 
         // ---- Barrier: compute -> graphics rendering ----

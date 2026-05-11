@@ -1,6 +1,6 @@
 # bestiary — shared library for species/morphology/phenotype code.
 #
-# Links into both apps/species_lab and (eventually) apps/drift_engine when
+# Links into both apps/plant_lab and (eventually) apps/drift_engine when
 # the planet engine starts using it. v0.0.1: just the clump morphology stub.
 
 add_library(bestiary STATIC
@@ -8,6 +8,19 @@ add_library(bestiary STATIC
     morphology/bush.cpp
     morphology/tree.cpp
     morphology/lplant.cpp
+    creature/herbivore.cpp
+    creature/vegetation_field.cpp
+    creature/creature_mesh.cpp
+    skeleton/skeleton.cpp
+    skeleton/animation.cpp
+    skeleton/skinning.cpp
+    animals/animal_mesh.cpp
+    animals/herbivore.cpp
+    animals/predator.cpp
+    animals/rabbit.cpp
+    animals/walks/herbivore_walk.cpp
+    animals/walks/predator_walk.cpp
+    animals/walks/rabbit_walk.cpp
     species_file.cpp
     environment.cpp
     distribution.cpp
