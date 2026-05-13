@@ -2,6 +2,7 @@
 
 #include <toml++/toml.hpp>
 #include <fstream>
+#include <set>
 #include <cstdio>
 #include <cstring>
 
@@ -41,7 +42,8 @@ static std::string fmt(float v)
 bool save_clump(const std::filesystem::path& path,
                 const ClumpParams& params,
                 const std::string& name,
-                const ClumpExpression* expr)
+                const ClumpExpression* expr,
+                const char* kind_override)
 {
     std::ofstream out(path);
     if (!out.is_open()) {
@@ -49,8 +51,9 @@ bool save_clump(const std::filesystem::path& path,
         return false;
     }
 
+    const char* kind = kind_override ? kind_override : "grass_clump";
     out << "[species]\n"
-        << "kind = 'grass_clump'\n"
+        << "kind = '" << kind << "'\n"
         << "name = '" << name << "'\n"
         << "\n"
         << "[morphology]\n"
@@ -750,12 +753,18 @@ bool save_creature(const std::filesystem::path& path,
         << "hunger_threshold = " << fmt(profile.hunger_threshold) << "\n"
         << "starve_threshold = " << fmt(profile.starve_threshold) << "\n"
         << "trophic_efficiency = " << fmt(profile.trophic_efficiency) << "\n"
+        << "max_age = " << fmt(profile.max_age) << "\n"
         << "\n"
         << "[grazing]\n"
-        << "graze_radius = "      << fmt(profile.graze_radius)      << "\n"
-        << "graze_consume = "     << fmt(profile.graze_consume)     << "\n"
-        << "graze_min_health = " << fmt(profile.graze_min_health) << "\n"
-        << "graze_duration = "    << fmt(profile.graze_duration)    << "\n"
+        << "graze_radius = "              << fmt(profile.graze_radius)              << "\n"
+        << "graze_consume = "             << fmt(profile.graze_consume)             << "\n"
+        << "graze_min_health = "          << fmt(profile.graze_min_health)          << "\n"
+        << "graze_duration = "            << fmt(profile.graze_duration)            << "\n"
+        << "grass_caloric_value = "       << fmt(profile.grass_caloric_value)       << "\n"
+        << "bush_caloric_value = "        << fmt(profile.bush_caloric_value)        << "\n"
+        << "tree_caloric_value = "        << fmt(profile.tree_caloric_value)        << "\n"
+        << "reed_caloric_value = "        << fmt(profile.reed_caloric_value)        << "\n"
+        << "wildflower_caloric_value = "  << fmt(profile.wildflower_caloric_value)  << "\n"
         << "\n"
         << "[wander]\n"
         << "wander_radius = " << fmt(profile.wander_radius) << "\n"
@@ -763,16 +772,57 @@ bool save_creature(const std::filesystem::path& path,
         << "\n"
         << "[flee]\n"
         << "flee_radius = "   << fmt(profile.flee_radius)   << "\n"
-        << "flee_duration = " << fmt(profile.flee_duration) << "\n";
+        << "flee_duration = " << fmt(profile.flee_duration) << "\n"
+        << "\n"
+        << "[herding]\n"
+        << "herd_radius = "       << fmt(profile.herd_radius)       << "\n"
+        << "herd_weight = "       << fmt(profile.herd_weight)       << "\n"
+        << "separation_radius = " << fmt(profile.separation_radius) << "\n"
+        << "separation_weight = " << fmt(profile.separation_weight) << "\n"
+        << "alignment_weight = "  << fmt(profile.alignment_weight)  << "\n"
+        << "\n"
+        << "[reproduction]\n"
+        << "reproduce_threshold = " << fmt(profile.reproduce_threshold) << "\n"
+        << "reproduce_cost = "      << fmt(profile.reproduce_cost)      << "\n"
+        << "reproduce_cooldown = "  << fmt(profile.reproduce_cooldown)  << "\n"
+        << "offspring_energy = "    << fmt(profile.offspring_energy)     << "\n"
+        << "mate_search_radius = "  << fmt(profile.mate_search_radius)  << "\n"
+        << "\n"
+        << "[terrain]\n"
+        << "water_avoidance = "  << fmt(profile.water_avoidance)  << "\n"
+        << "max_slope = "        << fmt(profile.max_slope)        << "\n"
+        << "slope_cost_factor = " << fmt(profile.slope_cost_factor) << "\n"
+        << "\n"
+        << "[drinking]\n"
+        << "drink_radius = " << fmt(profile.drink_radius) << "\n"
+        << "drink_rate = "   << fmt(profile.drink_rate)   << "\n";
 
-    if (profile.archetype == Archetype::Predator) {
+    bool is_pred = (profile.archetype == Archetype::Predator
+                 || profile.archetype == Archetype::Raptor
+                 || profile.archetype == Archetype::Snake);
+    if (is_pred) {
         out << "\n[hunting]\n"
             << "hunt_radius = "      << fmt(profile.hunt_radius)      << "\n"
             << "chase_speed = "      << fmt(profile.chase_speed)      << "\n"
             << "attack_range = "     << fmt(profile.attack_range)     << "\n"
             << "kill_energy_gain = " << fmt(profile.kill_energy_gain) << "\n"
             << "stalk_speed = "      << fmt(profile.stalk_speed)      << "\n"
-            << "consume_duration = " << fmt(profile.consume_duration) << "\n";
+            << "consume_duration = " << fmt(profile.consume_duration) << "\n"
+            << "max_prey_mass = "    << fmt(profile.max_prey_mass)    << "\n";
+    }
+
+    if (profile.can_fly) {
+        out << "\n[flight]\n"
+            << "fly_altitude = "        << fmt(profile.fly_altitude)        << "\n"
+            << "takeoff_speed = "       << fmt(profile.takeoff_speed)       << "\n"
+            << "landing_speed = "       << fmt(profile.landing_speed)       << "\n"
+            << "altitude_wander_amp = " << fmt(profile.altitude_wander_amp) << "\n";
+    }
+
+    if (profile.seed_disperser) {
+        out << "\n[seed_dispersal]\n"
+            << "seed_drop_probability = " << fmt(profile.seed_drop_probability) << "\n"
+            << "seed_kind = "             << profile.seed_kind                  << "\n";
     }
 
     return true;
@@ -814,11 +864,17 @@ bool load_creature(const std::filesystem::path& path,
     f("energy", "hunger_threshold",  profile.hunger_threshold);
     f("energy", "starve_threshold",  profile.starve_threshold);
     f("energy", "trophic_efficiency", profile.trophic_efficiency);
+    f("energy", "max_age",           profile.max_age);
 
-    f("grazing", "graze_radius",      profile.graze_radius);
-    f("grazing", "graze_consume",     profile.graze_consume);
-    f("grazing", "graze_min_health", profile.graze_min_health);
-    f("grazing", "graze_duration",    profile.graze_duration);
+    f("grazing", "graze_radius",              profile.graze_radius);
+    f("grazing", "graze_consume",             profile.graze_consume);
+    f("grazing", "graze_min_health",          profile.graze_min_health);
+    f("grazing", "graze_duration",            profile.graze_duration);
+    f("grazing", "grass_caloric_value",       profile.grass_caloric_value);
+    f("grazing", "bush_caloric_value",        profile.bush_caloric_value);
+    f("grazing", "tree_caloric_value",        profile.tree_caloric_value);
+    f("grazing", "reed_caloric_value",        profile.reed_caloric_value);
+    f("grazing", "wildflower_caloric_value",  profile.wildflower_caloric_value);
 
     f("wander", "wander_radius", profile.wander_radius);
     f("wander", "wander_jitter", profile.wander_jitter);
@@ -826,16 +882,187 @@ bool load_creature(const std::filesystem::path& path,
     f("flee", "flee_radius",   profile.flee_radius);
     f("flee", "flee_duration", profile.flee_duration);
 
-    if (profile.archetype == Archetype::Predator) {
+    f("herding", "herd_radius",       profile.herd_radius);
+    f("herding", "herd_weight",       profile.herd_weight);
+    f("herding", "separation_radius", profile.separation_radius);
+    f("herding", "separation_weight", profile.separation_weight);
+    f("herding", "alignment_weight",  profile.alignment_weight);
+
+    f("reproduction", "reproduce_threshold", profile.reproduce_threshold);
+    f("reproduction", "reproduce_cost",      profile.reproduce_cost);
+    f("reproduction", "reproduce_cooldown",  profile.reproduce_cooldown);
+    f("reproduction", "offspring_energy",     profile.offspring_energy);
+    f("reproduction", "mate_search_radius",  profile.mate_search_radius);
+
+    f("terrain", "water_avoidance",  profile.water_avoidance);
+    f("terrain", "max_slope",        profile.max_slope);
+    f("terrain", "slope_cost_factor", profile.slope_cost_factor);
+
+    f("drinking", "drink_radius", profile.drink_radius);
+    f("drinking", "drink_rate",   profile.drink_rate);
+
+    if (tbl["hunting"].as_table()) {
         f("hunting", "hunt_radius",      profile.hunt_radius);
         f("hunting", "chase_speed",      profile.chase_speed);
         f("hunting", "attack_range",     profile.attack_range);
         f("hunting", "kill_energy_gain", profile.kill_energy_gain);
         f("hunting", "stalk_speed",      profile.stalk_speed);
         f("hunting", "consume_duration", profile.consume_duration);
+        f("hunting", "max_prey_mass",    profile.max_prey_mass);
+    }
+
+    if (tbl["flight"].as_table()) {
+        profile.can_fly = true;
+        f("flight", "fly_altitude",        profile.fly_altitude);
+        f("flight", "takeoff_speed",       profile.takeoff_speed);
+        f("flight", "landing_speed",       profile.landing_speed);
+        f("flight", "altitude_wander_amp", profile.altitude_wander_amp);
+    }
+
+    if (tbl["seed_dispersal"].as_table()) {
+        profile.seed_disperser = true;
+        f("seed_dispersal", "seed_drop_probability", profile.seed_drop_probability);
+        if (auto v = tbl["seed_dispersal"]["seed_kind"].value<int>())
+            profile.seed_kind = *v;
     }
 
     return true;
+}
+
+bool save_wildflower(const std::filesystem::path& path,
+                     const WildflowerParams& params,
+                     const std::string& name,
+                     const WildflowerExpression* expr)
+{
+    std::ofstream out(path);
+    if (!out.is_open()) return false;
+
+    out << "[species]\n"
+        << "kind = 'wildflower'\n"
+        << "name = '" << name << "'\n"
+        << "\n"
+        << "[morphology]\n"
+        << "flower_count = "  << params.flower_count << "\n"
+        << "stem_height = "   << fmt(params.stem_height) << "\n"
+        << "stem_width = "    << fmt(params.stem_width)  << "\n"
+        << "petal_radius = "  << fmt(params.petal_radius) << "\n"
+        << "petal_count = "   << params.petal_count << "\n"
+        << "clump_radius = "  << fmt(params.clump_radius) << "\n"
+        << "\n"
+        << "[appearance]\n"
+        << "petal_color = [" << fmt(params.petal_color[0]) << ", "
+                             << fmt(params.petal_color[1]) << ", "
+                             << fmt(params.petal_color[2]) << "]\n"
+        << "stem_color = ["  << fmt(params.stem_color[0]) << ", "
+                             << fmt(params.stem_color[1]) << ", "
+                             << fmt(params.stem_color[2]) << "]\n";
+
+    if (expr) {
+        auto write_range = [&](const char* field, const ParamRange& r) {
+            if (r.enabled)
+                out << "\n[expression." << field << "]\n"
+                    << "low = " << fmt(r.low) << "\nhigh = " << fmt(r.high) << "\n";
+        };
+        write_range("flower_count",  expr->flower_count);
+        write_range("stem_height",   expr->stem_height);
+        write_range("petal_radius",  expr->petal_radius);
+        write_range("clump_radius",  expr->clump_radius);
+
+        if (expr->vary_color)
+            out << "\n[expression.color]\n"
+                << "dry = [" << fmt(expr->dry_color[0]) << ", "
+                             << fmt(expr->dry_color[1]) << ", "
+                             << fmt(expr->dry_color[2]) << "]\n"
+                << "wet = [" << fmt(expr->wet_color[0]) << ", "
+                             << fmt(expr->wet_color[1]) << ", "
+                             << fmt(expr->wet_color[2]) << "]\n";
+    }
+    return out.good();
+}
+
+bool load_wildflower(const std::filesystem::path& path,
+                     WildflowerParams& params,
+                     std::string& name,
+                     WildflowerExpression* expr)
+{
+    auto tbl = parse_toml(path);
+    if (tbl.empty()) return false;
+
+    if (auto v = tbl["species"]["name"].value<std::string>()) name = *v;
+
+    if (auto m = tbl["morphology"].as_table()) {
+        if (auto v = (*m)["flower_count"].value<int>())      params.flower_count  = *v;
+        if (auto v = (*m)["stem_height"].value<double>())    params.stem_height   = static_cast<float>(*v);
+        if (auto v = (*m)["stem_width"].value<double>())     params.stem_width    = static_cast<float>(*v);
+        if (auto v = (*m)["petal_radius"].value<double>())   params.petal_radius  = static_cast<float>(*v);
+        if (auto v = (*m)["petal_count"].value<int>())       params.petal_count   = *v;
+        if (auto v = (*m)["clump_radius"].value<double>())   params.clump_radius  = static_cast<float>(*v);
+    }
+
+    auto read_color = [&](const char* key, float color[3]) {
+        if (auto arr = tbl["appearance"][key].as_array(); arr && arr->size() >= 3)
+            for (int i = 0; i < 3; ++i)
+                if (auto v = (*arr)[static_cast<size_t>(i)].value<double>())
+                    color[i] = static_cast<float>(*v);
+    };
+    read_color("petal_color", params.petal_color);
+    read_color("stem_color",  params.stem_color);
+
+    if (expr) {
+        *expr = WildflowerExpression{};
+        auto read_range = [&](const char* field, ParamRange& r) {
+            if (auto t = tbl["expression"][field].as_table()) {
+                r.enabled = true;
+                if (auto v = (*t)["low"].value<double>())  r.low  = static_cast<float>(*v);
+                if (auto v = (*t)["high"].value<double>()) r.high = static_cast<float>(*v);
+            }
+        };
+        read_range("flower_count",  expr->flower_count);
+        read_range("stem_height",   expr->stem_height);
+        read_range("petal_radius",  expr->petal_radius);
+        read_range("clump_radius",  expr->clump_radius);
+
+        if (auto t = tbl["expression"]["color"].as_table()) {
+            expr->vary_color = true;
+            if (auto arr = (*t)["dry"].as_array(); arr && arr->size() >= 3)
+                for (int i = 0; i < 3; ++i)
+                    if (auto v = (*arr)[static_cast<size_t>(i)].value<double>())
+                        expr->dry_color[i] = static_cast<float>(*v);
+            if (auto arr = (*t)["wet"].as_array(); arr && arr->size() >= 3)
+                for (int i = 0; i < 3; ++i)
+                    if (auto v = (*arr)[static_cast<size_t>(i)].value<double>())
+                        expr->wet_color[i] = static_cast<float>(*v);
+        }
+    }
+    return true;
+}
+
+std::vector<NamedCreatureProfile> load_creature_dir(const std::filesystem::path& dir)
+{
+    std::vector<NamedCreatureProfile> result;
+    if (!std::filesystem::is_directory(dir)) return result;
+
+    static const std::set<std::string> creature_kinds = {
+        "herbivore", "predator", "rabbit", "bird", "raptor", "snake"
+    };
+
+    for (auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() != ".toml") continue;
+
+        std::string kind = detect_species_kind(entry.path());
+        if (creature_kinds.find(kind) == creature_kinds.end()) continue;
+
+        NamedCreatureProfile ncp{};
+        if (load_creature(entry.path(), ncp.profile, ncp.name)) {
+            std::fprintf(stderr, "Loaded creature: %s (%s) from %s\n",
+                         ncp.name.c_str(), kind.c_str(),
+                         entry.path().filename().string().c_str());
+            result.push_back(std::move(ncp));
+        }
+    }
+
+    return result;
 }
 
 // -----------------------------------------------------------------------

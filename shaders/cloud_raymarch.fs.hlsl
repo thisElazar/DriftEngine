@@ -12,11 +12,9 @@
     float4x4 inv_view_proj;
 };
 
-[[vk::combinedImageSampler]][[vk::binding(1, 0)]] Texture2D<float>  heightmap;
-[[vk::combinedImageSampler]][[vk::binding(1, 0)]] SamplerState      hm_sampler;
-
-[[vk::combinedImageSampler]][[vk::binding(5, 0)]] Texture3D<float4> cloud_vol;
-[[vk::combinedImageSampler]][[vk::binding(5, 0)]] SamplerState      vol_sampler;
+[[vk::binding(1, 0)]] Texture2D<float>  heightmap;
+[[vk::binding(5, 0)]] Texture3D<float4> cloud_vol;
+[[vk::binding(8, 0)]] SamplerState tex_sampler;
 
 [[vk::push_constant]]
 cbuffer RaymarchPC {
@@ -45,7 +43,7 @@ float get_terrain_height(float3 p)
     float2 uv = world_to_uv(p);
     if (uv.x < 0 || uv.x > 1 || uv.y < 0 || uv.y > 1)
         return 0;
-    return heightmap.SampleLevel(hm_sampler, uv, 0).r;
+    return heightmap.SampleLevel(tex_sampler, uv, 0).r;
 }
 
 float3 world_to_vol_uvw(float3 p)
@@ -118,7 +116,7 @@ float4 main(PSInput input) : SV_Target
         if (uvw.z < 0.0 || uvw.z > 1.0)
             continue;
 
-        float4 sample_val = cloud_vol.SampleLevel(vol_sampler, uvw, 0);
+        float4 sample_val = cloud_vol.SampleLevel(tex_sampler, uvw, 0);
         float density = sample_val.r * cloud_opacity;
         if (density < 0.001)
             continue;
@@ -135,7 +133,7 @@ float4 main(PSInput input) : SV_Target
             float3 sp = pos + light_dir * sun_step * float(s);
             float3 suvw = world_to_vol_uvw(sp);
             if (suvw.z >= 0.0 && suvw.z <= 1.0) {
-                float sd = cloud_vol.SampleLevel(vol_sampler, suvw, 0).r;
+                float sd = cloud_vol.SampleLevel(tex_sampler, suvw, 0).r;
                 sun_transmit *= exp(-sd * EXTINCTION * sun_step * cloud_opacity * 0.5);
             }
         }

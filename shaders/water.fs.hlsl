@@ -8,12 +8,10 @@
     float4 brush_color;
 };
 
-[[vk::combinedImageSampler]][[vk::binding(2, 0)]] Texture2D<float4> swe_output;
-[[vk::combinedImageSampler]][[vk::binding(2, 0)]] SamplerState swe_sampler;
-[[vk::combinedImageSampler]][[vk::binding(3, 0)]] Texture2D<float> sediment_tex;
-[[vk::combinedImageSampler]][[vk::binding(3, 0)]] SamplerState sediment_sampler;
-[[vk::combinedImageSampler]][[vk::binding(4, 0)]] Texture2D<float4> atmo_render;
-[[vk::combinedImageSampler]][[vk::binding(4, 0)]] SamplerState atmo_sampler;
+[[vk::binding(2, 0)]] Texture2D<float4> swe_output;
+[[vk::binding(3, 0)]] Texture2D<float> sediment_tex;
+[[vk::binding(4, 0)]] Texture2D<float4> atmo_render;
+[[vk::binding(8, 0)]] SamplerState tex_sampler;
 
 [[vk::push_constant]]
 cbuffer PushConstants {
@@ -41,7 +39,7 @@ float4 main(PSInput input) : SV_Target
 {
     if (input.depth < 0.05) discard;
 
-    float4 swe = swe_output.SampleLevel(swe_sampler, input.uv, 0);
+    float4 swe = swe_output.SampleLevel(tex_sampler, input.uv, 0);
     float depth = max(swe.r - (input.world_pos.y - input.depth), 0.0);
     float foam = saturate(swe.a);
     if (depth < 0.05) discard;
@@ -51,7 +49,7 @@ float4 main(PSInput input) : SV_Target
     float3 L = normalize(sun_dir);
     float3 R = reflect(-V, N);
 
-    float sed = sediment_tex.SampleLevel(sediment_sampler, input.uv, 0);
+    float sed = sediment_tex.SampleLevel(tex_sampler, input.uv, 0);
     float3 mud_color = float3(0.45, 0.30, 0.18);
     float mud_blend = saturate(sed * mud_visibility);
 
@@ -89,7 +87,7 @@ float4 main(PSInput input) : SV_Target
         color = lerp(color, brush_color.rgb, saturate(ring) * 0.85);
     }
 
-    float cloud_shadow = atmo_render.SampleLevel(atmo_sampler, input.uv, 0).r;
+    float cloud_shadow = atmo_render.SampleLevel(tex_sampler, input.uv, 0).r;
     float shadow = 1.0 - saturate(cloud_shadow * cloud_opacity) * 0.6;
     color *= shadow;
 

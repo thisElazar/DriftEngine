@@ -78,9 +78,20 @@ VegetationMesh generate_ecosystem(
 struct PlantInstance {
     float    x, z;
     int      kind;      // 0=grass, 1=bush, 2=tree, 3=reed, 4=wildflower
-    float    health;    // 0..1, drives visual scale; 0 = dead
+    float    health;    // 0..1; 0 = dead
     uint32_t seed;
 };
+
+// Flat per-instance data uploaded to the GPU for instanced plant rendering.
+struct PlantGPUInstance {
+    float    x, y, z;   // world position; y = terrain height, filled by caller
+    float    health;
+    uint32_t seed;
+};
+
+void collect_plant_instances(const std::vector<PlantInstance>& plants,
+                              int kind,
+                              std::vector<PlantGPUInstance>& out);
 
 std::vector<PlantInstance> place_ecosystem(
     const EcosystemParams& eco,

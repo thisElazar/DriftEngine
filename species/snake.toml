@@ -1,0 +1,73 @@
+[species]
+kind = 'snake'
+name = 'snake'
+
+[body]
+body_length = 1.0
+body_height = 0.05
+body_color = [0.40, 0.35, 0.20]
+
+[locomotion]
+move_speed = 1.0
+run_speed = 3.0
+turn_rate = 4.0
+
+[energy]
+body_mass = 1.5
+basal_rate = 0.0008
+locomotion_cost = 0.0004
+hunger_threshold = 0.40
+starve_threshold = 0.0
+trophic_efficiency = 0.10
+max_age = 1800.0
+
+[grazing]
+graze_radius = 3.0
+graze_consume = 0.15
+graze_min_health = 0.15
+graze_duration = 3.0
+grass_caloric_value = 0.6
+bush_caloric_value = 1.0
+tree_caloric_value = 0.3
+reed_caloric_value = 0.5
+wildflower_caloric_value = 0.8
+
+[wander]
+wander_radius = 8.0
+wander_jitter = 2.0
+
+[flee]
+flee_radius = 15.0
+flee_duration = 4.0
+
+[herding]
+herd_radius = 0.0
+herd_weight = 0.0
+separation_radius = 2.0
+separation_weight = 0.5
+alignment_weight = 0.2
+
+[reproduction]
+reproduce_threshold = 0.85
+reproduce_cost = 0.25
+reproduce_cooldown = 120.0
+offspring_energy = 0.35
+mate_search_radius = 20.0
+
+[terrain]
+water_avoidance = 3.0
+max_slope = 1.2
+slope_cost_factor = 0.5
+
+[drinking]
+drink_radius = 2.0
+drink_rate = 0.008
+
+[hunting]
+hunt_radius = 8.0
+chase_speed = 4.0
+attack_range = 0.8
+kill_energy_gain = 0.90
+stalk_speed = 0.0
+consume_duration = 6.0
+max_prey_mass = 5.0

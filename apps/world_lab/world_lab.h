@@ -124,6 +124,9 @@ struct WL_GraphState {
     float pop_browser[WL_GRAPH_HISTORY]  = {};
     float pop_wolf[WL_GRAPH_HISTORY]     = {};
     float pop_rabbit[WL_GRAPH_HISTORY]   = {};
+    float pop_bird[WL_GRAPH_HISTORY]     = {};
+    float pop_raptor[WL_GRAPH_HISTORY]   = {};
+    float pop_snake[WL_GRAPH_HISTORY]    = {};
     float pop_total[WL_GRAPH_HISTORY]    = {};
     float energy_avg[WL_GRAPH_HISTORY]   = {};
     float energy_min[WL_GRAPH_HISTORY]   = {};
@@ -136,6 +139,7 @@ struct WL_GraphState {
 struct WorldLabState {
     bool embedded     = false;  // true when driven by launcher (shows Back button)
     bool initialized  = false;
+    bool preview_mode = false;  // auto-orbit, no ImGui, simulation runs autonomously
 
     // --- GPU terrain / heightmap ---
     HeightmapData hm_data{};
@@ -187,6 +191,7 @@ struct WorldLabState {
     // --- Graphics pipelines ---
     WL_TerrainPipeline pipe_terrain{};
     WL_ClumpPipeline   pipe_clump{};
+    WL_ClumpPipeline   pipe_creature{};
     WL_CloudPipeline   pipe_cloud{};
 
     // --- Camera UBO ---
@@ -197,8 +202,10 @@ struct WorldLabState {
     // --- Terrain mesh ---
     StaticGridMesh terrain_mesh{};
 
-    // --- Plant mesh ---
-    WL_PlantMesh plants{};
+    // --- Plant rendering (instanced) ---
+    WL_PlantMesh plant_canonical[bestiary::PLANT_KIND_COUNT]{};  // static, built once
+    GpuBuffer    plant_inst[bestiary::PLANT_KIND_COUNT]{};        // per-kind instance buffers
+    uint32_t     plant_inst_count[bestiary::PLANT_KIND_COUNT]{};
 
     // --- Camera ---
     OrbitCamera camera{};

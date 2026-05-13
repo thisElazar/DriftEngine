@@ -1,6 +1,7 @@
 #include "distribution.h"
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 #include <vector>
 
 namespace bestiary {
@@ -457,6 +458,16 @@ void tick_plant_population(
         plants.end());
 }
 
+void collect_plant_instances(const std::vector<PlantInstance>& plants,
+                              int kind,
+                              std::vector<PlantGPUInstance>& out)
+{
+    out.clear();
+    for (const auto& p : plants)
+        if (p.kind == kind && p.health > 0.0f)
+            out.push_back({p.x, 0.0f, p.z, p.health, p.seed});
+}
+
 void sprout_plants(
     std::vector<PlantInstance>& plants,
     const EcosystemParams& eco,
@@ -467,6 +478,22 @@ void sprout_plants(
     float half = eco.region_size * 0.5f;
     float min_dist2 = eco.r_min * eco.r_min;
     constexpr float pi = 3.14159265f;
+
+    // Spatial grid for O(1) minimum-distance checks.
+    // Cell size = r_min so only a 3x3 neighborhood needs checking.
+    float cell = eco.r_min;
+    int grid_w = static_cast<int>(std::ceil(eco.region_size / cell)) + 2;
+    auto cell_of = [&](float px, float pz) -> std::pair<int,int> {
+        int ix = static_cast<int>((px + half) / cell);
+        int iz = static_cast<int>((pz + half) / cell);
+        return {std::clamp(ix, 0, grid_w - 1), std::clamp(iz, 0, grid_w - 1)};
+    };
+    std::unordered_map<int, std::vector<uint32_t>> grid;
+    grid.reserve(plants.size() * 2);
+    for (uint32_t i = 0; i < static_cast<uint32_t>(plants.size()); ++i) {
+        auto [ix, iz] = cell_of(plants[i].x, plants[i].z);
+        grid[iz * grid_w + ix].push_back(i);
+    }
 
     // Index existing plants by kind for parent selection
     std::vector<size_t> kind_idx[PLANT_KIND_COUNT];
@@ -536,19 +563,28 @@ void sprout_plants(
         if (!suit) continue;
         if (compute_suitability(*suit, sample) < 0.3f) continue;
 
+        // Spatial grid neighborhood check (3x3 cells)
+        auto [cx, cz] = cell_of(x, z);
         bool too_close = false;
-        for (const auto& p : plants) {
-            float dx = p.x - x;
-            float dz = p.z - z;
-            if (dx * dx + dz * dz < min_dist2) {
-                too_close = true;
-                break;
+        for (int dr = -1; dr <= 1 && !too_close; ++dr) {
+            for (int dc = -1; dc <= 1 && !too_close; ++dc) {
+                int nr = cz + dr, nc = cx + dc;
+                if (nc < 0 || nc >= grid_w || nr < 0 || nr >= grid_w) continue;
+                auto it = grid.find(nr * grid_w + nc);
+                if (it == grid.end()) continue;
+                for (uint32_t pi : it->second) {
+                    float fdx = plants[pi].x - x;
+                    float fdz = plants[pi].z - z;
+                    if (fdx * fdx + fdz * fdz < min_dist2) { too_close = true; break; }
+                }
             }
         }
         if (too_close) continue;
 
         uint32_t pt_seed = dhash(s ^ 0x12345678u);
         plants.push_back({x, z, kind, 0.01f, pt_seed});
+        auto [ax, az] = cell_of(x, z);
+        grid[az * grid_w + ax].push_back(static_cast<uint32_t>(plants.size() - 1));
         ++sprouted;
     }
 }

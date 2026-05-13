@@ -16,4 +16,6 @@ VegetationMesh generate_creature_meshes(
     std::function<float(float x, float z)> terrain_height,
     float dt = 0.016f);
 
+void clear_creature_mesh_cache();
+
 } // namespace bestiary

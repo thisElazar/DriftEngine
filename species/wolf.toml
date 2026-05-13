@@ -1,0 +1,73 @@
+[species]
+kind = 'predator'
+name = 'wolf'
+
+[body]
+body_length = 1.0
+body_height = 0.75
+body_color = [0.45, 0.42, 0.38]
+
+[locomotion]
+move_speed = 2.5
+run_speed = 7.0
+turn_rate = 4.0
+
+[energy]
+body_mass = 35.0
+basal_rate = 0.0010
+locomotion_cost = 0.0003
+hunger_threshold = 0.5
+starve_threshold = 0.0
+trophic_efficiency = 0.10
+max_age = 1200.0
+
+[grazing]
+graze_radius = 3.0
+graze_consume = 0.15
+graze_min_health = 0.15
+graze_duration = 3.0
+grass_caloric_value = 0.6
+bush_caloric_value = 1.0
+tree_caloric_value = 0.3
+reed_caloric_value = 0.5
+wildflower_caloric_value = 0.8
+
+[wander]
+wander_radius = 8.0
+wander_jitter = 2.0
+
+[flee]
+flee_radius = 15.0
+flee_duration = 4.0
+
+[herding]
+herd_radius = 15.0
+herd_weight = 0.2
+separation_radius = 3.0
+separation_weight = 0.5
+alignment_weight = 0.2
+
+[reproduction]
+reproduce_threshold = 0.80
+reproduce_cost = 0.30
+reproduce_cooldown = 60.0
+offspring_energy = 0.45
+mate_search_radius = 20.0
+
+[terrain]
+water_avoidance = 4.0
+max_slope = 0.9
+slope_cost_factor = 1.0
+
+[drinking]
+drink_radius = 2.0
+drink_rate = 0.015
+
+[hunting]
+hunt_radius = 30.0
+chase_speed = 9.0
+attack_range = 1.2
+kill_energy_gain = 0.80
+stalk_speed = 1.5
+consume_duration = 3.0
+max_prey_mass = 200.0

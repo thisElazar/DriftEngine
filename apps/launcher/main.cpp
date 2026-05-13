@@ -15,8 +15,8 @@
 #include "plant_lab/plant_lab.h"
 #include "animals_lab/animals_lab.h"
 #include "world_lab/world_lab.h"
+#include "globe/globe.h"
 
-#include <cstdlib>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -123,7 +123,7 @@ static void render_menu_frame(Renderer& r, FrameData& frame,
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
-enum class AppMode { Menu, PlantLab, AnimalsLab, WorldLab };
+enum class AppMode { Menu, PlantLab, AnimalsLab, WorldLab, Globe };
 
 int main()
 {
@@ -138,6 +138,22 @@ int main()
     PlantLabState   plant_state{};
     AnimalsLabState animals_state{};
     WorldLabState   world_state{};
+    GlobeState      globe_state{};
+
+    // Preview world (attractor scene behind menu)
+    WorldLabState preview_state{};
+    preview_state.embedded = true;
+    preview_state.preview_mode = true;
+    world_lab_init(preview_state, renderer);
+    preview_state.ui_creatures_enabled = true;
+    preview_state.ui_show_plants = true;
+    preview_state.ui_autorun = true;
+    preview_state.ui_spring_enabled = true;
+    preview_state.ui_atmo_enabled = true;
+    preview_state.camera.distance = 180.0f;
+    preview_state.camera.pitch    = 0.55f;
+    preview_state.camera.yaw      = 0.0f;
+    bool preview_alive = true;
 
     auto species = scan_species();
     int selected_species = -1;
@@ -161,6 +177,9 @@ int main()
         }
 
         if (mode == AppMode::Menu) {
+            if (preview_alive)
+                world_lab_tick(preview_state, renderer, dt);
+
             refresh_timer += dt;
             if (refresh_timer > 3.0f) {
                 refresh_timer = 0.0f;
@@ -171,9 +190,12 @@ int main()
             ImGui_ImplGlfw_NewFrame();
             ImGui::NewFrame();
 
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.06f, 0.08f, 0.82f));
+
             ImVec2 win_size = ImGui::GetIO().DisplaySize;
-            ImGui::SetNextWindowPos(ImVec2(0, 0));
-            ImGui::SetNextWindowSize(win_size);
+            float panel_w = std::min(400.0f, win_size.x * 0.35f);
+            ImGui::SetNextWindowPos(ImVec2(20, 20));
+            ImGui::SetNextWindowSize(ImVec2(panel_w, win_size.y - 40));
             ImGui::Begin("##main", nullptr,
                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
@@ -182,11 +204,11 @@ int main()
             ImGui::Separator();
             ImGui::Spacing();
 
-            ImGui::TextUnformatted("Design Tools");
-            ImGui::Spacing();
+            float btn_w = ImGui::GetContentRegionAvail().x;
+            float btn_half = (btn_w - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
 
-            float btn_w = (win_size.x - 60) * 0.5f;
-            if (ImGui::Button("Plant Lab", ImVec2(btn_w, 40))) {
+            ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "Design");
+            if (ImGui::Button("Plant Lab", ImVec2(btn_half, 32))) {
                 plant_state = {};
                 plant_state.embedded = true;
                 plant_lab_init(plant_state, renderer);
@@ -194,7 +216,7 @@ int main()
                 glfwSetWindowTitle(renderer.window, "Drift Engine - Plant Lab");
             }
             ImGui::SameLine();
-            if (ImGui::Button("Animal Lab", ImVec2(btn_w, 40))) {
+            if (ImGui::Button("Animal Lab", ImVec2(btn_half, 32))) {
                 animals_state = {};
                 animals_state.embedded = true;
                 animals_lab_init(animals_state, renderer);
@@ -203,12 +225,8 @@ int main()
             }
 
             ImGui::Spacing();
-            ImGui::Spacing();
-
-            ImGui::TextUnformatted("Create World");
-            ImGui::Spacing();
-
-            if (ImGui::Button("Flat Tile (World Lab)", ImVec2(btn_w, 40))) {
+            ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "World");
+            if (ImGui::Button("World Lab", ImVec2(btn_half, 32))) {
                 world_state = {};
                 world_state.embedded = true;
                 world_lab_init(world_state, renderer);
@@ -216,18 +234,22 @@ int main()
                 glfwSetWindowTitle(renderer.window, "Drift Engine - World Lab");
             }
             ImGui::SameLine();
-            if (ImGui::Button("Globe (Planet)", ImVec2(btn_w, 40))) {
-                std::system("./drift_engine &");
+            if (ImGui::Button("Globe", ImVec2(btn_half, 32))) {
+                globe_state = {};
+                globe_state.embedded = true;
+                globe_init(globe_state, renderer);
+                mode = AppMode::Globe;
+                glfwSetWindowTitle(renderer.window, "Drift Engine - Globe");
             }
 
             ImGui::Spacing();
-            ImGui::Spacing();
             ImGui::Separator();
 
-            ImGui::TextUnformatted("Species Library");
-            ImGui::SameLine();
-            ImGui::TextDisabled("(%d species)", static_cast<int>(species.size()));
-            ImGui::Spacing();
+            char lib_label[64];
+            std::snprintf(lib_label, sizeof(lib_label), "Species Library (%d)",
+                          static_cast<int>(species.size()));
+
+            if (ImGui::CollapsingHeader(lib_label)) {
 
             if (species.empty()) {
                 ImGui::TextDisabled("No species files found in species/");
@@ -254,19 +276,49 @@ int main()
                         else if (sp.kind == "predator")   label = "Predators";
                         else if (sp.kind == "rabbit")     label = "Rabbits";
                         else if (sp.kind == "bird")       label = "Birds";
+                        else if (sp.kind == "raptor")     label = "Raptors";
+                        else if (sp.kind == "snake")      label = "Snakes";
 
                         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%s", label);
                         ImGui::Separator();
                     }
 
                     bool is_selected = (selected_species == i);
-                    if (ImGui::Selectable(sp.name.c_str(), is_selected))
+                    if (ImGui::Selectable(sp.name.c_str(), is_selected,
+                                          ImGuiSelectableFlags_AllowDoubleClick)) {
                         selected_species = i;
+                        if (ImGui::IsMouseDoubleClicked(0)) {
+                            auto file_path = (species_dir() / (sp.name + ".toml")).string();
+                            bool is_plant = (sp.kind == "grass_clump" || sp.kind == "bush"
+                                          || sp.kind == "tree" || sp.kind == "lplant"
+                                          || sp.kind == "reed" || sp.kind == "wildflower");
+                            bool is_creature = (sp.kind == "herbivore" || sp.kind == "predator"
+                                             || sp.kind == "rabbit" || sp.kind == "bird"
+                                             || sp.kind == "raptor" || sp.kind == "snake");
+                            if (is_plant) {
+                                plant_state = {};
+                                plant_state.embedded = true;
+                                plant_state.pending_file = file_path;
+                                plant_lab_init(plant_state, renderer);
+                                mode = AppMode::PlantLab;
+                                glfwSetWindowTitle(renderer.window, "Drift Engine - Plant Lab");
+                            } else if (is_creature) {
+                                animals_state = {};
+                                animals_state.embedded = true;
+                                animals_state.pending_file = file_path;
+                                animals_lab_init(animals_state, renderer);
+                                mode = AppMode::AnimalsLab;
+                                glfwSetWindowTitle(renderer.window, "Drift Engine - Animals Lab");
+                            }
+                        }
+                    }
                 }
                 ImGui::EndChild();
             }
+            } // CollapsingHeader
 
             ImGui::End();
+            ImGui::PopStyleColor();
             ImGui::Render();
 
         } else if (mode == AppMode::PlantLab) {
@@ -275,6 +327,14 @@ int main()
             if (!animals_lab_tick(animals_state, renderer, dt)) back_pressed = true;
         } else if (mode == AppMode::WorldLab) {
             if (!world_lab_tick(world_state, renderer, dt)) back_pressed = true;
+        } else if (mode == AppMode::Globe) {
+            if (!globe_tick(globe_state, renderer, dt)) back_pressed = true;
+            // Globe's input callback sets WindowShouldClose on ESC —
+            // undo that, the launcher handles ESC as back-to-menu.
+            if (glfwWindowShouldClose(renderer.window)) {
+                glfwSetWindowShouldClose(renderer.window, GLFW_FALSE);
+                back_pressed = true;
+            }
         }
 
         // --- Handle back-to-menu ---
@@ -283,6 +343,9 @@ int main()
             if (mode == AppMode::PlantLab)   plant_lab_shutdown(plant_state, renderer);
             if (mode == AppMode::AnimalsLab)  animals_lab_shutdown(animals_state, renderer);
             if (mode == AppMode::WorldLab)    world_lab_shutdown(world_state, renderer);
+            if (mode == AppMode::Globe)  {
+                globe_shutdown(globe_state, renderer);
+            }
             mode = AppMode::Menu;
             glfwSetWindowTitle(renderer.window, "Drift Engine");
             species = scan_species();
@@ -296,23 +359,54 @@ int main()
         if (!renderer_begin_frame(renderer, frame, image_index, extent)) continue;
 
         if (mode == AppMode::Menu) {
-            render_menu_frame(renderer, *frame, image_index, extent);
+            if (preview_alive) {
+                world_lab_render(preview_state, renderer, *frame, image_index, extent);
+                // Draw menu ImGui on top of the preview scene
+                VkCommandBuffer cmd = frame->cmd;
+                VkRenderingAttachmentInfo ig_color{};
+                ig_color.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                ig_color.imageView   = renderer.swapchain_views[image_index];
+                ig_color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                ig_color.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
+                ig_color.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+                VkRenderingInfo ig_ri{};
+                ig_ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+                ig_ri.renderArea           = {{0, 0}, extent};
+                ig_ri.layerCount           = 1;
+                ig_ri.colorAttachmentCount = 1;
+                ig_ri.pColorAttachments    = &ig_color;
+                vkCmdBeginRendering(cmd, &ig_ri);
+                ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+                vkCmdEndRendering(cmd);
+                image_barrier(cmd, renderer.swapchain_images[image_index],
+                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, VK_ACCESS_2_NONE,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+            } else {
+                render_menu_frame(renderer, *frame, image_index, extent);
+            }
         } else if (mode == AppMode::PlantLab) {
             plant_lab_render(plant_state, renderer, *frame, image_index, extent);
         } else if (mode == AppMode::AnimalsLab) {
             animals_lab_render(animals_state, renderer, *frame, image_index, extent);
         } else if (mode == AppMode::WorldLab) {
             world_lab_render(world_state, renderer, *frame, image_index, extent);
+        } else if (mode == AppMode::Globe) {
+            globe_render(globe_state, renderer, *frame, image_index, extent);
         }
 
         renderer_end_frame(renderer, *frame, image_index);
     }
 
-    // Shutdown active lab if still running
+    // Shutdown active lab and preview
     vkDeviceWaitIdle(renderer.device);
     if (mode == AppMode::PlantLab)   plant_lab_shutdown(plant_state, renderer);
     if (mode == AppMode::AnimalsLab)  animals_lab_shutdown(animals_state, renderer);
     if (mode == AppMode::WorldLab)    world_lab_shutdown(world_state, renderer);
+    if (mode == AppMode::Globe)       globe_shutdown(globe_state, renderer);
+    if (preview_alive)               world_lab_shutdown(preview_state, renderer);
 
     renderer_shutdown(renderer);
     return 0;

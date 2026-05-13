@@ -112,6 +112,7 @@ enum CreatureType {
 struct AnimalsLabState {
     bool embedded    = false;   // true when driven by launcher (shows Back button)
     bool initialized = false;
+    std::string pending_file;
 
     // Pipelines
     MeshPipeline     mesh_pipe{};

@@ -8,11 +8,9 @@
     float4 brush_color;
 };
 
-[[vk::combinedImageSampler]][[vk::binding(1, 0)]] Texture2DArray<float> heightmap;
-[[vk::combinedImageSampler]][[vk::binding(1, 0)]] SamplerState heightmap_sampler;
-
-[[vk::combinedImageSampler]][[vk::binding(2, 0)]] Texture2DArray<float4> water_output;
-[[vk::combinedImageSampler]][[vk::binding(2, 0)]] SamplerState water_sampler;
+[[vk::binding(1, 0)]] Texture2DArray<float> heightmap;
+[[vk::binding(2, 0)]] Texture2DArray<float4> water_output;
+[[vk::binding(8, 0)]] SamplerState tex_sampler;
 
 [[vk::push_constant]]
 cbuffer PlanetTilePC {
@@ -89,13 +87,13 @@ VSOutput main(VSInput input)
     float2 hm_uv = (grid + 0.5) * heightmap_texel;
 
     float3 uvw = float3(hm_uv, float(pool_index));
-    float terrain_h = heightmap.SampleLevel(heightmap_sampler, uvw, 0).r;
+    float terrain_h = heightmap.SampleLevel(tex_sampler, uvw, 0).r;
 
     // Static sea-level depth (smooth, consistent across tiles)
     float static_depth = (sea_level > 0.0) ? max(sea_level - terrain_h, 0.0) : 0.0;
 
     // SWE dynamic depth (per-tile simulation)
-    float4 ws = water_output.SampleLevel(water_sampler, uvw, 0);
+    float4 ws = water_output.SampleLevel(tex_sampler, uvw, 0);
     float swe_depth = ws.r;
 
     // Use static sea_level as floor — SWE can only add above it
@@ -121,10 +119,10 @@ VSOutput main(VSInput input)
     float3 uvw_D = float3(hm_uv + float2(0, -heightmap_texel), float(pool_index));
     float3 uvw_U = float3(hm_uv + float2(0,  heightmap_texel), float(pool_index));
 
-    float hL = heightmap.SampleLevel(heightmap_sampler, uvw_L, 0).r;
-    float hR = heightmap.SampleLevel(heightmap_sampler, uvw_R, 0).r;
-    float hD = heightmap.SampleLevel(heightmap_sampler, uvw_D, 0).r;
-    float hU = heightmap.SampleLevel(heightmap_sampler, uvw_U, 0).r;
+    float hL = heightmap.SampleLevel(tex_sampler, uvw_L, 0).r;
+    float hR = heightmap.SampleLevel(tex_sampler, uvw_R, 0).r;
+    float hD = heightmap.SampleLevel(tex_sampler, uvw_D, 0).r;
+    float hU = heightmap.SampleLevel(tex_sampler, uvw_U, 0).r;
 
     float cell_world = tile_size * planet_radius / GRID_MAX;
     float3 terrain_normal = normalize(sphere_dir - ((hR - hL) / (2.0 * cell_world)) * east

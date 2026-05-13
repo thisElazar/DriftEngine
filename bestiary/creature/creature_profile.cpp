@@ -22,6 +22,16 @@ static float dhash_float(uint32_t seed, uint32_t index)
            static_cast<float>(0xFFFFFFFFu);
 }
 
+static bool is_predator_archetype(Archetype a)
+{
+    return a == Archetype::Predator || a == Archetype::Raptor || a == Archetype::Snake;
+}
+
+static bool is_flying(const Agent& a)
+{
+    return a.altitude > 0.1f;
+}
+
 static float vec2_length(float x, float z)
 {
     return std::sqrt(x * x + z * z);
@@ -338,7 +348,8 @@ static int find_prey(const Agent& predator,
             const Agent& other = agents[j];
             if (!other.alive) return;
             if (other.species_id >= profiles.size()) return;
-            if (profiles[other.species_id].archetype == Archetype::Predator) return;
+            if (is_predator_archetype(profiles[other.species_id].archetype)) return;
+            if (profiles[other.species_id].body_mass > prof.max_prey_mass) return;
 
             float dx = other.pos[0] - predator.pos[0];
             float dz = other.pos[1] - predator.pos[1];
@@ -391,7 +402,7 @@ void update_creatures(
         if (a.species_id >= profiles.size()) continue;
 
         const CreatureProfile& prof = profiles[a.species_id];
-        bool is_predator = (prof.archetype == Archetype::Predator);
+        bool is_predator = is_predator_archetype(prof.archetype);
         uint32_t agent_seed = dhash(tick_seed ^ static_cast<uint32_t>(i * 2654435761u));
 
         if (a.mate_cooldown > 0.0f)
@@ -421,8 +432,9 @@ void update_creatures(
                     const Agent& other = agents[j];
                     if (!other.alive) return;
                     if (other.species_id >= profiles.size()) return;
-                    if (profiles[other.species_id].archetype != Archetype::Predator) return;
-                    if (other.state != AgentState::Hunt && other.state != AgentState::Chase) return;
+                    if (!is_predator_archetype(profiles[other.species_id].archetype)) return;
+                    if (other.state != AgentState::Hunt && other.state != AgentState::Chase
+                        && other.state != AgentState::Dive && other.state != AgentState::Strike) return;
 
                     float dx = a.pos[0] - other.pos[0];
                     float dz = a.pos[1] - other.pos[1];
@@ -558,6 +570,12 @@ void update_creatures(
         }
 
         case AgentState::Hunt: {
+            if (prof.archetype == Archetype::Snake) {
+                a.state = AgentState::Ambush;
+                a.consume_timer = 0.0f;
+                break;
+            }
+
             if (a.chase_target >= agents.size() || !agents[a.chase_target].alive) {
                 int prey = find_prey(a, prof, agents, profiles, agent_grid, i);
                 if (prey < 0) {
@@ -580,7 +598,11 @@ void update_creatures(
             }
 
             if (dist < prof.hunt_radius * 0.5f) {
-                a.state = AgentState::Chase;
+                if (prof.archetype == Archetype::Raptor && is_flying(a)) {
+                    a.state = AgentState::Dive;
+                } else {
+                    a.state = AgentState::Chase;
+                }
                 break;
             }
 
@@ -631,27 +653,180 @@ void update_creatures(
             intent.magnitude = 0.0f;
             break;
         }
+
+        case AgentState::Fly: {
+            if (a.energy < prof.hunger_threshold * 0.8f) {
+                a.state = AgentState::Wander;
+                break;
+            }
+            intent = steer_wander(a, prof, agent_seed);
+            intent.magnitude = 0.6f;
+            break;
         }
 
-        // --- Terrain avoidance steering ---
-        float w_current = sample_water(world, a.pos[0], a.pos[1]);
-        bool in_water = (w_current > 0.05f);
+        case AgentState::Perch: {
+            intent.magnitude = 0.0f;
+            a.consume_timer += dt;
+            if (a.consume_timer > 8.0f || a.energy < prof.hunger_threshold) {
+                a.consume_timer = 0.0f;
+                a.state = AgentState::Wander;
+            }
+            break;
+        }
 
-        if (in_water) {
-            // Already submerged: override intent with escape direction
-            steer_escape_water(a, world, intent.direction[0], intent.direction[1]);
-            vec2_normalize(intent.direction[0], intent.direction[1]);
+        case AgentState::Dive: {
+            if (a.chase_target >= agents.size() || !agents[a.chase_target].alive) {
+                a.state = AgentState::Fly;
+                a.chase_target = UINT32_MAX;
+                break;
+            }
+
+            Agent& target = agents[a.chase_target];
+            float dx = target.pos[0] - a.pos[0];
+            float dz = target.pos[1] - a.pos[1];
+            float dist = vec2_length(dx, dz);
+
+            if (a.altitude <= 0.0f && dist < prof.attack_range) {
+                target.alive = false;
+                a.energy = std::min(a.energy + prof.kill_energy_gain, 1.0f);
+                a.state = AgentState::Consume;
+                a.consume_timer = prof.consume_duration;
+                a.chase_target = UINT32_MAX;
+                break;
+            }
+
+            if (dist > prof.hunt_radius * 2.0f) {
+                a.state = AgentState::Fly;
+                a.chase_target = UINT32_MAX;
+                break;
+            }
+
+            intent.direction[0] = dx / std::max(dist, 0.01f);
+            intent.direction[1] = dz / std::max(dist, 0.01f);
             intent.magnitude = 1.0f;
-        } else if (intent.magnitude > 0.01f) {
-            apply_terrain_steering(a, prof, world, intent.direction[0], intent.direction[1]);
-            vec2_normalize(intent.direction[0], intent.direction[1]);
+            break;
+        }
+
+        case AgentState::Ambush: {
+            intent.magnitude = 0.0f;
+
+            int prey = find_prey(a, prof, agents, profiles, agent_grid, i);
+            if (prey >= 0) {
+                const Agent& target = agents[static_cast<size_t>(prey)];
+                float dx = target.pos[0] - a.pos[0];
+                float dz = target.pos[1] - a.pos[1];
+                float dist = vec2_length(dx, dz);
+
+                if (dist < prof.attack_range * 2.5f) {
+                    a.state = AgentState::Strike;
+                    a.chase_target = static_cast<uint32_t>(prey);
+                    break;
+                }
+            }
+
+            a.consume_timer += dt;
+            if (a.consume_timer > 15.0f) {
+                a.state = AgentState::Wander;
+                a.consume_timer = 0.0f;
+            }
+            break;
+        }
+
+        case AgentState::Strike: {
+            if (a.chase_target >= agents.size() || !agents[a.chase_target].alive) {
+                a.state = AgentState::Wander;
+                a.chase_target = UINT32_MAX;
+                break;
+            }
+
+            Agent& target = agents[a.chase_target];
+            float dx = target.pos[0] - a.pos[0];
+            float dz = target.pos[1] - a.pos[1];
+            float dist = vec2_length(dx, dz);
+
+            if (dist < prof.attack_range) {
+                target.alive = false;
+                a.energy = std::min(a.energy + prof.kill_energy_gain, 1.0f);
+                a.state = AgentState::Consume;
+                a.consume_timer = prof.consume_duration;
+                a.chase_target = UINT32_MAX;
+                break;
+            }
+
+            if (dist > prof.attack_range * 4.0f) {
+                a.state = AgentState::Wander;
+                a.chase_target = UINT32_MAX;
+                break;
+            }
+
+            intent.direction[0] = dx / std::max(dist, 0.01f);
+            intent.direction[1] = dz / std::max(dist, 0.01f);
+            intent.magnitude = 1.5f;
+            break;
+        }
+        }
+
+        // --- Flight altitude management ---
+        if (prof.can_fly) {
+            if (a.state == AgentState::Fly) {
+                float target_alt = prof.fly_altitude
+                    + std::sin(a.age * 0.5f) * prof.altitude_wander_amp;
+                a.altitude += (target_alt - a.altitude) * prof.takeoff_speed * dt;
+                a.altitude = std::max(0.0f, a.altitude);
+            } else if (a.state == AgentState::Dive) {
+                a.altitude -= prof.chase_speed * dt;
+                if (a.altitude < 0.0f) a.altitude = 0.0f;
+            } else if (a.state == AgentState::Wander && !is_flying(a)
+                       && a.energy > prof.hunger_threshold
+                       && a.state != AgentState::Graze) {
+                a.state = AgentState::Fly;
+            } else if (is_flying(a) && a.state == AgentState::Wander) {
+                a.altitude -= prof.landing_speed * dt;
+                if (a.altitude < 0.0f) a.altitude = 0.0f;
+            }
+        }
+
+        // --- Seed dispersal ---
+        if (prof.seed_disperser && is_flying(a) && a.last_forage_time > 5.0f) {
+            if (dhash_float(agent_seed, 10) < prof.seed_drop_probability * dt) {
+                PlantInstance seed{};
+                seed.x = a.pos[0];
+                seed.z = a.pos[1];
+                seed.kind = prof.seed_kind;
+                seed.health = 0.05f;
+                seed.seed = dhash(agent_seed ^ 0xBEEF);
+                plants.push_back(seed);
+                a.last_forage_time = 0.0f;
+            }
+        }
+        a.last_forage_time += dt;
+
+        // --- Terrain avoidance steering (skipped for airborne agents) ---
+        float w_current = 0.0f;
+        bool in_water = false;
+        float slope = 0.0f;
+
+        if (!is_flying(a)) {
+            w_current = sample_water(world, a.pos[0], a.pos[1]);
+            in_water = (w_current > 0.05f);
+
+            if (in_water) {
+                steer_escape_water(a, world, intent.direction[0], intent.direction[1]);
+                vec2_normalize(intent.direction[0], intent.direction[1]);
+                intent.magnitude = 1.0f;
+            } else if (intent.magnitude > 0.01f) {
+                apply_terrain_steering(a, prof, world, intent.direction[0], intent.direction[1]);
+                vec2_normalize(intent.direction[0], intent.direction[1]);
+            }
         }
 
         // --- Blend herd steering into movement intent ---
         if (intent.magnitude > 0.01f &&
             a.state != AgentState::Flee &&
             a.state != AgentState::SeekMate &&
-            a.state != AgentState::Chase) {
+            a.state != AgentState::Chase &&
+            a.state != AgentState::Dive &&
+            a.state != AgentState::Strike) {
             HerdIntent herd = compute_herd(a, prof, agents, agent_grid, i);
             if (herd.neighbor_count > 0) {
                 intent.direction[0] += herd.cohesion[0]   * prof.herd_weight
@@ -666,18 +841,22 @@ void update_creatures(
 
         // --- Integrate movement ---
         float speed;
-        if (a.state == AgentState::Flee)       speed = prof.run_speed;
-        else if (a.state == AgentState::Chase) speed = prof.chase_speed;
-        else                                   speed = prof.move_speed;
+        if (a.state == AgentState::Flee)        speed = prof.run_speed;
+        else if (a.state == AgentState::Chase)  speed = prof.chase_speed;
+        else if (a.state == AgentState::Dive)   speed = prof.chase_speed;
+        else if (a.state == AgentState::Strike) speed = prof.run_speed;
+        else                                    speed = prof.move_speed;
 
         float actual_speed = speed * intent.magnitude;
 
-        float slope = sample_slope(world, a.pos[0], a.pos[1]);
-        if (slope > prof.max_slope) {
-            actual_speed *= 0.1f;
-        } else if (slope > prof.max_slope * 0.5f) {
-            float t = (slope - prof.max_slope * 0.5f) / (prof.max_slope * 0.5f);
-            actual_speed *= (1.0f - t * 0.7f);
+        if (!is_flying(a)) {
+            slope = sample_slope(world, a.pos[0], a.pos[1]);
+            if (slope > prof.max_slope) {
+                actual_speed *= 0.1f;
+            } else if (slope > prof.max_slope * 0.5f) {
+                float t = (slope - prof.max_slope * 0.5f) / (prof.max_slope * 0.5f);
+                actual_speed *= (1.0f - t * 0.7f);
+            }
         }
 
         if (intent.magnitude > 0.01f) {
@@ -695,14 +874,16 @@ void update_creatures(
         a.pos[0] += a.vel[0] * dt;
         a.pos[1] += a.vel[1] * dt;
 
-        float w_new = sample_water(world, a.pos[0], a.pos[1]);
-        bool should_revert = (!in_water && w_new > 0.05f)   // prevent entering water
-                          || (in_water  && w_new > w_current); // prevent moving deeper
-        if (should_revert) {
-            a.pos[0] -= a.vel[0] * dt;
-            a.pos[1] -= a.vel[1] * dt;
-            a.vel[0] = 0.0f;
-            a.vel[1] = 0.0f;
+        if (!is_flying(a)) {
+            float w_new = sample_water(world, a.pos[0], a.pos[1]);
+            bool should_revert = (!in_water && w_new > 0.05f)
+                              || (in_water  && w_new > w_current);
+            if (should_revert) {
+                a.pos[0] -= a.vel[0] * dt;
+                a.pos[1] -= a.vel[1] * dt;
+                a.vel[0] = 0.0f;
+                a.vel[1] = 0.0f;
+            }
         }
 
         a.pos[0] = std::clamp(a.pos[0],
@@ -712,17 +893,19 @@ void update_creatures(
                               -world.tile_half_z + 1.0f,
                                world.tile_half_z - 1.0f);
 
-        // --- Passive drinking (near water) ---
-        float nearby_water = sample_water(world, a.pos[0], a.pos[1]);
-        if (nearby_water > 0.01f && nearby_water < 0.3f) {
-            float proximity = 1.0f - std::min(nearby_water / 0.3f, 1.0f);
-            a.energy = std::min(a.energy + prof.drink_rate * proximity * dt, 1.0f);
+        // --- Passive drinking (near water, ground only) ---
+        if (!is_flying(a)) {
+            float nearby_water = sample_water(world, a.pos[0], a.pos[1]);
+            if (nearby_water > 0.01f && nearby_water < 0.3f) {
+                float proximity = 1.0f - std::min(nearby_water / 0.3f, 1.0f);
+                a.energy = std::min(a.energy + prof.drink_rate * proximity * dt, 1.0f);
+            }
         }
 
         // --- Energy drain (caloric model) ---
         float basal = prof.basal_rate;
         float locomotion = prof.locomotion_cost * (actual_speed * actual_speed);
-        float slope_mult = 1.0f + slope * prof.slope_cost_factor;
+        float slope_mult = is_flying(a) ? 1.0f : (1.0f + slope * prof.slope_cost_factor);
         float total_drain = (basal + locomotion * slope_mult) * dt;
         a.energy -= total_drain;
 

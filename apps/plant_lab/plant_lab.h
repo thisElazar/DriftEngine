@@ -15,6 +15,8 @@
 #include "environment.h"
 #include "distribution.h"
 
+#include <string>
+
 // ---------------------------------------------------------------------------
 // Dirty-check snapshot (memcmp'd each tick to detect param changes)
 // ---------------------------------------------------------------------------
@@ -44,6 +46,7 @@ struct PlantLabSnapshot {
 struct PlantLabState {
     bool embedded     = false;  // true when driven by launcher (shows Back button)
     bool initialized  = false;
+    std::string pending_file;
 
     // Pipeline + mesh
     ClumpPipeline cpipe{};

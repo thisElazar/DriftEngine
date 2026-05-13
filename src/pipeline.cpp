@@ -153,51 +153,56 @@ void pipelines_create(Pipelines& p, VkDevice device)
 
     VK_CHECK(vkCreateShaderModule(device, &fs_sm_ci, nullptr, &p.terrain_fs));
 
-    // Graphics descriptor set layout: UBO + heightmap + swe_output + sediment + atmo_shadow + cloud_vol_3d + wind_vol_3d + sand_deposit
-    VkDescriptorSetLayoutBinding gfx_bindings[8]{};
+    // Graphics descriptor set layout: UBO + 7 textures (SAMPLED_IMAGE) + 1 shared sampler
+    VkDescriptorSetLayoutBinding gfx_bindings[9]{};
     gfx_bindings[0].binding = 0;
     gfx_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     gfx_bindings[0].descriptorCount = 1;
     gfx_bindings[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
     gfx_bindings[1].binding = 1;
-    gfx_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    gfx_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     gfx_bindings[1].descriptorCount = 1;
     gfx_bindings[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
     gfx_bindings[2].binding = 2;
-    gfx_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    gfx_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     gfx_bindings[2].descriptorCount = 1;
     gfx_bindings[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
     gfx_bindings[3].binding = 3;
-    gfx_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    gfx_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     gfx_bindings[3].descriptorCount = 1;
     gfx_bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     gfx_bindings[4].binding = 4;
-    gfx_bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    gfx_bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     gfx_bindings[4].descriptorCount = 1;
     gfx_bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
     gfx_bindings[5].binding = 5;
-    gfx_bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    gfx_bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     gfx_bindings[5].descriptorCount = 1;
     gfx_bindings[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     gfx_bindings[6].binding = 6;
-    gfx_bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    gfx_bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     gfx_bindings[6].descriptorCount = 1;
     gfx_bindings[6].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     gfx_bindings[7].binding = 7;
-    gfx_bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    gfx_bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     gfx_bindings[7].descriptorCount = 1;
     gfx_bindings[7].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
+    gfx_bindings[8].binding = 8;
+    gfx_bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    gfx_bindings[8].descriptorCount = 1;
+    gfx_bindings[8].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
     VkDescriptorSetLayoutCreateInfo gfx_dsl_ci{};
     gfx_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    gfx_dsl_ci.bindingCount = 8;
+    gfx_dsl_ci.bindingCount = 9;
     gfx_dsl_ci.pBindings = gfx_bindings;
 
     VK_CHECK(vkCreateDescriptorSetLayout(device, &gfx_dsl_ci, nullptr, &p.gfx_desc_layout));

@@ -100,6 +100,12 @@ add_library(drift_engine_core STATIC
     src/vk_util.cpp
     src/grid_util.cpp
     src/vma_impl.cpp
+    src/camera.cpp
+    src/input.cpp
+    src/pipeline.cpp
+    src/planet.cpp
+    src/terrain.cpp
+    src/ui.cpp
 )
 
 target_include_directories(drift_engine_core PUBLIC src)
@@ -133,14 +139,10 @@ endif()
 # ---------------------------------------------------------------------------
 add_executable(drift_engine
     src/main.cpp
-    src/camera.cpp
-    src/input.cpp
-    src/pipeline.cpp
-    src/planet.cpp
-    src/terrain.cpp
-    src/ui.cpp
+    apps/globe/globe.cpp
 )
 
+target_include_directories(drift_engine PRIVATE apps)
 target_link_libraries(drift_engine PRIVATE drift_engine_core)
 
 if(MSVC)
@@ -192,6 +194,16 @@ endforeach()
 
 add_custom_target(shaders ALL DEPENDS ${SPV_OUTPUTS})
 add_dependencies(drift_engine shaders)
+
+# ---------------------------------------------------------------------------
+# Copy species files to build dir
+# ---------------------------------------------------------------------------
+file(GLOB SPECIES_FILES ${CMAKE_CURRENT_SOURCE_DIR}/species/*.toml)
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/species)
+foreach(SF ${SPECIES_FILES})
+    get_filename_component(SF_NAME ${SF} NAME)
+    configure_file(${SF} ${CMAKE_BINARY_DIR}/species/${SF_NAME} COPYONLY)
+endforeach()
 
 # ---------------------------------------------------------------------------
 # Bestiary library + Plant Lab app

@@ -1,0 +1,74 @@
+[species]
+kind = 'bird'
+name = 'songbird'
+
+[body]
+body_length = 0.25
+body_height = 0.18
+body_color = [0.35, 0.32, 0.30]
+
+[locomotion]
+move_speed = 3.0
+run_speed = 5.0
+turn_rate = 6.0
+
+[energy]
+body_mass = 0.5
+basal_rate = 0.0025
+locomotion_cost = 0.0002
+hunger_threshold = 0.35
+starve_threshold = 0.0
+trophic_efficiency = 0.50
+max_age = 400.0
+
+[grazing]
+graze_radius = 2.0
+graze_consume = 0.08
+graze_min_health = 0.15
+graze_duration = 1.5
+grass_caloric_value = 0.5
+bush_caloric_value = 0.3
+tree_caloric_value = 0.1
+reed_caloric_value = 0.4
+wildflower_caloric_value = 1.2
+
+[wander]
+wander_radius = 8.0
+wander_jitter = 2.0
+
+[flee]
+flee_radius = 15.0
+flee_duration = 4.0
+
+[herding]
+herd_radius = 15.0
+herd_weight = 0.6
+separation_radius = 1.0
+separation_weight = 0.5
+alignment_weight = 0.2
+
+[reproduction]
+reproduce_threshold = 0.60
+reproduce_cost = 0.15
+reproduce_cooldown = 15.0
+offspring_energy = 0.30
+mate_search_radius = 20.0
+
+[terrain]
+water_avoidance = 0.0
+max_slope = 2.0
+slope_cost_factor = 0.0
+
+[drinking]
+drink_radius = 2.0
+drink_rate = 0.008
+
+[flight]
+fly_altitude = 8.0
+takeoff_speed = 3.0
+landing_speed = 2.0
+altitude_wander_amp = 2.0
+
+[seed_dispersal]
+seed_drop_probability = 0.015
+seed_kind = 4

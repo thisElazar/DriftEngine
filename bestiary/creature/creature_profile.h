@@ -82,6 +82,19 @@ struct CreatureProfile {
     float kill_energy_gain   = 0.50f;
     float stalk_speed        = 1.5f;
     float consume_duration   = 3.0f;
+    float max_prey_mass      = 1000.0f;
+
+    // Flight (bird/raptor)
+    bool  can_fly              = false;
+    float fly_altitude         = 8.0f;
+    float takeoff_speed        = 3.0f;
+    float landing_speed        = 2.0f;
+    float altitude_wander_amp  = 2.0f;
+
+    // Seed dispersal (flying seed-eaters)
+    bool  seed_disperser         = false;
+    float seed_drop_probability  = 0.02f;
+    int   seed_kind              = 0;
 };
 
 struct CreatureWorldView {

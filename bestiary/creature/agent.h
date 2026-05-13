@@ -21,6 +21,11 @@ enum class AgentState : uint8_t {
     Hunt,
     Chase,
     Consume,
+    Fly,
+    Perch,
+    Dive,
+    Ambush,
+    Strike,
 };
 
 struct SteeringIntent {
@@ -47,6 +52,8 @@ struct Agent {
     bool       female          = false;
     uint32_t   chase_target    = UINT32_MAX;
     float      consume_timer   = 0.0f;
+    float      altitude        = 0.0f;
+    float      last_forage_time = 0.0f;
 };
 
 } // namespace bestiary

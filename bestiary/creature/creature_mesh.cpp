@@ -237,6 +237,11 @@ static const WalkCycle* select_cycle(const CachedAnimalModel& model,
     case AgentState::Hunt:     return &model.cycles[CYCLE_STALK];
     case AgentState::Flee:
     case AgentState::Chase:    return &model.cycles[CYCLE_RUN];
+    case AgentState::Fly:      return &model.cycles[CYCLE_RUN];
+    case AgentState::Perch:    return &model.cycles[CYCLE_IDLE];
+    case AgentState::Dive:     return &model.cycles[CYCLE_GRAZE];
+    case AgentState::Ambush:   return &model.cycles[CYCLE_IDLE];
+    case AgentState::Strike:   return &model.cycles[CYCLE_STALK];
     case AgentState::SeekMate:
     case AgentState::Wander:
         if (speed > 4.0f)      return &model.cycles[CYCLE_RUN];
@@ -313,7 +318,7 @@ static void append_skinned_agent(VegetationMesh& mesh,
 
         VegetationVertex v{};
         v.position[0] = agent.pos[0] + lx * cos_h + lz * sin_h;
-        v.position[1] = terrain_y + ly;
+        v.position[1] = terrain_y + agent.altitude + ly;
         v.position[2] = agent.pos[1] - lx * sin_h + lz * cos_h;
 
         v.normal[0] = sv.normal[0] * cos_h + sv.normal[2] * sin_h;
@@ -353,6 +358,11 @@ VegetationMesh generate_creature_meshes(
     }
 
     return mesh;
+}
+
+void clear_creature_mesh_cache()
+{
+    s_models.clear();
 }
 
 } // namespace bestiary

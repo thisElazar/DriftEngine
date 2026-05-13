@@ -9,6 +9,7 @@
 static void key_callback(GLFWwindow* window, int key, int /*scancode*/, int action, int /*mods*/)
 {
     auto* ctx = static_cast<CallbackContext*>(glfwGetWindowUserPointer(window));
+    if (!ctx) return;
     auto& input = *ctx->input;
     auto& ui = *ctx->ui;
 
@@ -55,6 +56,7 @@ static void key_callback(GLFWwindow* window, int key, int /*scancode*/, int acti
 static void mouse_button_callback(GLFWwindow* window, int button, int action, int /*mods*/)
 {
     auto* ctx = static_cast<CallbackContext*>(glfwGetWindowUserPointer(window));
+    if (!ctx) return;
     auto& input = *ctx->input;
 
     if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse)
@@ -74,6 +76,7 @@ static void mouse_button_callback(GLFWwindow* window, int button, int action, in
 static void cursor_pos_callback(GLFWwindow* window, double xpos, double ypos)
 {
     auto* ctx = static_cast<CallbackContext*>(glfwGetWindowUserPointer(window));
+    if (!ctx) return;
     auto& input = *ctx->input;
 
     input.cursor_x = xpos;
@@ -99,12 +102,14 @@ static void scroll_callback(GLFWwindow* window, double /*xoffset*/, double yoffs
     if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse)
         return;
     auto* ctx = static_cast<CallbackContext*>(glfwGetWindowUserPointer(window));
+    if (!ctx) return;
     camera_zoom(*ctx->camera, yoffset);
 }
 
 static void framebuffer_resize_callback(GLFWwindow* window, int /*width*/, int /*height*/)
 {
     auto* ctx = static_cast<CallbackContext*>(glfwGetWindowUserPointer(window));
+    if (!ctx) return;
     ctx->input->framebuffer_resized = true;
 }
 

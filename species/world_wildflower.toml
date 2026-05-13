@@ -1,0 +1,31 @@
+[species]
+kind = 'wildflower'
+name = 'world_wildflower'
+
+[morphology]
+flower_count = 6
+stem_height = 0.50
+stem_width = 0.012
+petal_radius = 0.08
+petal_count = 5
+clump_radius = 0.15
+
+[appearance]
+petal_color = [0.85, 0.75, 0.25]
+stem_color = [0.35, 0.50, 0.20]
+
+[expression.stem_height]
+low = 0.35
+high = 0.70
+
+[expression.petal_radius]
+low = 0.06
+high = 0.12
+
+[expression.flower_count]
+low = 4.0
+high = 10.0
+
+[expression.color]
+dry = [0.90, 0.80, 0.20]
+wet = [0.65, 0.30, 0.75]

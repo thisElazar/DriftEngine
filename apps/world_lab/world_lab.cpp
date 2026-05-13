@@ -14,11 +14,14 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
+#include "species_file.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -295,22 +298,28 @@ static WL_ClumpPipeline create_wl_clump_pipeline(VkDevice device)
     stages[1].module = p.fs;
     stages[1].pName  = "main";
 
-    VkVertexInputBindingDescription vb{};
-    vb.binding   = 0;
-    vb.stride    = sizeof(bestiary::VegetationVertex);
-    vb.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputBindingDescription vbs[2]{};
+    vbs[0].binding   = 0;
+    vbs[0].stride    = sizeof(bestiary::VegetationVertex);
+    vbs[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    vbs[1].binding   = 1;
+    vbs[1].stride    = sizeof(bestiary::PlantGPUInstance);
+    vbs[1].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
 
-    VkVertexInputAttributeDescription attrs[4]{};
-    attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(bestiary::VegetationVertex, position)};
-    attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(bestiary::VegetationVertex, normal)};
-    attrs[2] = {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(bestiary::VegetationVertex, color)};
-    attrs[3] = {3, 0, VK_FORMAT_R32_SFLOAT,        offsetof(bestiary::VegetationVertex, height_t)};
+    VkVertexInputAttributeDescription attrs[6]{};
+    attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(bestiary::VegetationVertex,  position)};
+    attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(bestiary::VegetationVertex,  normal)};
+    attrs[2] = {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(bestiary::VegetationVertex,  color)};
+    attrs[3] = {3, 0, VK_FORMAT_R32_SFLOAT,        offsetof(bestiary::VegetationVertex,  height_t)};
+    attrs[4] = {4, 1, VK_FORMAT_R32G32B32_SFLOAT,  offsetof(bestiary::PlantGPUInstance,  x)};  // x,y,z
+    attrs[5] = {5, 1, VK_FORMAT_R32_SFLOAT,         offsetof(bestiary::PlantGPUInstance,  health)};
+    // inst_seed omitted — uint vertex attrs need DXC; add back when jitter lands
 
     VkPipelineVertexInputStateCreateInfo vi{};
     vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vi.vertexBindingDescriptionCount   = 1;
-    vi.pVertexBindingDescriptions      = &vb;
-    vi.vertexAttributeDescriptionCount = 4;
+    vi.vertexBindingDescriptionCount   = 2;
+    vi.pVertexBindingDescriptions      = vbs;
+    vi.vertexAttributeDescriptionCount = 6;
     vi.pVertexAttributeDescriptions    = attrs;
 
     VkPipelineInputAssemblyStateCreateInfo ia{};
@@ -377,6 +386,124 @@ static WL_ClumpPipeline create_wl_clump_pipeline(VkDevice device)
 }
 
 static void destroy_wl_clump_pipeline(VkDevice device, WL_ClumpPipeline& p)
+{
+    vkDestroyPipeline(device, p.pipeline, nullptr);
+    vkDestroyPipelineLayout(device, p.layout, nullptr);
+    vkDestroyShaderModule(device, p.fs, nullptr);
+    vkDestroyShaderModule(device, p.vs, nullptr);
+    p = {};
+}
+
+// ---------------------------------------------------------------------------
+// Creature pipeline (non-instanced, pre-baked world-space vertices)
+// ---------------------------------------------------------------------------
+static WL_ClumpPipeline create_wl_creature_pipeline(VkDevice device)
+{
+    WL_ClumpPipeline p{};
+    p.vs = make_shader(device, "shaders/world_creature_vs.spv");
+    p.fs = make_shader(device, "shaders/world_clump_fs.spv");
+
+    VkPushConstantRange push{};
+    push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    push.size       = sizeof(glm::mat4);
+
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &push;
+    VK_CHECK(vkCreatePipelineLayout(device, &plci, nullptr, &p.layout));
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = p.vs;
+    stages[0].pName  = "main";
+    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = p.fs;
+    stages[1].pName  = "main";
+
+    VkVertexInputBindingDescription vb{};
+    vb.binding   = 0;
+    vb.stride    = sizeof(bestiary::VegetationVertex);
+    vb.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription attrs[3]{};
+    attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(bestiary::VegetationVertex, position)};
+    attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(bestiary::VegetationVertex, normal)};
+    attrs[2] = {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(bestiary::VegetationVertex, color)};
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount   = 1;
+    vi.pVertexBindingDescriptions      = &vb;
+    vi.vertexAttributeDescriptionCount = 3;
+    vi.pVertexAttributeDescriptions    = attrs;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1; vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode    = VK_CULL_MODE_NONE;
+    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth   = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable  = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState ba{};
+    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                      | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1; cb.pAttachments = &ba;
+
+    VkDynamicState dyns[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = 2; dyn.pDynamicStates = dyns;
+
+    VkFormat color_fmt = VK_FORMAT_B8G8R8A8_UNORM;
+    VkFormat depth_fmt = VK_FORMAT_D32_SFLOAT;
+    VkPipelineRenderingCreateInfo rci{};
+    rci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    rci.colorAttachmentCount = 1;
+    rci.pColorAttachmentFormats = &color_fmt;
+    rci.depthAttachmentFormat = depth_fmt;
+
+    VkGraphicsPipelineCreateInfo gp{};
+    gp.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.pNext               = &rci;
+    gp.stageCount          = 2;
+    gp.pStages             = stages;
+    gp.pVertexInputState   = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState      = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState   = &ms;
+    gp.pDepthStencilState  = &ds;
+    gp.pColorBlendState    = &cb;
+    gp.pDynamicState       = &dyn;
+    gp.layout              = p.layout;
+    VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gp, nullptr, &p.pipeline));
+    return p;
+}
+
+static void destroy_wl_creature_pipeline(VkDevice device, WL_ClumpPipeline& p)
 {
     vkDestroyPipeline(device, p.pipeline, nullptr);
     vkDestroyPipelineLayout(device, p.layout, nullptr);
@@ -598,31 +725,63 @@ static void write_image(VkDevice device, VkDescriptorSet set, uint32_t binding,
 }
 
 // ---------------------------------------------------------------------------
-// Rebuild plant mesh from persistent population
+// Build one canonical mesh per plant kind (called once at init / on species change)
 // ---------------------------------------------------------------------------
-static void rebuild_plant_mesh(WorldLabState& s, VkDevice device, VmaAllocator alloc)
+static void build_canonical_meshes(WorldLabState& s, VmaAllocator alloc)
 {
-    bestiary::PlantMeshParams pmp;
-    pmp.cp = s.clump_params; pmp.ce = s.clump_expr;
-    pmp.bp = s.bush_params;  pmp.be = s.bush_expr;
-    pmp.tp = s.tree_params;  pmp.te = s.tree_expr;
-    pmp.reed_cp = s.reed_params; pmp.reed_ce = s.reed_expr;
-    pmp.wfp = s.wildflower_params; pmp.wfe = s.wildflower_expr;
-    pmp.phenotype_variance = s.eco_params.phenotype_variance;
-    bestiary::VegetationMesh m = bestiary::generate_mesh_from_population(
-        s.plant_population, s.persistent_env, pmp);
+    using namespace bestiary;
+    constexpr float mid = 0.5f;
 
+    auto upload = [&](int kind, const VegetationMesh& m) {
+        destroy_plant_mesh(alloc, s.plant_canonical[kind]);
+        upload_plant_mesh(alloc, s.plant_canonical[kind], m);
+    };
+
+    upload(PLANT_GRASS,
+           generate_clump(evaluate_expression(s.clump_params, s.clump_expr, mid),
+                          0, false, 0.0f, 0.0f));
+    upload(PLANT_BUSH,
+           generate_bush(evaluate_bush_expression(s.bush_params, s.bush_expr, mid),
+                         0, false, 0.0f, 0.0f));
+    upload(PLANT_TREE,
+           generate_tree(evaluate_tree_expression(s.tree_params, s.tree_expr, mid),
+                         0, false, 0.0f, 0.0f));
+    upload(PLANT_REED,
+           generate_clump(evaluate_expression(s.reed_params, s.reed_expr, mid),
+                          0, false, 0.0f, 0.0f));
+    upload(PLANT_WILDFLOWER,
+           generate_wildflower(evaluate_wildflower_expression(
+                                   s.wildflower_params, s.wildflower_expr, mid),
+                               0, false, 0.0f, 0.0f));
+}
+
+// ---------------------------------------------------------------------------
+// Upload per-kind instance buffers from current plant population
+// ---------------------------------------------------------------------------
+static void upload_plant_instances(WorldLabState& s, VkDevice device, VmaAllocator alloc)
+{
     constexpr float plant_lift = 0.01f;
-    for (auto& v : m.vertices) {
-        float y = sample_hm_bilinear(s.hm_cpu, WL_GRID_W, WL_GRID_H,
-                                     wl_world_to_gx(v.position[0]),
-                                     wl_world_to_gy(v.position[2]));
-        v.position[1] += y + plant_lift;
-    }
-
+    std::vector<bestiary::PlantGPUInstance> buf;
     vkDeviceWaitIdle(device);
-    destroy_plant_mesh(alloc, s.plants);
-    upload_plant_mesh(alloc, s.plants, m);
+    for (int k = 0; k < bestiary::PLANT_KIND_COUNT; ++k) {
+        buf.clear();
+        for (const auto& p : s.plant_population) {
+            if (p.kind != k || p.health <= 0.0f) continue;
+            float terrain_y = sample_hm_bilinear(s.hm_cpu, WL_GRID_W, WL_GRID_H,
+                                                  wl_world_to_gx(p.x), wl_world_to_gy(p.z));
+            buf.push_back({p.x, terrain_y + plant_lift, p.z, p.health, p.seed});
+        }
+        destroy_buffer(alloc, s.plant_inst[k]);
+        s.plant_inst_count[k] = 0;
+        if (buf.empty()) continue;
+        VkDeviceSize sz = buf.size() * sizeof(bestiary::PlantGPUInstance);
+        s.plant_inst[k] = create_host_buffer(alloc, sz, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        void* mapped = nullptr;
+        vmaMapMemory(alloc, s.plant_inst[k].allocation, &mapped);
+        std::memcpy(mapped, buf.data(), sz);
+        vmaUnmapMemory(alloc, s.plant_inst[k].allocation);
+        s.plant_inst_count[k] = static_cast<uint32_t>(buf.size());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -664,7 +823,7 @@ static void run_replant(WorldLabState& s, VkDevice device, VmaAllocator alloc,
 {
     refresh_env(s, device, alloc, gqueue, gfamily);
     s.plant_population = bestiary::place_ecosystem(s.eco_params, s.persistent_env);
-    rebuild_plant_mesh(s, device, alloc);
+    upload_plant_instances(s, device, alloc);
     s.veg_rebuild_timer = 0.0f;
 }
 
@@ -707,14 +866,148 @@ static void generate_heightmap(std::vector<float>& values)
 }
 
 // ---------------------------------------------------------------------------
+// Species file I/O
+// ---------------------------------------------------------------------------
+static const char* wl_species_dir()
+{
+    return "species";
+}
+
+static const char* wl_profile_names[] = {
+    "sprinter", "grazer", "browser", "wolf", "rabbit",
+    "songbird", "raptor", "snake"
+};
+
+static void save_creature_profiles(const WorldLabState& s)
+{
+    std::filesystem::create_directories(wl_species_dir());
+    for (size_t i = 0; i < s.creature_profiles.size(); ++i) {
+        std::filesystem::path p = std::filesystem::path(wl_species_dir())
+            / (std::string(wl_profile_names[i]) + ".toml");
+        bestiary::save_creature(p, s.creature_profiles[i], wl_profile_names[i]);
+    }
+    std::fprintf(stderr, "Saved %zu creature profiles to %s/\n",
+                 s.creature_profiles.size(), wl_species_dir());
+}
+
+static bool load_creature_profiles(WorldLabState& s)
+{
+    auto loaded = bestiary::load_creature_dir(wl_species_dir());
+    if (loaded.empty()) return false;
+
+    s.creature_profiles.clear();
+
+    for (size_t i = 0; i < 8; ++i) {
+        const char* want = wl_profile_names[i];
+        bool found = false;
+        for (auto& ncp : loaded) {
+            if (ncp.name == want) {
+                s.creature_profiles.push_back(ncp.profile);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std::fprintf(stderr, "Warning: species '%s' not found on disk, using default\n", want);
+            return false;
+        }
+    }
+
+    std::fprintf(stderr, "Loaded %zu creature profiles from %s/\n",
+                 s.creature_profiles.size(), wl_species_dir());
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Plant species file I/O
+// ---------------------------------------------------------------------------
+static void save_plant_profiles(const WorldLabState& s)
+{
+    std::filesystem::create_directories(wl_species_dir());
+    auto dir = std::filesystem::path(wl_species_dir());
+
+    bestiary::save_clump(dir / "world_grass.toml", s.clump_params, "world_grass",
+                         &s.clump_expr);
+    bestiary::save_clump(dir / "world_reed.toml", s.reed_params, "world_reed",
+                         &s.reed_expr, "reed");
+    bestiary::save_bush(dir / "world_bush.toml", s.bush_params, "world_bush",
+                        &s.bush_expr);
+    bestiary::save_tree(dir / "world_tree.toml", s.tree_params, "world_tree",
+                        &s.tree_expr);
+    bestiary::save_wildflower(dir / "world_wildflower.toml", s.wildflower_params,
+                              "world_wildflower", &s.wildflower_expr);
+
+    std::fprintf(stderr, "Saved 5 plant profiles to %s/\n", wl_species_dir());
+}
+
+static bool load_plant_profiles(WorldLabState& s)
+{
+    auto dir = std::filesystem::path(wl_species_dir());
+    bool any = false;
+
+    {
+        std::string name;
+        auto p = dir / "world_grass.toml";
+        if (std::filesystem::exists(p) &&
+            bestiary::load_clump(p, s.clump_params, name, &s.clump_expr)) {
+            any = true;
+            std::fprintf(stderr, "Loaded plant: %s\n", name.c_str());
+        }
+    }
+    {
+        std::string name;
+        auto p = dir / "world_reed.toml";
+        if (std::filesystem::exists(p) &&
+            bestiary::load_clump(p, s.reed_params, name, &s.reed_expr)) {
+            any = true;
+            std::fprintf(stderr, "Loaded plant: %s\n", name.c_str());
+        }
+    }
+    {
+        std::string name;
+        auto p = dir / "world_bush.toml";
+        if (std::filesystem::exists(p) &&
+            bestiary::load_bush(p, s.bush_params, name, &s.bush_expr)) {
+            any = true;
+            std::fprintf(stderr, "Loaded plant: %s\n", name.c_str());
+        }
+    }
+    {
+        std::string name;
+        auto p = dir / "world_tree.toml";
+        if (std::filesystem::exists(p) &&
+            bestiary::load_tree(p, s.tree_params, name, &s.tree_expr)) {
+            any = true;
+            std::fprintf(stderr, "Loaded plant: %s\n", name.c_str());
+        }
+    }
+    {
+        std::string name;
+        auto p = dir / "world_wildflower.toml";
+        if (std::filesystem::exists(p) &&
+            bestiary::load_wildflower(p, s.wildflower_params, name, &s.wildflower_expr)) {
+            any = true;
+            std::fprintf(stderr, "Loaded plant: %s\n", name.c_str());
+        }
+    }
+
+    return any;
+}
+
+// ---------------------------------------------------------------------------
 // Spawn creatures across all species
 // ---------------------------------------------------------------------------
 static void spawn_all_creatures(WorldLabState& s)
 {
     s.agents.clear();
-    int herb_count = s.ui_creature_count * 3 / 5;
-    int wolf_count = std::max(2, s.ui_creature_count / 10);
-    int rabbit_count = s.ui_creature_count - herb_count - wolf_count;
+    int total = s.ui_creature_count;
+    int wolf_count   = std::max(2, total / 10);
+    int rabbit_count = total / 5;
+    int bird_count   = total / 6;
+    int raptor_count = std::max(1, total / 20);
+    int snake_count  = std::max(1, total / 15);
+    int herb_count   = total - wolf_count - rabbit_count - bird_count - raptor_count - snake_count;
+    herb_count = std::max(0, herb_count);
     int per_herb = herb_count / 3;
     int herb_extra = herb_count - per_herb * 3;
     bestiary::spawn_creatures(s.agents, 0, per_herb + (herb_extra > 0 ? 1 : 0),
@@ -727,6 +1020,12 @@ static void spawn_all_creatures(WorldLabState& s)
         s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 404u);
     bestiary::spawn_creatures(s.agents, 4, rabbit_count,
         s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 555u);
+    bestiary::spawn_creatures(s.agents, 5, bird_count,
+        s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 666u);
+    bestiary::spawn_creatures(s.agents, 6, raptor_count,
+        s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 777u);
+    bestiary::spawn_creatures(s.agents, 7, snake_count,
+        s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 888u);
 }
 
 // ===========================================================================
@@ -1000,7 +1299,8 @@ void world_lab_init(WorldLabState& s, Renderer& r)
 
     // ---- Graphics pipelines ---------------------------------------------
     s.pipe_terrain = create_terrain_pipeline(device);
-    s.pipe_clump   = create_wl_clump_pipeline(device);
+    s.pipe_clump    = create_wl_clump_pipeline(device);
+    s.pipe_creature = create_wl_creature_pipeline(device);
 
     s.ds_terrain = alloc_set(device, s.desc_pool, s.pipe_terrain.dsl);
     write_image(device, s.ds_terrain, 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s.hm_gpu.view,    s.sampler);
@@ -1061,6 +1361,9 @@ void world_lab_init(WorldLabState& s, Renderer& r)
     }
 
     // ---- Plant + ecosystem default params ---------------------------------
+    load_plant_profiles(s);
+    build_canonical_meshes(s, alloc);
+
     s.eco_params.region_size   = static_cast<float>(WL_GRID_W) * WL_DX;
     s.eco_params.density_scale = 1.0f;
     s.eco_params.r_min         = 1.5f;
@@ -1119,6 +1422,7 @@ void world_lab_init(WorldLabState& s, Renderer& r)
     s.wildflower_expr.flower_count.high = 10.0f;
 
     // ---- Creature profiles --------------------------------------------------
+    if (!load_creature_profiles(s))
     {
         // Species 0: Sprinter
         bestiary::CreatureProfile sprinter{};
@@ -1239,6 +1543,7 @@ void world_lab_init(WorldLabState& s, Renderer& r)
         wolf.kill_energy_gain = 0.80f;
         wolf.stalk_speed = 1.5f;
         wolf.consume_duration = 3.0f;
+        wolf.max_prey_mass = 200.0f;
         wolf.herd_radius = 15.0f;
         wolf.herd_weight = 0.2f;
         wolf.separation_radius = 3.0f;
@@ -1288,6 +1593,118 @@ void world_lab_init(WorldLabState& s, Renderer& r)
         rabbit.slope_cost_factor = 1.0f;
         rabbit.max_age = 480.0f;
         s.creature_profiles.push_back(rabbit);
+
+        // Species 5: Songbird
+        bestiary::CreatureProfile bird{};
+        bird.archetype = bestiary::Archetype::Bird;
+        bird.body_length = 0.25f;
+        bird.body_height = 0.18f;
+        bird.body_color[0] = 0.35f; bird.body_color[1] = 0.32f; bird.body_color[2] = 0.30f;
+        bird.move_speed = 3.0f;
+        bird.run_speed  = 5.0f;
+        bird.turn_rate  = 6.0f;
+        bird.body_mass  = 0.5f;
+        bird.basal_rate = 0.0025f;
+        bird.locomotion_cost = 0.0002f;
+        bird.hunger_threshold = 0.35f;
+        bird.graze_consume = 0.08f;
+        bird.graze_duration = 1.5f;
+        bird.graze_radius = 2.0f;
+        bird.trophic_efficiency = 0.50f;
+        bird.grass_caloric_value      = 0.5f;
+        bird.bush_caloric_value       = 0.3f;
+        bird.tree_caloric_value       = 0.1f;
+        bird.reed_caloric_value       = 0.4f;
+        bird.wildflower_caloric_value = 1.2f;
+        bird.herd_radius = 15.0f;
+        bird.herd_weight = 0.6f;
+        bird.separation_radius = 1.0f;
+        bird.reproduce_threshold = 0.60f;
+        bird.reproduce_cost = 0.15f;
+        bird.reproduce_cooldown = 15.0f;
+        bird.offspring_energy = 0.30f;
+        bird.water_avoidance = 0.0f;
+        bird.max_slope = 2.0f;
+        bird.slope_cost_factor = 0.0f;
+        bird.max_age = 400.0f;
+        bird.can_fly = true;
+        bird.fly_altitude = 8.0f;
+        bird.takeoff_speed = 3.0f;
+        bird.landing_speed = 2.0f;
+        bird.altitude_wander_amp = 2.0f;
+        bird.seed_disperser = true;
+        bird.seed_drop_probability = 0.015f;
+        bird.seed_kind = 4;
+        s.creature_profiles.push_back(bird);
+
+        // Species 6: Raptor
+        bestiary::CreatureProfile raptor{};
+        raptor.archetype = bestiary::Archetype::Raptor;
+        raptor.body_length = 0.38f;
+        raptor.body_height = 0.25f;
+        raptor.body_color[0] = 0.45f; raptor.body_color[1] = 0.35f; raptor.body_color[2] = 0.25f;
+        raptor.move_speed = 2.5f;
+        raptor.run_speed  = 8.0f;
+        raptor.turn_rate  = 5.0f;
+        raptor.body_mass  = 2.0f;
+        raptor.basal_rate = 0.0015f;
+        raptor.locomotion_cost = 0.0002f;
+        raptor.hunger_threshold = 0.45f;
+        raptor.hunt_radius = 40.0f;
+        raptor.chase_speed = 12.0f;
+        raptor.attack_range = 1.5f;
+        raptor.kill_energy_gain = 0.70f;
+        raptor.stalk_speed = 2.0f;
+        raptor.consume_duration = 4.0f;
+        raptor.max_prey_mass = 5.0f;
+        raptor.herd_radius = 0.0f;
+        raptor.herd_weight = 0.0f;
+        raptor.reproduce_threshold = 0.80f;
+        raptor.reproduce_cost = 0.30f;
+        raptor.reproduce_cooldown = 90.0f;
+        raptor.offspring_energy = 0.40f;
+        raptor.water_avoidance = 0.0f;
+        raptor.max_slope = 2.0f;
+        raptor.slope_cost_factor = 0.0f;
+        raptor.max_age = 1500.0f;
+        raptor.can_fly = true;
+        raptor.fly_altitude = 25.0f;
+        raptor.takeoff_speed = 4.0f;
+        raptor.landing_speed = 2.0f;
+        raptor.altitude_wander_amp = 5.0f;
+        s.creature_profiles.push_back(raptor);
+
+        // Species 7: Snake
+        bestiary::CreatureProfile snake{};
+        snake.archetype = bestiary::Archetype::Snake;
+        snake.body_length = 1.0f;
+        snake.body_height = 0.05f;
+        snake.body_color[0] = 0.40f; snake.body_color[1] = 0.35f; snake.body_color[2] = 0.20f;
+        snake.move_speed = 1.0f;
+        snake.run_speed  = 3.0f;
+        snake.turn_rate  = 4.0f;
+        snake.body_mass  = 1.5f;
+        snake.basal_rate = 0.0008f;
+        snake.locomotion_cost = 0.0004f;
+        snake.hunger_threshold = 0.40f;
+        snake.hunt_radius = 8.0f;
+        snake.chase_speed = 4.0f;
+        snake.attack_range = 0.8f;
+        snake.kill_energy_gain = 0.90f;
+        snake.stalk_speed = 0.0f;
+        snake.consume_duration = 6.0f;
+        snake.max_prey_mass = 5.0f;
+        snake.herd_radius = 0.0f;
+        snake.herd_weight = 0.0f;
+        snake.reproduce_threshold = 0.85f;
+        snake.reproduce_cost = 0.25f;
+        snake.reproduce_cooldown = 120.0f;
+        snake.offspring_energy = 0.35f;
+        snake.water_avoidance = 3.0f;
+        snake.max_slope = 1.2f;
+        snake.slope_cost_factor = 0.5f;
+        snake.max_age = 1800.0f;
+        s.creature_profiles.push_back(snake);
     }
 
     s.persistent_water_depth.assign(WL_GRID_W * WL_GRID_H, 0.0f);
@@ -1443,6 +1860,13 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
     bool lmb = !capture_mouse && glfwGetMouseButton(r.window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
     bool rain_key = glfwGetKey(r.window, GLFW_KEY_R) == GLFW_PRESS;
 
+    if (s.preview_mode) {
+        s.camera.yaw += 0.15f * sim_dt;
+        lmb = false;
+        rain_key = false;
+        return true;
+    }
+
     // ---- ImGui --------------------------------------------------------
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplGlfw_NewFrame();
@@ -1559,6 +1983,15 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
                     static_cast<double>(s.accumulated_time),
                     static_cast<double>(AUTO_REPLANT_INTERVAL - s.auto_replant_timer));
         if (ImGui::Button("Replant now")) s.replant_pending = 1;
+        ImGui::SameLine();
+        if (ImGui::Button("Save Plants")) save_plant_profiles(s);
+        ImGui::SameLine();
+        if (ImGui::Button("Load Plants")) {
+            if (load_plant_profiles(s)) {
+                build_canonical_meshes(s, alloc);
+                s.replant_pending = 1;
+            }
+        }
         ImGui::Separator();
 
         // Per-species plant count
@@ -1576,8 +2009,13 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
         ImGui::Text("plants: %d total", n_plants);
         ImGui::Text("  grass:%d  bush:%d  tree:%d", n_grass, n_bush, n_tree);
         ImGui::Text("  reed:%d  wildflower:%d", n_reed, n_wf);
-        ImGui::Text("mesh: %u verts / %u tris",
-                    s.plants.vertex_count, s.plants.index_count / 3);
+        uint32_t total_inst = 0;
+        for (int k = 0; k < bestiary::PLANT_KIND_COUNT; ++k) total_inst += s.plant_inst_count[k];
+        ImGui::Text("instances: %u  canonical verts/kind: %u/%u/%u/%u/%u",
+                    total_inst,
+                    s.plant_canonical[0].vertex_count, s.plant_canonical[1].vertex_count,
+                    s.plant_canonical[2].vertex_count, s.plant_canonical[3].vertex_count,
+                    s.plant_canonical[4].vertex_count);
     }
 
     // ---- Creatures ---------------------------------------------------------
@@ -1589,6 +2027,15 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
         if (ImGui::Button("Spawn All")) spawn_all_creatures(s);
         ImGui::SameLine();
         if (ImGui::Button("Clear")) { s.agents.clear(); s.ui_follow_agent = -1; }
+
+        if (ImGui::Button("Save Species")) save_creature_profiles(s);
+        ImGui::SameLine();
+        if (ImGui::Button("Load Species")) {
+            if (load_creature_profiles(s)) {
+                bestiary::clear_creature_mesh_cache();
+                spawn_all_creatures(s);
+            }
+        }
 
         // Follow camera controls
         {
@@ -1624,10 +2071,10 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
                     }
                 }
                 ImGui::SameLine();
-                const char* sp_names[] = {"Sprinter","Grazer","Browser","Wolf","Rabbit"};
+                const char* sp_names[] = {"Sprinter","Grazer","Browser","Wolf","Rabbit","Bird","Raptor","Snake"};
                 int sp = s.agents[s.ui_follow_agent].species_id;
                 ImGui::TextDisabled("#%d %s", s.ui_follow_agent,
-                    (sp >= 0 && sp < 5) ? sp_names[sp] : "?");
+                    (sp >= 0 && sp < 8) ? sp_names[sp] : "?");
             }
         }
 
@@ -1637,7 +2084,12 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
         int s2 = bestiary::count_alive_species(s.agents, 2);
         int s3 = bestiary::count_alive_species(s.agents, 3);
         int s4 = bestiary::count_alive_species(s.agents, 4);
-        ImGui::Text("alive: %d  (S:%d G:%d B:%d W:%d R:%d)", alive, s0, s1, s2, s3, s4);
+        int s5 = bestiary::count_alive_species(s.agents, 5);
+        int s6 = bestiary::count_alive_species(s.agents, 6);
+        int s7 = bestiary::count_alive_species(s.agents, 7);
+        ImGui::Text("alive: %d", alive);
+        ImGui::Text("  S:%d G:%d B:%d W:%d R:%d Bi:%d Ra:%d Sn:%d",
+                    s0, s1, s2, s3, s4, s5, s6, s7);
         float cur_avg_energy = bestiary::avg_energy(s.agents);
         float cur_min_energy = bestiary::min_energy(s.agents);
         float cur_max_energy = bestiary::max_energy(s.agents);
@@ -1655,6 +2107,9 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
             s.graph.pop_browser[s.graph.write_idx]  = static_cast<float>(s2);
             s.graph.pop_wolf[s.graph.write_idx]     = static_cast<float>(s3);
             s.graph.pop_rabbit[s.graph.write_idx]   = static_cast<float>(s4);
+            s.graph.pop_bird[s.graph.write_idx]     = static_cast<float>(s5);
+            s.graph.pop_raptor[s.graph.write_idx]   = static_cast<float>(s6);
+            s.graph.pop_snake[s.graph.write_idx]    = static_cast<float>(s7);
             s.graph.pop_total[s.graph.write_idx]    = static_cast<float>(alive);
             s.graph.energy_avg[s.graph.write_idx]   = cur_avg_energy;
             s.graph.energy_min[s.graph.write_idx]   = cur_min_energy;
@@ -1681,6 +2136,9 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
             plot_ring("Browser",  s.graph.pop_browser,  ImVec4(0.4f, 0.3f, 0.2f, 1.0f), 0.0f, pop_max);
             plot_ring("Wolf",     s.graph.pop_wolf,     ImVec4(0.8f, 0.2f, 0.2f, 1.0f), 0.0f, pop_max);
             plot_ring("Rabbit",   s.graph.pop_rabbit,   ImVec4(0.7f, 0.6f, 0.9f, 1.0f), 0.0f, pop_max);
+            plot_ring("Bird",     s.graph.pop_bird,     ImVec4(0.3f, 0.7f, 0.9f, 1.0f), 0.0f, pop_max);
+            plot_ring("Raptor",   s.graph.pop_raptor,   ImVec4(0.9f, 0.5f, 0.1f, 1.0f), 0.0f, pop_max);
+            plot_ring("Snake",    s.graph.pop_snake,    ImVec4(0.2f, 0.5f, 0.2f, 1.0f), 0.0f, pop_max);
             plot_ring("Total",    s.graph.pop_total,    ImVec4(1.0f, 1.0f, 1.0f, 1.0f), 0.0f, pop_max);
         }
 
@@ -1699,25 +2157,31 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
 
         ImGui::Separator();
         ImGui::TextUnformatted("Species");
-        const char* species_names[] = {"Sprinter", "Grazer", "Browser", "Wolf", "Rabbit"};
-        ImGui::Combo("##species", &s.ui_species_sel, species_names, 5);
+        const char* species_names[] = {"Sprinter", "Grazer", "Browser", "Wolf", "Rabbit", "Bird", "Raptor", "Snake"};
+        ImGui::Combo("##species", &s.ui_species_sel, species_names, 8);
         auto& sp = s.creature_profiles[static_cast<size_t>(s.ui_species_sel)];
 
         ImGui::SliderFloat("body mass",       &sp.body_mass,            1.0f, 200.0f, "%.0f kg");
         ImGui::SliderFloat("basal rate",      &sp.basal_rate,           0.001f, 0.05f, "%.3f");
         ImGui::SliderFloat("locomotion cost", &sp.locomotion_cost,      0.001f, 0.02f, "%.4f");
-        if (sp.archetype != bestiary::Archetype::Predator) {
+        bool sp_is_predator = (sp.archetype == bestiary::Archetype::Predator
+                            || sp.archetype == bestiary::Archetype::Raptor
+                            || sp.archetype == bestiary::Archetype::Snake);
+        if (!sp_is_predator) {
             ImGui::SliderFloat("trophic eff",  &sp.trophic_efficiency,  0.01f, 0.50f, "%.2f");
             ImGui::SliderFloat("graze consume",&sp.graze_consume,        0.01f, 0.50f, "%.2f");
         }
         ImGui::SliderFloat("reproduce at", &sp.reproduce_threshold, 0.40f, 0.95f, "%.2f");
-        ImGui::SliderFloat("max age (s)",  &sp.max_age,             30.0f, 600.0f, "%.0f");
-        if (sp.archetype == bestiary::Archetype::Predator) {
+        ImGui::SliderFloat("max age (s)",  &sp.max_age,             30.0f, 1800.0f, "%.0f");
+        if (sp_is_predator) {
             ImGui::SliderFloat("hunt radius",  &sp.hunt_radius,        5.0f, 60.0f, "%.0f m");
             ImGui::SliderFloat("chase speed",  &sp.chase_speed,        3.0f, 15.0f, "%.1f m/s");
             ImGui::SliderFloat("attack range", &sp.attack_range,       0.5f, 3.0f,  "%.1f m");
             ImGui::SliderFloat("kill energy",  &sp.kill_energy_gain,   0.1f, 1.0f,  "%.2f");
             ImGui::SliderFloat("stalk speed",  &sp.stalk_speed,        0.5f, 3.0f,  "%.1f m/s");
+        }
+        if (sp.can_fly) {
+            ImGui::SliderFloat("fly altitude", &sp.fly_altitude,       2.0f, 40.0f, "%.0f m");
         }
         ImGui::SliderFloat("water avoid", &sp.water_avoidance,    0.0f, 20.0f, "%.1f");
         ImGui::SliderFloat("max slope",   &sp.max_slope,          0.2f, 1.5f,  "%.2f");
@@ -1740,11 +2204,11 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
                                     s.eco_params, sim_dt,
                                     s.plant_growth_rate, s.plant_decay_rate);
 
-    constexpr float VEG_REBUILD_INTERVAL = 2.0f;
-    s.veg_rebuild_timer += dt;  // wall-clock: controls GPU mesh rebuild frequency
+    constexpr float VEG_REBUILD_INTERVAL = 0.5f;
+    s.veg_rebuild_timer += dt;
     if (s.veg_rebuild_timer >= VEG_REBUILD_INTERVAL) {
         s.veg_rebuild_timer = 0.0f;
-        rebuild_plant_mesh(s, device, alloc);
+        upload_plant_instances(s, device, alloc);
     }
 
     // ---- Creature tick ---------------------------------------------------
@@ -2110,8 +2574,8 @@ void world_lab_render(WorldLabState& s, Renderer& r,
     vkCmdBindIndexBuffer(cmd, s.terrain_mesh.ibo.buffer, 0, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(cmd, s.terrain_mesh.index_count, 1, 0, 0, 0);
 
-    // Plants
-    if (s.ui_show_plants && s.plants.index_count > 0) {
+    // Plants (instanced, one draw per kind)
+    if (s.ui_show_plants) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipe_clump.pipeline);
         ClumpPC cpc{};
         cpc.mvp = mvp;
@@ -2121,22 +2585,22 @@ void world_lab_render(WorldLabState& s, Renderer& r,
         cpc.time = s.accumulated_time;
         vkCmdPushConstants(cmd, s.pipe_clump.layout, VK_SHADER_STAGE_VERTEX_BIT,
                            0, sizeof(cpc), &cpc);
-        vkCmdBindVertexBuffers(cmd, 0, 1, &s.plants.vbo.buffer, &zero);
-        vkCmdBindIndexBuffer(cmd, s.plants.ibo.buffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, s.plants.index_count, 1, 0, 0, 0);
+        for (int k = 0; k < bestiary::PLANT_KIND_COUNT; ++k) {
+            if (s.plant_inst_count[k] == 0 || s.plant_canonical[k].index_count == 0) continue;
+            VkBuffer     vbufs[2]   = {s.plant_canonical[k].vbo.buffer, s.plant_inst[k].buffer};
+            VkDeviceSize offsets[2] = {0, 0};
+            vkCmdBindVertexBuffers(cmd, 0, 2, vbufs, offsets);
+            vkCmdBindIndexBuffer(cmd, s.plant_canonical[k].ibo.buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(cmd, s.plant_canonical[k].index_count,
+                             s.plant_inst_count[k], 0, 0, 0);
+        }
     }
 
-    // Creatures (same pipeline as plants — height_t=0 means no wind sway)
+    // Creatures (dedicated pipeline — pre-baked world-space vertices, no instancing)
     if (s.ui_creatures_enabled && s.creature_mesh_gpu.index_count > 0) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipe_clump.pipeline);
-        ClumpPC cpc{};
-        cpc.mvp = mvp;
-        cpc.wind_dir[0] = 0.0f;
-        cpc.wind_dir[1] = 0.0f;
-        cpc.wind_speed  = 0.0f;
-        cpc.time = s.accumulated_time;
-        vkCmdPushConstants(cmd, s.pipe_clump.layout, VK_SHADER_STAGE_VERTEX_BIT,
-                           0, sizeof(cpc), &cpc);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipe_creature.pipeline);
+        vkCmdPushConstants(cmd, s.pipe_creature.layout, VK_SHADER_STAGE_VERTEX_BIT,
+                           0, sizeof(glm::mat4), &mvp);
         vkCmdBindVertexBuffers(cmd, 0, 1, &s.creature_mesh_gpu.vbo.buffer, &zero);
         vkCmdBindIndexBuffer(cmd, s.creature_mesh_gpu.ibo.buffer, 0, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed(cmd, s.creature_mesh_gpu.index_count, 1, 0, 0, 0);
@@ -2187,24 +2651,28 @@ void world_lab_render(WorldLabState& s, Renderer& r,
         vkCmdEndRendering(cmd);
     }
 
-    // ---- ImGui pass --------------------------------------------------
-    VkRenderingAttachmentInfo ig_color = color;
-    ig_color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    VkRenderingInfo ig_ri{};
-    ig_ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    ig_ri.renderArea           = {{0, 0}, extent};
-    ig_ri.layerCount           = 1;
-    ig_ri.colorAttachmentCount = 1;
-    ig_ri.pColorAttachments    = &ig_color;
-    vkCmdBeginRendering(cmd, &ig_ri);
-    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
-    vkCmdEndRendering(cmd);
+    // ---- ImGui pass (skipped in preview mode — caller draws its own) ---
+    if (!s.preview_mode) {
+        VkRenderingAttachmentInfo ig_color = color;
+        ig_color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        VkRenderingInfo ig_ri{};
+        ig_ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ig_ri.renderArea           = {{0, 0}, extent};
+        ig_ri.layerCount           = 1;
+        ig_ri.colorAttachmentCount = 1;
+        ig_ri.pColorAttachments    = &ig_color;
+        vkCmdBeginRendering(cmd, &ig_ri);
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+        vkCmdEndRendering(cmd);
+    }
 
-    image_barrier(cmd, r.swapchain_images[image_index],
-        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, VK_ACCESS_2_NONE,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    if (!s.preview_mode) {
+        image_barrier(cmd, r.swapchain_images[image_index],
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, VK_ACCESS_2_NONE,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    }
 
     (void)s.brushing;
     (void)s.wt_water_pulse_active;
@@ -2220,13 +2688,17 @@ void world_lab_shutdown(WorldLabState& s, Renderer& r)
 
     vkDeviceWaitIdle(device);
 
-    destroy_plant_mesh(alloc, s.plants);
+    for (int k = 0; k < bestiary::PLANT_KIND_COUNT; ++k) {
+        destroy_plant_mesh(alloc, s.plant_canonical[k]);
+        destroy_buffer(alloc, s.plant_inst[k]);
+    }
     destroy_plant_mesh(alloc, s.creature_mesh_gpu);
     destroy_buffer(alloc, s.terrain_mesh.vbo);
     destroy_buffer(alloc, s.terrain_mesh.ibo);
 
     destroy_cloud_pipeline(device, s.pipe_cloud);
     vmaDestroyBuffer(alloc, s.camera_ubo, s.camera_ubo_alloc);
+    destroy_wl_creature_pipeline(device, s.pipe_creature);
     destroy_wl_clump_pipeline(device, s.pipe_clump);
     destroy_terrain_pipeline(device, s.pipe_terrain);
     destroy_compute_pipeline(device, s.pipe_erosion);

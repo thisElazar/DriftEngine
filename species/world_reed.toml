@@ -1,0 +1,25 @@
+[species]
+kind = 'reed'
+name = 'world_reed'
+
+[morphology]
+blade_count = 8
+blade_height = 0.80
+blade_width = 0.008
+splay_angle = 8.0
+clump_radius = 0.04
+
+[appearance]
+base_color = [0.40, 0.48, 0.22]
+
+[expression.blade_height]
+low = 0.50
+high = 1.20
+
+[expression.blade_count]
+low = 4.0
+high = 14.0
+
+[expression.color]
+dry = [0.50, 0.45, 0.25]
+wet = [0.30, 0.50, 0.20]

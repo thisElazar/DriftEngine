@@ -636,12 +636,42 @@ void plant_lab_init(PlantLabState& s, Renderer& r)
     // Force first-frame regen by poisoning the snapshot.
     std::memset(&s.last_snapshot, 0xFF, sizeof(s.last_snapshot));
 
+    s.fio.kind_filter = {"grass_clump", "bush", "tree", "lplant", "reed", "wildflower"};
     s.fio.refresh_files();
     s.initialized = true;
 }
 
 bool plant_lab_tick(PlantLabState& s, Renderer& r, float dt)
 {
+    if (!s.pending_file.empty()) {
+        auto path = std::filesystem::path(s.pending_file);
+        s.pending_file.clear();
+        std::string kind = bestiary::detect_species_kind(path);
+        std::string loaded_name;
+        bool ok = false;
+        if (kind == "grass_clump") {
+            ok = bestiary::load_clump(path, s.clump_params, loaded_name, &s.clump_expr);
+            if (ok) s.species_kind = 0;
+        } else if (kind == "bush") {
+            ok = bestiary::load_bush(path, s.bush_params, loaded_name, &s.bush_expr);
+            if (ok) s.species_kind = 1;
+        } else if (kind == "tree") {
+            ok = bestiary::load_tree(path, s.tree_params, loaded_name, &s.tree_expr);
+            if (ok) s.species_kind = 2;
+        } else if (kind == "lplant") {
+            ok = bestiary::load_lplant(path, s.lplant_params, loaded_name, &s.lplant_expr);
+            if (ok) s.species_kind = 3;
+        } else if (kind == "reed") {
+            ok = bestiary::load_clump(path, s.reed_params, loaded_name, &s.reed_expr);
+            if (ok) s.species_kind = 4;
+        } else if (kind == "wildflower") {
+            ok = bestiary::load_wildflower(path, s.wildflower_params, loaded_name, &s.wildflower_expr);
+            if (ok) s.species_kind = 5;
+        }
+        if (ok)
+            std::snprintf(s.fio.name_buf, sizeof(s.fio.name_buf), "%s", loaded_name.c_str());
+    }
+
     // Camera.
     float max_zoom = (s.view_mode == 2) ? 60.0f
                    : (s.view_mode == 1) ? 40.0f

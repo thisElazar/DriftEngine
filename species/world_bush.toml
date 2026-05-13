@@ -1,0 +1,28 @@
+[species]
+kind = 'bush'
+name = 'world_bush'
+
+[morphology]
+leaf_count = 120
+leaf_length = 0.08
+leaf_width = 0.04
+bush_height = 0.6
+bush_radius = 0.4
+stem_height = 0.1
+n_stems = 3
+attractor_count = 200
+kill_ratio = 1.5
+influence_ratio = 3.0
+tropism = 0.2
+surface_bias = 0.5
+envelope_shape = 0
+branch_taper = 0.7
+branch_width_min = 0.003
+branch_width_max = 0.012
+branch_gravity = 0.1
+branch_wobble = 0.15
+tip_leaf_bias = 0.6
+leaf_droop = 0.2
+
+[appearance]
+base_color = [0.28, 0.45, 0.15]

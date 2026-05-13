@@ -8,10 +8,9 @@
     float4 brush_color;
 };
 
-[[vk::combinedImageSampler]][[vk::binding(1, 0)]] Texture2D<float> heightmap;
-[[vk::combinedImageSampler]][[vk::binding(1, 0)]] SamplerState heightmap_sampler;
-[[vk::combinedImageSampler]][[vk::binding(2, 0)]] Texture2D<float4> swe_output;
-[[vk::combinedImageSampler]][[vk::binding(2, 0)]] SamplerState swe_sampler;
+[[vk::binding(1, 0)]] Texture2D<float> heightmap;
+[[vk::binding(2, 0)]] Texture2D<float4> swe_output;
+[[vk::binding(8, 0)]] SamplerState tex_sampler;
 
 [[vk::push_constant]]
 cbuffer PushConstants {
@@ -37,8 +36,8 @@ VSOutput main(VSInput input)
 {
     float2 uv = input.grid_pos / 511.0;
 
-    float t = heightmap.SampleLevel(heightmap_sampler, uv, 0).r;
-    float4 swe = swe_output.SampleLevel(swe_sampler, uv, 0);
+    float t = heightmap.SampleLevel(tex_sampler, uv, 0).r;
+    float4 swe = swe_output.SampleLevel(tex_sampler, uv, 0);
     float surface_elev = swe.r;
     float depth = surface_elev - t;
 
@@ -48,10 +47,10 @@ VSOutput main(VSInput input)
     world_pos.z = (uv.y - 0.5) * terrain_size;
 
     float2 px = float2(heightmap_texel, heightmap_texel);
-    float sL = swe_output.SampleLevel(swe_sampler, uv + float2(-px.x, 0), 0).r;
-    float sR = swe_output.SampleLevel(swe_sampler, uv + float2( px.x, 0), 0).r;
-    float sD = swe_output.SampleLevel(swe_sampler, uv + float2(0, -px.y), 0).r;
-    float sU = swe_output.SampleLevel(swe_sampler, uv + float2(0,  px.y), 0).r;
+    float sL = swe_output.SampleLevel(tex_sampler, uv + float2(-px.x, 0), 0).r;
+    float sR = swe_output.SampleLevel(tex_sampler, uv + float2( px.x, 0), 0).r;
+    float sD = swe_output.SampleLevel(tex_sampler, uv + float2(0, -px.y), 0).r;
+    float sU = swe_output.SampleLevel(tex_sampler, uv + float2(0,  px.y), 0).r;
 
     float dx = terrain_size * heightmap_texel;
     float3 normal = normalize(float3(sL - sR, 2.0 * dx, sD - sU));

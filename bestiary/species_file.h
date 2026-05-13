@@ -4,6 +4,7 @@
 #include "morphology/bush.h"
 #include "morphology/tree.h"
 #include "morphology/lplant.h"
+#include "morphology/wildflower.h"
 #include "creature/creature_profile.h"
 #include "animals/herbivore.h"
 #include "animals/predator.h"
@@ -20,7 +21,8 @@ std::string detect_species_kind(const std::filesystem::path& path);
 bool save_clump(const std::filesystem::path& path,
                 const ClumpParams& params,
                 const std::string& name,
-                const ClumpExpression* expr = nullptr);
+                const ClumpExpression* expr = nullptr,
+                const char* kind_override = nullptr);
 
 bool load_clump(const std::filesystem::path& path,
                 ClumpParams& params,
@@ -57,6 +59,16 @@ bool load_lplant(const std::filesystem::path& path,
                  std::string& name,
                  LPlantExpression* expr = nullptr);
 
+bool save_wildflower(const std::filesystem::path& path,
+                     const WildflowerParams& params,
+                     const std::string& name,
+                     const WildflowerExpression* expr = nullptr);
+
+bool load_wildflower(const std::filesystem::path& path,
+                     WildflowerParams& params,
+                     std::string& name,
+                     WildflowerExpression* expr = nullptr);
+
 bool save_creature(const std::filesystem::path& path,
                    const CreatureProfile& profile,
                    const std::string& name);
@@ -64,6 +76,13 @@ bool save_creature(const std::filesystem::path& path,
 bool load_creature(const std::filesystem::path& path,
                    CreatureProfile& profile,
                    std::string& name);
+
+struct NamedCreatureProfile {
+    std::string      name;
+    CreatureProfile  profile;
+};
+
+std::vector<NamedCreatureProfile> load_creature_dir(const std::filesystem::path& dir);
 
 bool save_animal(const std::filesystem::path& path,
                  Archetype archetype,

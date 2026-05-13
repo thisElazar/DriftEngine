@@ -729,6 +729,19 @@ void animals_lab_init(AnimalsLabState& s, Renderer& r)
 
 bool animals_lab_tick(AnimalsLabState& s, Renderer& r, float dt)
 {
+    if (!s.pending_file.empty()) {
+        auto path = std::filesystem::path(s.pending_file);
+        s.pending_file.clear();
+        bestiary::Archetype loaded_arch{};
+        std::string loaded_name;
+        if (bestiary::load_animal(path, loaded_arch, s.herb_params, s.pred_params,
+                                  s.rabbit_params, s.bird_params, s.snake_params,
+                                  loaded_name)) {
+            s.creature_type = static_cast<int>(loaded_arch);
+            std::snprintf(s.fio.name_buf, sizeof(s.fio.name_buf), "%s", loaded_name.c_str());
+        }
+    }
+
     update_orbit(s.camera, r.window, 10.0f);
 
     // --- Dirty-check params -> regen mesh/skeleton/gaits ---

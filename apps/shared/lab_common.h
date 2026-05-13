@@ -13,11 +13,13 @@
 
 #include "vk_util.h"           // from drift_engine_core
 #include "morphology/clump.h"  // from bestiary — VegetationVertex, VegetationMesh
+#include "species_file.h"      // from bestiary — detect_species_kind
 
 #include <filesystem>
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <initializer_list>
 #include <cstring>
 #include <cstdio>
 
@@ -153,13 +155,22 @@ struct FileIOState {
         status_timer = 3.0f;
     }
 
+    std::vector<std::string> kind_filter;
+
     void refresh_files() {
         file_list.clear();
         selected_file = -1;
         if (!std::filesystem::exists(species_dir())) return;
         for (auto& entry : std::filesystem::directory_iterator(species_dir())) {
-            if (entry.path().extension() == ".toml")
-                file_list.push_back(entry.path().stem().string());
+            if (entry.path().extension() != ".toml") continue;
+            if (!kind_filter.empty()) {
+                auto kind = bestiary::detect_species_kind(entry.path());
+                bool match = false;
+                for (auto& k : kind_filter)
+                    if (k == kind) { match = true; break; }
+                if (!match) continue;
+            }
+            file_list.push_back(entry.path().stem().string());
         }
         std::sort(file_list.begin(), file_list.end());
     }

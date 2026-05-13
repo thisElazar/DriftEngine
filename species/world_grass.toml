@@ -1,0 +1,25 @@
+[species]
+kind = 'grass_clump'
+name = 'world_grass'
+
+[morphology]
+blade_count = 12
+blade_height = 0.4
+blade_width = 0.012
+splay_angle = 25.0
+clump_radius = 0.08
+
+[appearance]
+base_color = [0.40, 0.52, 0.18]
+
+[expression.blade_height]
+low = 0.20
+high = 0.80
+
+[expression.blade_count]
+low = 4.0
+high = 30.0
+
+[expression.color]
+dry = [0.62, 0.55, 0.25]
+wet = [0.20, 0.55, 0.18]

@@ -1,0 +1,64 @@
+[species]
+kind = 'herbivore'
+name = 'grazer'
+
+[body]
+body_length = 0.8
+body_height = 0.6
+body_color = [0.55, 0.40, 0.25]
+
+[locomotion]
+move_speed = 2.0
+run_speed = 6.0
+turn_rate = 3.0
+
+[energy]
+body_mass = 30.0
+basal_rate = 0.0010
+locomotion_cost = 0.0003
+hunger_threshold = 0.45
+starve_threshold = 0.0
+trophic_efficiency = 0.10
+max_age = 300.0
+
+[grazing]
+graze_radius = 3.0
+graze_consume = 0.15
+graze_min_health = 0.15
+graze_duration = 3.0
+grass_caloric_value = 0.6
+bush_caloric_value = 1.0
+tree_caloric_value = 0.3
+reed_caloric_value = 0.5
+wildflower_caloric_value = 0.8
+
+[wander]
+wander_radius = 8.0
+wander_jitter = 2.0
+
+[flee]
+flee_radius = 15.0
+flee_duration = 4.0
+
+[herding]
+herd_radius = 20.0
+herd_weight = 0.3
+separation_radius = 2.0
+separation_weight = 0.5
+alignment_weight = 0.2
+
+[reproduction]
+reproduce_threshold = 0.75
+reproduce_cost = 0.25
+reproduce_cooldown = 30.0
+offspring_energy = 0.40
+mate_search_radius = 20.0
+
+[terrain]
+water_avoidance = 8.0
+max_slope = 0.7
+slope_cost_factor = 2.0
+
+[drinking]
+drink_radius = 2.0
+drink_rate = 0.008
