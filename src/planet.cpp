@@ -69,24 +69,56 @@ struct TileCandidate {
     bool operator<(const TileCandidate& o) const { return screen_error < o.screen_error; }
 };
 
+// Precomputed once per frame for fast horizon culling.
+// Works in cosine-of-angle space so the per-tile test is a single dot
+// product + comparison — no acos.  A per-level lookup table of
+// cos(horizon + margin_L) is built once per frame with exact trig so
+// large margins (low LOD levels) are handled correctly.
+static constexpr uint32_t HORIZON_MAX_LEVEL = 24;
+
+struct HorizonState {
+    glm::dvec3 cam_dir;
+    double     cos_threshold[HORIZON_MAX_LEVEL + 1];
+    bool       active;
+};
+
+static HorizonState build_horizon_state(const glm::dvec3& cam_pos, double planet_radius,
+                                        double max_elevation)
+{
+    HorizonState h;
+    double cam_height = glm::length(cam_pos);
+    h.active = cam_height > planet_radius * 1.001;
+    if (h.active) {
+        h.cam_dir = cam_pos / cam_height;
+        double cos_h = planet_radius / cam_height;
+        double sin_h = std::sqrt(1.0 - cos_h * cos_h);
+        double elev_margin = max_elevation / planet_radius;
+        for (uint32_t L = 0; L <= HORIZON_MAX_LEVEL; L++) {
+            double margin = 2.0 / (1 << L) * 1.5 + elev_margin;
+            h.cos_threshold[L] = cos_h * std::cos(margin) - sin_h * std::sin(margin);
+        }
+    }
+    return h;
+}
+
+static bool tile_behind_horizon(const HorizonState& h, const glm::dvec3& tile_dir,
+                                uint32_t level)
+{
+    if (!h.active) return false;
+    uint32_t L = (level <= HORIZON_MAX_LEVEL) ? level : HORIZON_MAX_LEVEL;
+    return glm::dot(h.cam_dir, tile_dir) < h.cos_threshold[L];
+}
+
 static double compute_tile_error(const QuadNode& node, const glm::dvec3& cam_pos,
+                                 const HorizonState& horizon,
                                  float screen_height, float fov_y, float planet_radius)
 {
-    glm::dvec3 center = planet_tile_center_on_sphere(node, planet_radius);
-    glm::dvec3 rel = center - cam_pos;
-    double dist = glm::length(rel);
+    glm::dvec3 tile_dir = planet_tile_center_dir(node);
+    if (tile_behind_horizon(horizon, tile_dir, node.level))
+        return -1.0;
 
-    double cam_height = glm::length(cam_pos);
-    if (cam_height > static_cast<double>(planet_radius) * 1.01) {
-        glm::dvec3 cam_dir = glm::normalize(cam_pos);
-        glm::dvec3 tile_dir = glm::normalize(center);
-        double angle = std::acos(std::clamp(glm::dot(cam_dir, tile_dir), -1.0, 1.0));
-        double horizon = std::acos(static_cast<double>(planet_radius) / cam_height);
-        double tile_angular_size = 2.0 / (1 << node.level) * 1.5;
-        if (angle - tile_angular_size > horizon)
-            return -1.0;
-    }
-
+    glm::dvec3 center = tile_dir * static_cast<double>(planet_radius);
+    double dist = glm::length(center - cam_pos);
     double tile_world_size = (2.0 / (1 << node.level)) * static_cast<double>(planet_radius) * 1.5708;
     return (tile_world_size / std::max(dist, 1.0)) * screen_height / fov_y;
 }
@@ -95,6 +127,10 @@ std::vector<QuadNode> planet_select_visible_tiles(const PlanetTraversalParams& p
 {
     std::vector<QuadNode> visible_tiles;
     visible_tiles.reserve(params.max_tiles);
+
+    HorizonState horizon = build_horizon_state(
+        params.cam_pos, static_cast<double>(params.planet_radius),
+        static_cast<double>(params.max_elevation));
 
     uint32_t effective_max_level = params.max_level;
     if (params.altitude_above_terrain > 100.0) {
@@ -106,7 +142,7 @@ std::vector<QuadNode> planet_select_visible_tiles(const PlanetTraversalParams& p
 
     for (uint32_t f = 0; f < 6; f++) {
         QuadNode root{f, 0, 0, 0};
-        double err = compute_tile_error(root, params.cam_pos,
+        double err = compute_tile_error(root, params.cam_pos, horizon,
                                         params.screen_height, params.fov_y, params.planet_radius);
         if (err > 0.0) pq.push({root, err});
     }
@@ -120,7 +156,7 @@ std::vector<QuadNode> planet_select_visible_tiles(const PlanetTraversalParams& p
                 for (uint32_t cx = 0; cx < 2; cx++) {
                     QuadNode child{top.node.face, top.node.level + 1,
                                    top.node.x * 2 + cx, top.node.y * 2 + cy};
-                    double err = compute_tile_error(child, params.cam_pos,
+                    double err = compute_tile_error(child, params.cam_pos, horizon,
                                                     params.screen_height, params.fov_y, params.planet_radius);
                     if (err > 0.0) pq.push({child, err});
                 }

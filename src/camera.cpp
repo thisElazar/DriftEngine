@@ -353,18 +353,8 @@ glm::mat4 camera_build_view(const Camera& cam)
     glm::mat3 rot = glm::mat3_cast(orient);
     glm::mat3 inv_rot = glm::transpose(rot);
 
-    if (cam.mode == CameraMode::Orbital) {
-        glm::vec3 arm_offset(0.0f, 0.0f, static_cast<float>(cam.orbit.arm_length));
-        glm::vec3 eye_local = rot * arm_offset;
-        glm::mat4 view(1.0f);
-        view[0] = glm::vec4(inv_rot[0], 0.0f);
-        view[1] = glm::vec4(inv_rot[1], 0.0f);
-        view[2] = glm::vec4(inv_rot[2], 0.0f);
-        view[3] = glm::vec4(-(inv_rot * eye_local), 1.0f);
-        return view;
-    }
-
-    // FP: camera-relative — eye is at origin in its own frame.
+    // Rotation only — tile positions are already camera-relative (rel_d
+    // subtracts the full eye position on the CPU in double precision).
     glm::mat4 view(1.0f);
     view[0] = glm::vec4(inv_rot[0], 0.0f);
     view[1] = glm::vec4(inv_rot[1], 0.0f);

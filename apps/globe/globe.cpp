@@ -2649,6 +2649,7 @@ void globe_render(GlobeState& s, Renderer& r,
         tp.screen_height = static_cast<float>(extent.height);
         tp.fov_y = s.camera.fov_y;
         tp.planet_radius = PLANET_RADIUS;
+        tp.max_elevation = PLANET_MAX_ELEVATION;
         tp.subdivide_threshold = TILE_SUBDIVIDE_PX;
         tp.max_level = PLANET_MAX_LEVEL;
         tp.max_tiles = PLANET_TILE_POOL;

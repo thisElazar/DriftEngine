@@ -44,6 +44,7 @@ struct PlanetTraversalParams {
     float      screen_height;
     float      fov_y;
     float      planet_radius;
+    float      max_elevation;
     float      subdivide_threshold;
     uint32_t   max_level;
     uint32_t   max_tiles;
