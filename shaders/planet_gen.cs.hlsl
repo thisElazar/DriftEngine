@@ -34,10 +34,13 @@ float hash31(float3 p)
 
 float3 hash33(float3 p)
 {
-    p = float3(dot(p, float3(127.1, 311.7, 74.7)),
-               dot(p, float3(269.5, 183.3, 246.1)),
-               dot(p, float3(113.5, 271.9, 124.6)));
-    return frac(sin(p) * 43758.5453123);
+    float3 p3 = frac(p * float3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yxz + 31.32);
+    return float3(
+        frac((p3.x + p3.y) * p3.z),
+        frac((p3.z + p3.x) * p3.y),
+        frac((p3.y + p3.z) * p3.x)
+    );
 }
 
 float gradient_noise_3d(float3 p)
@@ -113,60 +116,125 @@ float3 cube_to_sphere(float3 p)
     );
 }
 
+// ---------------------------------------------------------------------------
+// Worley (cellular) noise — returns F1, F2 distances and the integer cell
+// coords of the two nearest cell points.
+// ---------------------------------------------------------------------------
+struct WorleyResult {
+    float  F1, F2;
+    float3 cell_A, cell_B;
+};
+
+WorleyResult worley3d(float3 p, float seed_ofs)
+{
+    float3 ip = floor(p);
+    float3 fp = frac(p);
+
+    float d1 = 1e10, d2 = 1e10;
+    float3 c1 = 0, c2 = 0;
+
+    for (int z = -1; z <= 1; z++)
+    for (int y = -1; y <= 1; y++)
+    for (int x = -1; x <= 1; x++) {
+        float3 cell = ip + float3(x, y, z);
+        float3 pt = float3(x, y, z) + hash33(cell + seed_ofs) - fp;
+        float d = dot(pt, pt);
+        if (d < d1) {
+            d2 = d1; c2 = c1;
+            d1 = d;  c1 = cell;
+        } else if (d < d2) {
+            d2 = d;  c2 = cell;
+        }
+    }
+
+    WorleyResult r;
+    r.F1 = sqrt(d1);
+    r.F2 = sqrt(d2);
+    r.cell_A = c1;
+    r.cell_B = c2;
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Tectonic + watershed terrain height
+// ---------------------------------------------------------------------------
+
+static const float PLATE_FREQ      = 1.1;
+static const float BOUNDARY_WIDTH  = 0.12;
+
+static const float BASIN_FREQ_MAJ  = 12.0;
+static const float BASIN_FREQ_MIN  = 40.0;
+
+static const float RIDGE_SHARP_MAJ = 0.08;
+static const float RIDGE_SHARP_MIN = 0.06;
+static const float RIDGE_H_MAJ     = 1500.0;
+static const float RIDGE_H_MIN     = 600.0;
+
+static const float BASIN_DEPTH_MAJ = 800.0;
+static const float BASIN_DEPTH_MIN = 300.0;
+
+static const float VALLEY_FLOOR_W  = 0.02;
+static const float VALLEY_FLOOR_H  = 200.0;
+
 float terrain_height(float3 sphere_dir)
 {
     float3 sp = sphere_dir * 1000.0;
-    float latitude = abs(sphere_dir.y);
 
-    // Continental base — large-scale elevation variation
-    float base = 200.0 + fbm3d(sp * 0.0003, 5, 2.0, 0.5) * 1500.0;
+    // ===== LAYER 1: TECTONIC PLATES =====
+    WorleyResult plate = worley3d(sphere_dir * PLATE_FREQ, seed * 0.07);
 
-    // Biome selection
-    float biome = fbm3d(sp * 0.0005 + float3(7.7, 0, 0), 3, 2.0, 0.5);
+    float continental_A = step(0.45, hash31(plate.cell_A + 77.7));
+    float plate_base = lerp(-200.0, 1000.0, continental_A);
 
-    float mtn_w    = smoothstep(0.55, 0.70, biome);
-    float desert_w = smoothstep(0.35, 0.50, biome) * smoothstep(0.55, 0.40, biome)
-                   * smoothstep(0.65, 0.15, latitude);
-    float plains_w = smoothstep(0.45, 0.25, biome);
-    float polar_w  = smoothstep(0.55, 0.80, latitude);
+    float boundary = 1.0 - smoothstep(0.0, BOUNDARY_WIDTH, plate.F2 - plate.F1);
 
-    // Mountains: sharp ridges + broad uplift
-    float mountain = ridged3d(sp * 0.006, 7) * 4500.0;
-    mountain += fbm3d(sp * 0.003, 5, 2.0, 0.55) * 2000.0;
+    float3 vel_A = hash33(plate.cell_A + seed * 0.31) * 2.0 - 1.0;
+    float3 vel_B = hash33(plate.cell_B + seed * 0.31) * 2.0 - 1.0;
+    float3 bn = normalize(plate.cell_B - plate.cell_A + 1e-6);
+    float approach = dot(vel_A - vel_B, bn);
+    float convergent = smoothstep(-0.2, 0.2, approach);
 
-    // Desert: mesas, dunes, sand sheets
-    float desert = fbm3d(sp * 0.005, 5, 2.0, 0.5) * 500.0;
-    desert += abs(gradient_noise_3d(sp * 0.03)) * 250.0;
-    desert += (gradient_noise_3d(sp * 0.1) - 0.5) * 80.0;
+    float mountain_h = boundary * convergent * 3500.0;
+    float rift_h = boundary * (1.0 - convergent) * -600.0;
 
-    // Plains: gentle rolling terrain
-    float plains = fbm3d(sp * 0.004, 5, 2.0, 0.5) * 400.0;
-    plains += fbm3d(sp * 0.02, 3, 2.0, 0.4) * 100.0;
+    float cont_swell = (fbm3d(sp * 0.0003, 4, 2.0, 0.5) - 0.5) * 800.0;
 
-    // Polar: ice fields with crevasses
-    float polar = fbm3d(sp * 0.003, 4, 2.0, 0.5) * 800.0;
-    polar += abs(gradient_noise_3d(sp * 0.02) - 0.5) * 200.0;
+    float tectonic_h = plate_base + mountain_h + rift_h + cont_swell;
 
-    float total_w = max(mtn_w + desert_w + plains_w + polar_w, 0.01);
-    float biome_h = (mountain * mtn_w + desert * desert_w + plains * plains_w + polar * polar_w) / total_w;
+    // ===== LAYER 2: DRAINAGE BASINS =====
+    WorleyResult basin_maj = worley3d(sphere_dir * BASIN_FREQ_MAJ, seed * 0.13 + 1000.0);
+    WorleyResult basin_min = worley3d(sphere_dir * BASIN_FREQ_MIN, seed * 0.19 + 2000.0);
 
-    float h = base + biome_h;
+    float ridge_maj = smoothstep(RIDGE_SHARP_MAJ, 0.0, basin_maj.F2 - basin_maj.F1) * RIDGE_H_MAJ;
 
-    // Biome-independent global relief — without this, plains/desert biomes
-    // dominate ~80% of the planet and stay nearly flat (only 400-500 m of
-    // variation on a 200-1700 m base). These layers add visible structure
-    // everywhere while preserving the biome character on top.
-    h += ridged3d(sp * 0.4, 5) * 350.0;                 // global ridge networks (~16 km)
-    h += (fbm3d(sp * 0.08, 6, 2.0, 0.5) - 0.5) * 600.0; // ~80 km broad swell
+    float in_basin = smoothstep(0.0, 0.15, basin_maj.F2 - basin_maj.F1);
+    float ridge_min = smoothstep(RIDGE_SHARP_MIN, 0.0, basin_min.F2 - basin_min.F1)
+                    * RIDGE_H_MIN * in_basin;
 
-    // Surface detail — visible at walking scale, independent of biome.
-    h += (gradient_noise_3d(sp * 0.15) - 0.5) * 40.0;   // ~40 km
-    h += (fbm3d(sp * 1.6, 3, 2.0, 0.5)  - 0.5) * 200.0; // ~4 km rolling
-    h += (gradient_noise_3d(sp * 13.0)  - 0.5) * 30.0;  // ~500 m bumps
-    h += (gradient_noise_3d(sp * 80.0)  - 0.5) * 8.0;   // ~80 m undulation
-    h += (gradient_noise_3d(sp * 640.0) - 0.5) * 1.5;   // ~10 m surface
+    float slope_maj = pow(saturate(basin_maj.F1 * 3.0), 0.6) * BASIN_DEPTH_MAJ;
+    float slope_min = pow(saturate(basin_min.F1 * 5.0), 0.6) * BASIN_DEPTH_MIN * in_basin;
 
-    return h;
+    // ===== LAYER 3: VALLEY PROFILE =====
+    float valley_flat = smoothstep(VALLEY_FLOOR_W, 0.0, basin_maj.F1) * VALLEY_FLOOR_H;
+    float valley_flat_min = smoothstep(VALLEY_FLOOR_W, 0.0, basin_min.F1) * (VALLEY_FLOOR_H * 0.4) * in_basin;
+
+    float drainage_h = ridge_maj + ridge_min + slope_maj + slope_min - valley_flat - valley_flat_min;
+
+    // Mountain detail on convergent boundaries
+    float mtn_detail = ridged3d(sp * 0.006, 5) * 1500.0 * boundary * convergent;
+
+    // ===== LAYER 4: SURFACE DETAIL =====
+    float detail = 0.0;
+    detail += ridged3d(sp * 0.4, 5) * 200.0;
+    detail += (fbm3d(sp * 0.08, 6, 2.0, 0.5) - 0.5) * 300.0;
+    detail += (gradient_noise_3d(sp * 0.15) - 0.5) * 40.0;
+    detail += (fbm3d(sp * 1.6, 3, 2.0, 0.5) - 0.5) * 150.0;
+    detail += (gradient_noise_3d(sp * 13.0) - 0.5) * 30.0;
+    detail += (gradient_noise_3d(sp * 80.0) - 0.5) * 8.0;
+    detail += (gradient_noise_3d(sp * 640.0) - 0.5) * 1.5;
+
+    float h = tectonic_h + drainage_h + mtn_detail + detail;
+    return clamp(h, -2000.0, 8000.0);
 }
 
 [numthreads(8, 8, 1)]
