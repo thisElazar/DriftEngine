@@ -103,3 +103,54 @@ capture + fly-to-cursor (C). Then confirm scroll-zoom survives a Globe round-tri
   delete `install_launcher_input`
 - `src/main.cpp` (standalone) — build a minimal `InputFrame` too (or retire; see
   Stage 3)
+
+---
+
+## Increment B — Globe off callbacks (VERIFIED SCOPE, not yet done)
+
+Increment A (InputFrame threaded through every tick; orbit labs fully ported)
+landed in commit 36cd189. Globe takes `const InputFrame&` but still `(void)in`s
+it and uses its GLFW callbacks. Removing those is bigger than a globe.cpp edit:
+
+**The camera module is the real coupling.** `camera_update(Camera&, GLFWwindow*,
+dt, ...)` (src/camera.cpp:84) polls movement *itself*:
+`glfwGetKey(window, W/A/S/D/Q/E/LEFT_SHIFT/LEFT_CONTROL)` at lines 99-105. Mouse-
+look enters via `camera_apply_mouse_look(cam, dx, dy)` (camera.cpp:53) called from
+globe's `cursor_pos_callback` on RMB-drag; zoom via `camera_zoom()` from
+`scroll_callback`. So input reaches the camera through callbacks, not InputState.
+
+**globe.cpp s.input touchpoints (ground-truth lines, HEAD 36cd189):**
+- 1958/1960 reload_shaders (F5)
+- 2263/2268/2269 toggle_camera_mode (F) + reset rmb_held
+- 2290-2296 cursor-visibility state machine (rmb_held → GLFW_CURSOR_DISABLED;
+  first_mouse reset) via glfwSetInputMode
+- 2316 cursor_x/cursor_y → ray-pick NDC
+- 2421/2431 warp_to_cursor (C)
+- 2437 lmb_held && !rmb_held → brush gate
+- 3151/3156 pulse_pending (Space)
+- brush_mode (1/2/3/4) used throughout stamp/water/sand dispatch
+- 3580 shutdown restores GLFW_CURSOR_NORMAL
+
+**Required changes (do with reliable file I/O + interactive testing):**
+1. Extend InputFrame with movement (w/a/s/d/q/e, ctrl) and *edge-triggered*
+   keys (f_pressed, c_pressed, space_pressed, f5_pressed) — the callbacks fire on
+   GLFW_PRESS edges, so held-state booleans would retrigger every frame.
+2. Change `camera_update` to take movement + look-delta from InputFrame instead
+   of `GLFWwindow*` (core-lib change; standalone src/main.cpp must build the
+   frame too, or keep a window-polling overload for standalone).
+3. Replace globe's 15 s.input.* sites with in.*; feed in.mouse_dx/dy to
+   camera_apply_mouse_look when in.rmb && !in.ui_wants_mouse; in.scroll to zoom.
+4. Cursor capture: globe sets s.want_cursor_capture (InputFrame out-field already
+   exists); launcher applies glfwSetInputMode after tick. Remove globe's direct
+   glfwSetInputMode calls + the init input_install_callbacks/cb_ctx.
+5. Delete dead code: input_install_callbacks + GLFW callbacks (src/input.cpp),
+   CallbackContext (src/input.h), g_scroll_accum/lab_scroll_cb (lab_common.h),
+   install_launcher_input (launcher) — once nobody steals callbacks.
+
+**Verification (human, no screenshots):** orbital RMB-orbit + scroll-zoom; F to
+first-person; WASD+QE walk; RMB mouse-look with cursor captured; C fly-to-cursor;
+1/2/3/4 brush modes + LMB paint; Space pulse; ESC→menu; scroll-zoom survives a
+Globe round-trip with install_launcher_input removed.
+
+Status note: paused before starting — session file-read I/O was fabricating
+buffer content, unsafe for a precise shared-camera rewrite. Resume with clean I/O.
