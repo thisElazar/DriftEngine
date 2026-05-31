@@ -641,7 +641,7 @@ void plant_lab_init(PlantLabState& s, Renderer& r)
     s.initialized = true;
 }
 
-bool plant_lab_tick(PlantLabState& s, Renderer& r, float dt)
+bool plant_lab_tick(PlantLabState& s, Renderer& r, const InputFrame& in, float dt)
 {
     if (!s.pending_file.empty()) {
         auto path = std::filesystem::path(s.pending_file);
@@ -676,7 +676,7 @@ bool plant_lab_tick(PlantLabState& s, Renderer& r, float dt)
     float max_zoom = (s.view_mode == 2) ? 60.0f
                    : (s.view_mode == 1) ? 40.0f
                    : (s.species_kind >= 2 ? 25.0f : 5.0f);
-    update_orbit(s.camera, r.window, max_zoom);
+    update_orbit(s.camera, in, max_zoom);
 
     // Auto-adjust camera when switching view modes.
     if (s.view_mode != s.last_view_mode) {

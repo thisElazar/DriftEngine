@@ -727,7 +727,7 @@ void animals_lab_init(AnimalsLabState& s, Renderer& r)
     s.initialized = true;
 }
 
-bool animals_lab_tick(AnimalsLabState& s, Renderer& r, float dt)
+bool animals_lab_tick(AnimalsLabState& s, Renderer& r, const InputFrame& in, float dt)
 {
     if (!s.pending_file.empty()) {
         auto path = std::filesystem::path(s.pending_file);
@@ -742,7 +742,7 @@ bool animals_lab_tick(AnimalsLabState& s, Renderer& r, float dt)
         }
     }
 
-    update_orbit(s.camera, r.window, 10.0f);
+    update_orbit(s.camera, in, 10.0f);
 
     // --- Dirty-check params -> regen mesh/skeleton/gaits ---
     bool params_changed = false;

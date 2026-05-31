@@ -1719,7 +1719,7 @@ void world_lab_init(WorldLabState& s, Renderer& r)
 // ===========================================================================
 // world_lab_tick
 // ===========================================================================
-bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
+bool world_lab_tick(WorldLabState& s, Renderer& r, const InputFrame& in, float dt)
 {
     constexpr float AUTO_REPLANT_INTERVAL = 8.0f;
 
@@ -1814,35 +1814,30 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
             }
         }
 
-        double mx, my;
-        glfwGetCursorPos(r.window, &mx, &my);
-        bool rmb = glfwGetMouseButton(r.window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
-        bool capture = ImGui::GetIO().WantCaptureMouse;
+        bool rmb = in.rmb;
+        bool capture = in.ui_wants_mouse;
         if (rmb && !capture) {
             if (s.camera.dragging) {
-                s.camera.yaw   -= static_cast<float>(mx - s.camera.last_mx) * 0.005f;
-                s.camera.pitch += static_cast<float>(my - s.camera.last_my) * 0.005f;
+                s.camera.yaw   -= static_cast<float>(in.mouse_x - s.camera.last_mx) * 0.005f;
+                s.camera.pitch += static_cast<float>(in.mouse_y - s.camera.last_my) * 0.005f;
                 s.camera.pitch  = glm::clamp(s.camera.pitch, 0.05f, 1.4f);
             }
             s.camera.dragging = true;
         } else {
             s.camera.dragging = false;
         }
-        s.camera.last_mx = mx; s.camera.last_my = my;
+        s.camera.last_mx = in.mouse_x; s.camera.last_my = in.mouse_y;
         if (!capture) {
-            s.camera.distance *= std::pow(0.9f, g_scroll_accum);
+            s.camera.distance *= std::pow(0.9f, in.scroll);
             float dist_min = (s.ui_follow_agent >= 0) ?  2.0f : 30.0f;
             float dist_max = (s.ui_follow_agent >= 0) ? 40.0f : 800.0f;
             s.camera.distance = glm::clamp(s.camera.distance, dist_min, dist_max);
         }
-        g_scroll_accum = 0.0f;
     }
 
     // Cursor pick
-    int win_w, win_h;
-    glfwGetWindowSize(r.window, &win_w, &win_h);
-    double mx, my;
-    glfwGetCursorPos(r.window, &mx, &my);
+    int win_w = in.win_w, win_h = in.win_h;
+    double mx = in.mouse_x, my = in.mouse_y;
     float aspect = float(win_w) / float(win_h);
     glm::mat4 proj = glm::perspective(glm::radians(45.0f), aspect, 0.5f, 1500.0f);
     proj[1][1] *= -1.0f;
@@ -1856,9 +1851,9 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, float dt)
     float pick_gx = -1.0f, pick_gy = -1.0f;
     bool have_pick = pick_grid_cell(view, proj, ndc, pick_gx, pick_gy);
 
-    bool capture_mouse = ImGui::GetIO().WantCaptureMouse;
-    bool lmb = !capture_mouse && glfwGetMouseButton(r.window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
-    bool rain_key = glfwGetKey(r.window, GLFW_KEY_R) == GLFW_PRESS;
+    bool capture_mouse = in.ui_wants_mouse;
+    bool lmb = !capture_mouse && in.lmb;
+    bool rain_key = in.key_r;
 
     if (s.preview_mode) {
         s.camera.yaw += 0.15f * sim_dt;

@@ -89,7 +89,7 @@ void plant_lab_init(PlantLabState& s, Renderer& r);
 
 /// Poll camera, dirty-check -> regen mesh, draw ImGui panel.
 /// Returns false if the user pressed "Back" (only possible when s.embedded).
-bool plant_lab_tick(PlantLabState& s, Renderer& r, float dt);
+bool plant_lab_tick(PlantLabState& s, Renderer& r, const InputFrame& in, float dt);
 
 /// Record the command buffer: barriers, clump draw, ImGui draw, present barrier.
 void plant_lab_render(PlantLabState& s, Renderer& r,

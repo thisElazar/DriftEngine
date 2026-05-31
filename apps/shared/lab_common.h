@@ -12,6 +12,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include "vk_util.h"           // from drift_engine_core
+#include "input_frame.h"       // from drift_engine_core — unified per-frame input
 #include "morphology/clump.h"  // from bestiary — VegetationVertex, VegetationMesh
 #include "species_file.h"      // from bestiary — detect_species_kind
 
@@ -46,30 +47,28 @@ struct OrbitCamera {
     bool      dragging = false;
 };
 
-inline void update_orbit(OrbitCamera& cam, GLFWwindow* window, float max_dist = 5.0f)
+// Orbit camera update driven by the unified per-frame InputFrame. RMB-drag
+// rotates; wheel zooms. ImGui mouse capture is respected via in.ui_wants_mouse.
+// (The launcher drains the scroll accumulator into in.scroll once per frame.)
+inline void update_orbit(OrbitCamera& cam, const InputFrame& in, float max_dist = 5.0f)
 {
-    double mx, my;
-    glfwGetCursorPos(window, &mx, &my);
-
-    bool rmb = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
-    if (rmb && !ImGui::GetIO().WantCaptureMouse) {
+    if (in.rmb && !in.ui_wants_mouse) {
         if (cam.dragging) {
-            cam.yaw   -= static_cast<float>(mx - cam.last_mx) * 0.005f;
-            cam.pitch += static_cast<float>(my - cam.last_my) * 0.005f;
+            cam.yaw   -= static_cast<float>(in.mouse_x - cam.last_mx) * 0.005f;
+            cam.pitch += static_cast<float>(in.mouse_y - cam.last_my) * 0.005f;
             cam.pitch  = glm::clamp(cam.pitch, -1.5f, 1.5f);
         }
         cam.dragging = true;
     } else {
         cam.dragging = false;
     }
-    cam.last_mx = mx;
-    cam.last_my = my;
+    cam.last_mx = in.mouse_x;
+    cam.last_my = in.mouse_y;
 
-    if (!ImGui::GetIO().WantCaptureMouse) {
-        cam.distance -= g_scroll_accum * 0.1f;
+    if (!in.ui_wants_mouse) {
+        cam.distance -= in.scroll * 0.1f;
         cam.distance  = glm::clamp(cam.distance, 0.2f, max_dist);
     }
-    g_scroll_accum = 0.0f;
 }
 
 inline glm::mat4 orbit_view(const OrbitCamera& cam)

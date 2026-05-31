@@ -328,7 +328,7 @@ void world_lab_init(WorldLabState& s, Renderer& r);
 
 /// Poll camera, run simulation, handle input, draw ImGui panel.
 /// Returns false if the user pressed "Back" (only possible when s.embedded).
-bool world_lab_tick(WorldLabState& s, Renderer& r, float dt);
+bool world_lab_tick(WorldLabState& s, Renderer& r, const InputFrame& in, float dt);
 
 /// Record the command buffer: compute dispatches, terrain draw, plant draw,
 /// creature draw, cloud draw, ImGui draw, present barrier.

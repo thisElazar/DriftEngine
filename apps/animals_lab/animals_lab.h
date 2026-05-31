@@ -194,7 +194,7 @@ void animals_lab_init(AnimalsLabState& s, Renderer& r);
 
 /// Poll camera, dirty-check -> regen mesh/skeleton/gaits, animation update, ImGui panel.
 /// Returns false if the user pressed "Back" (only possible when s.embedded).
-bool animals_lab_tick(AnimalsLabState& s, Renderer& r, float dt);
+bool animals_lab_tick(AnimalsLabState& s, Renderer& r, const InputFrame& in, float dt);
 
 /// Record the command buffer: barriers, mesh draw, skeleton overlay, ImGui draw, present barrier.
 void animals_lab_render(AnimalsLabState& s, Renderer& r,

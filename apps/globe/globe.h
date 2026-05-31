@@ -13,6 +13,7 @@
 #include "terrain.h"
 #include "ui.h"
 #include "vk_util.h"
+#include "input_frame.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -213,7 +214,7 @@ struct GlobeState {
 void globe_init(GlobeState& s, Renderer& r);
 
 /// Returns false if the user pressed "Back" (only when s.embedded).
-bool globe_tick(GlobeState& s, Renderer& r, float dt);
+bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt);
 
 void globe_render(GlobeState& s, Renderer& r,
                   FrameData& frame, uint32_t image_index, VkExtent2D extent);

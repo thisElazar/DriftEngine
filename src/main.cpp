@@ -28,7 +28,9 @@ int main()
         if (glfwGetKey(r.window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
             glfwSetWindowShouldClose(r.window, GLFW_TRUE);
 
-        globe_tick(state, r, dt);
+        // Standalone Globe still reads input via its own GLFW callbacks, so it
+        // ignores the InputFrame; pass a default one for signature parity.
+        globe_tick(state, r, InputFrame{}, dt);
 
         FrameData* frame = nullptr;
         uint32_t   image_index = 0;

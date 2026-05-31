@@ -1938,8 +1938,12 @@ void globe_init(GlobeState& s, Renderer& r)
 }
 
 // ---------------------------------------------------------------------------
-bool globe_tick(GlobeState& s, Renderer& r, float dt)
+bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
 {
+    // Globe still reads input through its own GLFW callbacks (s.input/cb_ctx);
+    // the unified InputFrame is threaded for signature parity and will replace
+    // those callbacks in a follow-up (see docs/INPUT_UNIFICATION.md).
+    (void)in;
     VkDevice device = r.device;
     VmaAllocator allocator = r.allocator;
     VkQueue graphics_queue = r.graphics_queue;

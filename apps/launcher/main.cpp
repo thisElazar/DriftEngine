@@ -138,6 +138,53 @@ static void install_launcher_input(Renderer& r)
 }
 
 // ---------------------------------------------------------------------------
+// Poll all user input into one immutable snapshot for this frame. This is the
+// single input source the labs consume via their tick (see input_frame.h /
+// docs/INPUT_UNIFICATION.md). Mouse/scroll deltas are computed against prev;
+// the wheel accumulator (fed by lab_scroll_cb) is drained here.
+// ---------------------------------------------------------------------------
+static InputFrame poll_input(Renderer& r, const InputFrame& prev)
+{
+    InputFrame in;
+    GLFWwindow* w = r.window;
+
+    glfwGetCursorPos(w, &in.mouse_x, &in.mouse_y);
+    in.mouse_dx = static_cast<float>(in.mouse_x - prev.mouse_x);
+    in.mouse_dy = static_cast<float>(in.mouse_y - prev.mouse_y);
+
+    in.scroll = g_scroll_accum;
+    g_scroll_accum = 0.0f;
+
+    in.lmb = glfwGetMouseButton(w, GLFW_MOUSE_BUTTON_LEFT)   == GLFW_PRESS;
+    in.rmb = glfwGetMouseButton(w, GLFW_MOUSE_BUTTON_RIGHT)  == GLFW_PRESS;
+    in.mmb = glfwGetMouseButton(w, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
+    in.lmb_pressed = in.lmb && !prev.lmb;
+    in.rmb_pressed = in.rmb && !prev.rmb;
+
+    in.key_shift = glfwGetKey(w, GLFW_KEY_LEFT_SHIFT)  == GLFW_PRESS
+                || glfwGetKey(w, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+    in.key_r     = glfwGetKey(w, GLFW_KEY_R)     == GLFW_PRESS;
+    in.key_space = glfwGetKey(w, GLFW_KEY_SPACE) == GLFW_PRESS;
+    in.key_f     = glfwGetKey(w, GLFW_KEY_F)     == GLFW_PRESS;
+    in.key_c     = glfwGetKey(w, GLFW_KEY_C)     == GLFW_PRESS;
+    in.key_f5    = glfwGetKey(w, GLFW_KEY_F5)    == GLFW_PRESS;
+    in.esc_pressed = glfwGetKey(w, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+    if      (glfwGetKey(w, GLFW_KEY_1) == GLFW_PRESS) in.brush_digit = 1;
+    else if (glfwGetKey(w, GLFW_KEY_2) == GLFW_PRESS) in.brush_digit = 2;
+    else if (glfwGetKey(w, GLFW_KEY_3) == GLFW_PRESS) in.brush_digit = 3;
+    else if (glfwGetKey(w, GLFW_KEY_4) == GLFW_PRESS) in.brush_digit = 4;
+
+    if (ImGui::GetCurrentContext()) {
+        in.ui_wants_mouse    = ImGui::GetIO().WantCaptureMouse;
+        in.ui_wants_keyboard = ImGui::GetIO().WantCaptureKeyboard;
+    }
+
+    glfwGetWindowSize(w, &in.win_w, &in.win_h);
+    glfwGetFramebufferSize(w, &in.fb_w, &in.fb_h);
+    return in;
+}
+
+// ---------------------------------------------------------------------------
 // Lab vtable — every lab exposes the same init/tick/render/shutdown contract
 // over its own state struct. Binding those free functions to a state instance
 // behind std::function lets the main loop drive any lab uniformly, so adding a
@@ -154,7 +201,7 @@ constexpr int LAB_COUNT = 4;  // PlantLab..Globe; Menu is not a lab
 struct Lab {
     const char* title;
     std::function<void(const std::string& file)>                  enter;
-    std::function<bool(float dt)>                                 tick;
+    std::function<bool(const InputFrame&, float dt)>              tick;
     std::function<void(FrameData&, uint32_t, VkExtent2D)>         render;
     std::function<void()>                                        shutdown;
 };
@@ -203,7 +250,7 @@ int main()
                 if (!f.empty()) plant_state.pending_file = f;
                 plant_lab_init(plant_state, renderer);
             },
-            [&](float dt) { return plant_lab_tick(plant_state, renderer, dt); },
+            [&](const InputFrame& in, float dt) { return plant_lab_tick(plant_state, renderer, in, dt); },
             [&](FrameData& fr, uint32_t ii, VkExtent2D ex) {
                 plant_lab_render(plant_state, renderer, fr, ii, ex);
             },
@@ -217,7 +264,7 @@ int main()
                 if (!f.empty()) animals_state.pending_file = f;
                 animals_lab_init(animals_state, renderer);
             },
-            [&](float dt) { return animals_lab_tick(animals_state, renderer, dt); },
+            [&](const InputFrame& in, float dt) { return animals_lab_tick(animals_state, renderer, in, dt); },
             [&](FrameData& fr, uint32_t ii, VkExtent2D ex) {
                 animals_lab_render(animals_state, renderer, fr, ii, ex);
             },
@@ -230,7 +277,7 @@ int main()
                 world_state.embedded = true;
                 world_lab_init(world_state, renderer);
             },
-            [&](float dt) { return world_lab_tick(world_state, renderer, dt); },
+            [&](const InputFrame& in, float dt) { return world_lab_tick(world_state, renderer, in, dt); },
             [&](FrameData& fr, uint32_t ii, VkExtent2D ex) {
                 world_lab_render(world_state, renderer, fr, ii, ex);
             },
@@ -243,7 +290,7 @@ int main()
                 globe_state.embedded = true;
                 globe_init(globe_state, renderer);
             },
-            [&](float dt) { return globe_tick(globe_state, renderer, dt); },
+            [&](const InputFrame& in, float dt) { return globe_tick(globe_state, renderer, in, dt); },
             [&](FrameData& fr, uint32_t ii, VkExtent2D ex) {
                 globe_render(globe_state, renderer, fr, ii, ex);
             },
@@ -263,6 +310,7 @@ int main()
     int selected_species = -1;
     float refresh_timer = 0.0f;
 
+    InputFrame input_prev{};
     double last_time = glfwGetTime();
 
     while (!glfwWindowShouldClose(renderer.window)) {
@@ -271,6 +319,9 @@ int main()
         last_time = now;
 
         glfwPollEvents();
+
+        InputFrame in = poll_input(renderer, input_prev);
+        input_prev = in;
 
         // --- Tick active mode ---
         bool back_pressed = false;
@@ -282,7 +333,7 @@ int main()
 
         if (mode == AppMode::Menu) {
             if (preview_alive)
-                world_lab_tick(preview_state, renderer, dt);
+                world_lab_tick(preview_state, renderer, in, dt);
 
             refresh_timer += dt;
             if (refresh_timer > 3.0f) {
@@ -395,7 +446,7 @@ int main()
             ImGui::Render();
 
         } else {
-            if (!labs[lab_index(mode)].tick(dt)) back_pressed = true;
+            if (!labs[lab_index(mode)].tick(in, dt)) back_pressed = true;
         }
 
         // --- Handle back-to-menu ---
