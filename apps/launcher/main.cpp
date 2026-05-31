@@ -121,6 +121,21 @@ static void render_menu_frame(Renderer& r, FrameData& frame,
 }
 
 // ---------------------------------------------------------------------------
+// Re-establish the launcher's baseline input handling.
+//
+// Labs that install their own GLFW callbacks (Globe, via input_install_callbacks)
+// restore only ImGui's callbacks on shutdown, dropping lab_scroll_cb — which
+// kills scroll-zoom in the menu preview and every lab opened afterward. Calling
+// this after any lab exits puts the launcher's scroll handler back.
+// ---------------------------------------------------------------------------
+static void install_launcher_input(Renderer& r)
+{
+    ImGui_ImplGlfw_RestoreCallbacks(r.window);
+    glfwSetScrollCallback(r.window, lab_scroll_cb);
+    ImGui_ImplGlfw_InstallCallbacks(r.window);
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 enum class AppMode { Menu, PlantLab, AnimalsLab, WorldLab, Globe };
@@ -329,12 +344,6 @@ int main()
             if (!world_lab_tick(world_state, renderer, dt)) back_pressed = true;
         } else if (mode == AppMode::Globe) {
             if (!globe_tick(globe_state, renderer, dt)) back_pressed = true;
-            // Globe's input callback sets WindowShouldClose on ESC —
-            // undo that, the launcher handles ESC as back-to-menu.
-            if (glfwWindowShouldClose(renderer.window)) {
-                glfwSetWindowShouldClose(renderer.window, GLFW_FALSE);
-                back_pressed = true;
-            }
         }
 
         // --- Handle back-to-menu ---
@@ -346,6 +355,7 @@ int main()
             if (mode == AppMode::Globe)  {
                 globe_shutdown(globe_state, renderer);
             }
+            install_launcher_input(renderer);
             mode = AppMode::Menu;
             glfwSetWindowTitle(renderer.window, "Drift Engine");
             species = scan_species();

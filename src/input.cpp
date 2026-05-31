@@ -13,8 +13,14 @@ static void key_callback(GLFWwindow* window, int key, int /*scancode*/, int acti
     auto& input = *ctx->input;
     auto& ui = *ctx->ui;
 
-    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
-        glfwSetWindowShouldClose(window, GLFW_TRUE);
+    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
+        // Embedded in the launcher: ESC returns to the menu (the host consumes
+        // wants_back), never closes the shared window. Standalone: ESC quits.
+        if (ui.embedded)
+            ui.wants_back = true;
+        else
+            glfwSetWindowShouldClose(window, GLFW_TRUE);
+    }
     if (key == GLFW_KEY_GRAVE_ACCENT && action == GLFW_PRESS)
         ui.show_menu = !ui.show_menu;
     if (key == GLFW_KEY_F5 && action == GLFW_PRESS)

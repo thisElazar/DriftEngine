@@ -14,6 +14,11 @@ void ui_draw(UIState& s)
     if (s.show_menu) {
         ImGui::Begin("drift_engine", &s.show_menu);
 
+        if (s.embedded) {
+            if (ImGui::Button("< Back")) s.wants_back = true;
+            ImGui::Separator();
+        }
+
         if (ImGui::CollapsingHeader("Performance", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Text("CPU: %.2f ms (%.1f fps)", s.cpu_avg_ms, 1000.0 / std::max(s.cpu_avg_ms, 0.001));
             ImGui::Text("GPU SWE: %.2f ms", s.gpu_avg_ms);

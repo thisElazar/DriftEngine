@@ -1948,6 +1948,7 @@ bool globe_tick(GlobeState& s, Renderer& r, float dt)
     float terrain_size = s.terrain_size;
 
     s.last_dt = dt;
+    s.ui.embedded = s.embedded;
     s.ui.first_person_mode = (s.camera.mode == CameraMode::FirstPerson);
 
         if (s.input.reload_shaders) {
@@ -2559,6 +2560,11 @@ bool globe_tick(GlobeState& s, Renderer& r, float dt)
             s.last_title_update = frame_end;
         }
 
+    // Return to launcher menu if the user requested it (ESC or "< Back").
+    if (s.embedded && s.ui.wants_back) {
+        s.ui.wants_back = false;
+        return false;
+    }
     return true;
 }
 

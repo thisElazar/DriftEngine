@@ -5,6 +5,13 @@
 struct UIState {
     bool show_menu = true;
 
+    // Embedding (set by caller): when true, the lab is hosted by the launcher,
+    // so ui_draw shows a "< Back" button and ESC requests a return to the menu
+    // instead of closing the window. wants_back is set by ui_draw / the input
+    // callback and consumed by the caller.
+    bool embedded   = false;
+    bool wants_back = false;
+
     // Performance display (set by caller before ui_draw)
     double cpu_avg_ms = 0;
     double gpu_avg_ms = 0;
