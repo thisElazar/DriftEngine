@@ -10,6 +10,7 @@
 
 #include "renderer.h"
 #include "species_file.h"
+#include "input_poll.h"
 #include "shared/lab_common.h"
 
 #include "plant_lab/plant_lab.h"
@@ -123,68 +124,6 @@ static void render_menu_frame(Renderer& r, FrameData& frame,
 }
 
 // ---------------------------------------------------------------------------
-// Re-establish the launcher's baseline input handling.
-//
-// Labs that install their own GLFW callbacks (Globe, via input_install_callbacks)
-// restore only ImGui's callbacks on shutdown, dropping lab_scroll_cb — which
-// kills scroll-zoom in the menu preview and every lab opened afterward. Calling
-// this after any lab exits puts the launcher's scroll handler back.
-// ---------------------------------------------------------------------------
-static void install_launcher_input(Renderer& r)
-{
-    ImGui_ImplGlfw_RestoreCallbacks(r.window);
-    glfwSetScrollCallback(r.window, lab_scroll_cb);
-    ImGui_ImplGlfw_InstallCallbacks(r.window);
-}
-
-// ---------------------------------------------------------------------------
-// Poll all user input into one immutable snapshot for this frame. This is the
-// single input source the labs consume via their tick (see input_frame.h /
-// docs/INPUT_UNIFICATION.md). Mouse/scroll deltas are computed against prev;
-// the wheel accumulator (fed by lab_scroll_cb) is drained here.
-// ---------------------------------------------------------------------------
-static InputFrame poll_input(Renderer& r, const InputFrame& prev)
-{
-    InputFrame in;
-    GLFWwindow* w = r.window;
-
-    glfwGetCursorPos(w, &in.mouse_x, &in.mouse_y);
-    in.mouse_dx = static_cast<float>(in.mouse_x - prev.mouse_x);
-    in.mouse_dy = static_cast<float>(in.mouse_y - prev.mouse_y);
-
-    in.scroll = g_scroll_accum;
-    g_scroll_accum = 0.0f;
-
-    in.lmb = glfwGetMouseButton(w, GLFW_MOUSE_BUTTON_LEFT)   == GLFW_PRESS;
-    in.rmb = glfwGetMouseButton(w, GLFW_MOUSE_BUTTON_RIGHT)  == GLFW_PRESS;
-    in.mmb = glfwGetMouseButton(w, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
-    in.lmb_pressed = in.lmb && !prev.lmb;
-    in.rmb_pressed = in.rmb && !prev.rmb;
-
-    in.key_shift = glfwGetKey(w, GLFW_KEY_LEFT_SHIFT)  == GLFW_PRESS
-                || glfwGetKey(w, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
-    in.key_r     = glfwGetKey(w, GLFW_KEY_R)     == GLFW_PRESS;
-    in.key_space = glfwGetKey(w, GLFW_KEY_SPACE) == GLFW_PRESS;
-    in.key_f     = glfwGetKey(w, GLFW_KEY_F)     == GLFW_PRESS;
-    in.key_c     = glfwGetKey(w, GLFW_KEY_C)     == GLFW_PRESS;
-    in.key_f5    = glfwGetKey(w, GLFW_KEY_F5)    == GLFW_PRESS;
-    in.esc_pressed = glfwGetKey(w, GLFW_KEY_ESCAPE) == GLFW_PRESS;
-    if      (glfwGetKey(w, GLFW_KEY_1) == GLFW_PRESS) in.brush_digit = 1;
-    else if (glfwGetKey(w, GLFW_KEY_2) == GLFW_PRESS) in.brush_digit = 2;
-    else if (glfwGetKey(w, GLFW_KEY_3) == GLFW_PRESS) in.brush_digit = 3;
-    else if (glfwGetKey(w, GLFW_KEY_4) == GLFW_PRESS) in.brush_digit = 4;
-
-    if (ImGui::GetCurrentContext()) {
-        in.ui_wants_mouse    = ImGui::GetIO().WantCaptureMouse;
-        in.ui_wants_keyboard = ImGui::GetIO().WantCaptureKeyboard;
-    }
-
-    glfwGetWindowSize(w, &in.win_w, &in.win_h);
-    glfwGetFramebufferSize(w, &in.fb_w, &in.fb_h);
-    return in;
-}
-
-// ---------------------------------------------------------------------------
 // Lab vtable — every lab exposes the same init/tick/render/shutdown contract
 // over its own state struct. Binding those free functions to a state instance
 // behind std::function lets the main loop drive any lab uniformly, so adding a
@@ -214,7 +153,7 @@ int main()
     Renderer renderer{};
     renderer_init(renderer, 1280, 800, "Drift Engine");
 
-    glfwSetScrollCallback(renderer.window, lab_scroll_cb);
+    input_install_scroll_callback(renderer.window);
     ImGui_ImplGlfw_InstallCallbacks(renderer.window);
 
     AppMode mode = AppMode::Menu;
@@ -320,14 +259,13 @@ int main()
 
         glfwPollEvents();
 
-        InputFrame in = poll_input(renderer, input_prev);
+        InputFrame in = poll_input_frame(renderer.window, input_prev);
         input_prev = in;
 
         // --- Tick active mode ---
         bool back_pressed = false;
 
-        if (mode != AppMode::Menu &&
-            glfwGetKey(renderer.window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+        if (mode != AppMode::Menu && in.esc_pressed) {
             back_pressed = true;
         }
 
@@ -453,7 +391,8 @@ int main()
         if (back_pressed) {
             vkDeviceWaitIdle(renderer.device);
             labs[lab_index(mode)].shutdown();
-            install_launcher_input(renderer);
+            // No callback re-install needed: no lab steals GLFW callbacks any
+            // more (Stage 2 — input is polled, not callback-driven).
             mode = AppMode::Menu;
             glfwSetWindowTitle(renderer.window, "Drift Engine");
             species = scan_species();

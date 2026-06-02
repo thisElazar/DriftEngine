@@ -12,7 +12,6 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <imgui.h>
-#include <imgui_impl_glfw.h>
 #include <imgui_impl_vulkan.h>
 
 
@@ -55,15 +54,10 @@ void globe_init(GlobeState& s, Renderer& r)
 
     camera_initialize_orientation(s.camera);
 
-    s.cb_ctx = {&s.input, &s.camera, &s.ui};
-    if (s.embedded) {
-        ImGui_ImplGlfw_RestoreCallbacks(window);
-        input_install_callbacks(window, &s.cb_ctx);
-        ImGui_ImplGlfw_InstallCallbacks(window);
-    } else {
-        input_install_callbacks(window, &s.cb_ctx);
-        ImGui_ImplGlfw_InstallCallbacks(window);
-    }
+    // Input is polled into a per-frame InputFrame by the host (launcher or
+    // standalone main) and passed to globe_tick — Globe no longer installs any
+    // GLFW input callbacks. See docs/INPUT_UNIFICATION.md.
+    (void)window;
 
     // ---- Procedural basin ---------------------------------------------------
     s.basin_params = BasinParams{};
@@ -1940,10 +1934,6 @@ void globe_init(GlobeState& s, Renderer& r)
 // ---------------------------------------------------------------------------
 bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
 {
-    // Globe still reads input through its own GLFW callbacks (s.input/cb_ctx);
-    // the unified InputFrame is threaded for signature parity and will replace
-    // those callbacks in a follow-up (see docs/INPUT_UNIFICATION.md).
-    (void)in;
     VkDevice device = r.device;
     VmaAllocator allocator = r.allocator;
     VkQueue graphics_queue = r.graphics_queue;
@@ -1955,9 +1945,34 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
     s.ui.embedded = s.embedded;
     s.ui.first_person_mode = (s.camera.mode == CameraMode::FirstPerson);
 
-        if (s.input.reload_shaders) {
+        if (in.key_f5_pressed) {
             pipelines_reload(s.pipelines, device);
-            s.input.reload_shaders = false;
+        }
+
+        // ---- Keyboard shortcuts that mirror UI controls (gated on ImGui) ----
+        if (!in.ui_wants_keyboard) {
+            if (in.key_space_pressed) s.pulse_pending = true;
+            if (in.key_grave_pressed) s.ui.show_menu = !s.ui.show_menu;
+            if (in.brush_digit == 1) s.brush_mode = BrushMode::Raise;
+            if (in.brush_digit == 2) s.brush_mode = BrushMode::Lower;
+            if (in.brush_digit == 3) s.brush_mode = BrushMode::Water;
+            if (in.brush_digit == 4) s.brush_mode = BrushMode::Sand;
+            if (in.key_lbracket_pressed)
+                s.ui.brush_radius_grid = std::max(2.0f, s.ui.brush_radius_grid * 0.85f);
+            if (in.key_rbracket_pressed)
+                s.ui.brush_radius_grid = std::min(300.0f, s.ui.brush_radius_grid * 1.18f);
+            if (in.key_minus_pressed) {
+                if (s.brush_mode == BrushMode::Water)
+                    s.ui.brush_strength = std::max(0.05f, s.ui.brush_strength * 0.85f);
+                else
+                    s.ui.terrain_strength = std::max(2.0f, s.ui.terrain_strength * 0.85f);
+            }
+            if (in.key_equal_pressed) {
+                if (s.brush_mode == BrushMode::Water)
+                    s.ui.brush_strength = std::min(20.0f, s.ui.brush_strength * 1.18f);
+                else
+                    s.ui.terrain_strength = std::min(500.0f, s.ui.terrain_strength * 1.18f);
+            }
         }
 
         int fb_w, fb_h;
@@ -2260,18 +2275,24 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
                 return h;
             };
 
-            if (s.input.toggle_camera_mode) {
+            if (in.key_f_pressed && !in.ui_wants_keyboard) {
                 if (s.camera.mode == CameraMode::Orbital)
                     camera_switch_to_first_person(s.camera, PLANET_RADIUS, height_fn);
                 else
                     camera_switch_to_orbital(s.camera);
-                s.input.rmb_held = false;
-                s.input.toggle_camera_mode = false;
             }
             s.ui.first_person_mode = (s.camera.mode == CameraMode::FirstPerson);
 
+            // Mouse-look while RMB-dragging over the world; wheel zooms. (The
+            // poll zeroes the delta on the frame the cursor capture toggles, so
+            // there's no look jump when RMB first grabs the cursor.)
+            if (in.rmb && !in.ui_wants_mouse)
+                camera_apply_mouse_look(s.camera, in.mouse_dx, in.mouse_dy);
+            if (in.scroll != 0.0f && !in.ui_wants_mouse)
+                camera_zoom(s.camera, in.scroll);
+
             glm::dvec3 prev_eye = camera_eye_position(s.camera);
-            auto cam_result = camera_update(s.camera, window, s.last_dt, PLANET_RADIUS, height_fn);
+            auto cam_result = camera_update(s.camera, in, s.last_dt, PLANET_RADIUS, height_fn);
             s.terrain_height_at_cam = cam_result.terrain_height_at_cam;
             s.altitude_above_terrain = cam_result.altitude_above_terrain;
 
@@ -2284,16 +2305,18 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
 
         // ---- Cursor visibility (UE pattern) ----
         // OS cursor hidden over the world (3D brush ring/dot is the cursor),
-        // captured during RMB-look, normal over ImGui. Switch only on change
-        // so we're not pinging GLFW every frame.
+        // captured during RMB-look, normal over ImGui. Switch only on change so
+        // we're not pinging GLFW every frame. This is window cursor state, not a
+        // GLFW input callback — driving it here doesn't re-introduce the
+        // callback-ownership split that Stage 2 removed. The poll detects the
+        // capture transition and drops that frame's look delta.
         {
-            bool over_ui = ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse;
-            int desired = over_ui     ? GLFW_CURSOR_NORMAL
-                        : s.input.rmb_held ? GLFW_CURSOR_DISABLED
-                                         : GLFW_CURSOR_HIDDEN;
+            bool over_ui = in.ui_wants_mouse;
+            int desired = over_ui ? GLFW_CURSOR_NORMAL
+                        : in.rmb  ? GLFW_CURSOR_DISABLED
+                                  : GLFW_CURSOR_HIDDEN;
             if (desired != s.current_cursor_mode) {
                 glfwSetInputMode(window, GLFW_CURSOR, desired);
-                if (desired == GLFW_CURSOR_DISABLED) s.input.first_mouse = true;
                 s.current_cursor_mode = desired;
             }
         }
@@ -2313,8 +2336,8 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
         {
             int win_w, win_h;
             glfwGetWindowSize(window, &win_w, &win_h);
-            float ndc_x = static_cast<float>(s.input.cursor_x) / win_w * 2.0f - 1.0f;
-            float ndc_y = static_cast<float>(s.input.cursor_y) / win_h * 2.0f - 1.0f;
+            float ndc_x = static_cast<float>(in.mouse_x) / win_w * 2.0f - 1.0f;
+            float ndc_y = static_cast<float>(in.mouse_y) / win_h * 2.0f - 1.0f;
 
             glm::mat4 inv_proj = glm::inverse(cam_proj);
             glm::vec4 clip_pt = inv_proj * glm::vec4(ndc_x, ndc_y, 1.0f, 1.0f);
@@ -2418,7 +2441,7 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
             }
         }
         // ---- Fly-to-cursor (C key, FP only) ----
-        if (s.input.warp_to_cursor) {
+        if (in.key_c_pressed && !in.ui_wants_keyboard) {
             if (s.camera.mode == CameraMode::FirstPerson && s.cursor_on_world) {
                 float h = cpu_terrain_height_with_stamps(s.stamp_sphere_dir, s.stamps.data(),
                     static_cast<uint32_t>(s.stamps.size()));
@@ -2428,13 +2451,12 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
                 glm::dvec3 target_eye = glm::dvec3(s.stamp_sphere_dir) * target_radius;
                 camera_begin_warp_to(s.camera, target_eye);
             }
-            s.input.warp_to_cursor = false;
         }
 
         // FP is move + warp only. Terrain/water painting happens in orbital
         // (god's-eye) mode where the brush ring + LMB are the editing tools.
         bool can_paint = (s.camera.mode == CameraMode::Orbital);
-        s.brush_active = can_paint && s.input.lmb_held && !s.input.rmb_held;
+        s.brush_active = can_paint && in.lmb && !in.rmb && !in.ui_wants_mouse;
         s.brush_hit = s.brush_active && s.cursor_on_world;
 
         // Brush angular radius scales with view distance so the ring stays a
@@ -2451,12 +2473,12 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
 
         // ---- Place terrain stamp on LMB ----
         if (s.brush_hit &&
-            (s.input.brush_mode == BrushMode::Raise || s.input.brush_mode == BrushMode::Lower) &&
+            (s.brush_mode == BrushMode::Raise || s.brush_mode == BrushMode::Lower) &&
             s.stamps.size() < MAX_STAMPS)
         {
             double now_s = glfwGetTime();
             if (now_s - s.last_stamp_time > 0.1) {
-                float sign = (s.input.brush_mode == BrushMode::Raise) ? 1.0f : -1.0f;
+                float sign = (s.brush_mode == BrushMode::Raise) ? 1.0f : -1.0f;
                 float angular_radius = s.effective_angular;
 
                 TerrainStamp stamp{};
@@ -2476,7 +2498,7 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
         // Persistent record of brushed water; applied to every LOD's SWE init so
         // a brushed lake stays visible from any zoom. The dynamic SWE step still
         // adds waves on top at the brushed level — this is the static skeleton.
-        if (s.brush_hit && s.input.brush_mode == BrushMode::Water &&
+        if (s.brush_hit && s.brush_mode == BrushMode::Water &&
             s.water_stamps.size() < MAX_WATER_STAMPS)
         {
             double now_s = glfwGetTime();
@@ -2504,11 +2526,11 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
             // brush_color.a = 0 → ring (orbital), 1 → filled dot (FP).
             float cursor_alpha = (s.camera.mode == CameraMode::FirstPerson) ? 1.0f : 0.0f;
             glm::vec4 brush_color;
-            if (s.input.brush_mode == BrushMode::Raise)
+            if (s.brush_mode == BrushMode::Raise)
                 brush_color = glm::vec4(0.30f, 0.95f, 0.40f, cursor_alpha);
-            else if (s.input.brush_mode == BrushMode::Lower)
+            else if (s.brush_mode == BrushMode::Lower)
                 brush_color = glm::vec4(0.95f, 0.45f, 0.20f, cursor_alpha);
-            else if (s.input.brush_mode == BrushMode::Sand)
+            else if (s.brush_mode == BrushMode::Sand)
                 brush_color = glm::vec4(0.85f, 0.70f, 0.45f, cursor_alpha);
             else
                 brush_color = glm::vec4(0.30f, 0.85f, 0.95f, cursor_alpha);
@@ -2586,8 +2608,8 @@ void globe_render(GlobeState& s, Renderer& r,
     (void)allocator; (void)graphics_queue; (void)gfx_family; (void)window;
 
         // ---- Terrain brush dispatch (flat-grid only, before SWE) ----
-        if (!s.ui.ocean_enabled && s.brush_hit && (s.input.brush_mode == BrushMode::Raise || s.input.brush_mode == BrushMode::Lower)) {
-            float sign = (s.input.brush_mode == BrushMode::Raise) ? 1.0f : -1.0f;
+        if (!s.ui.ocean_enabled && s.brush_hit && (s.brush_mode == BrushMode::Raise || s.brush_mode == BrushMode::Lower)) {
+            float sign = (s.brush_mode == BrushMode::Raise) ? 1.0f : -1.0f;
 
             TerrainBrushPC tb_pc{};
             tb_pc.brush_x = s.grid_x;
@@ -2621,7 +2643,7 @@ void globe_render(GlobeState& s, Renderer& r,
         }
 
         // ---- Sand brush dispatch (flat-grid only) ----
-        if (!s.ui.ocean_enabled && s.brush_hit && s.input.brush_mode == BrushMode::Sand) {
+        if (!s.ui.ocean_enabled && s.brush_hit && s.brush_mode == BrushMode::Sand) {
             TerrainBrushPC sb_pc{};
             sb_pc.brush_x = s.grid_x;
             sb_pc.brush_y = s.grid_y;
@@ -2873,7 +2895,7 @@ void globe_render(GlobeState& s, Renderer& r,
 
             // Pick target tile under the cursor for the water brush.
             PlanetTilePick pick{};
-            bool water_brush_active = s.brush_hit && s.input.brush_mode == BrushMode::Water;
+            bool water_brush_active = s.brush_hit && s.brush_mode == BrushMode::Water;
             if (water_brush_active) {
                 pick = planet_pick_tile(s.stamp_sphere_dir, visible_tiles, PLANET_TILE_RES);
                 if (pick.hit) s.disturbed_tiles.insert(pick.node);
@@ -3147,13 +3169,13 @@ void globe_render(GlobeState& s, Renderer& r,
                 swe_pc.grid_h = SWE_GRID_H;
 
                 if (step == 0) {
-                    bool water_brush_active = s.brush_hit && s.input.brush_mode == BrushMode::Water;
-                    if (s.input.pulse_pending) {
+                    bool water_brush_active = s.brush_hit && s.brush_mode == BrushMode::Water;
+                    if (s.pulse_pending) {
                         swe_pc.pulse_x = SWE_GRID_W * 0.5f;
                         swe_pc.pulse_y = SWE_GRID_H * 0.5f;
                         swe_pc.pulse_radius = s.ui.pulse_radius_cells;
                         swe_pc.pulse_amount = s.ui.pulse_amount;
-                        s.input.pulse_pending = false;
+                        s.pulse_pending = false;
                     } else if (water_brush_active) {
                         swe_pc.pulse_x = s.grid_x;
                         swe_pc.pulse_y = s.grid_y;
@@ -3569,17 +3591,11 @@ void globe_render(GlobeState& s, Renderer& r,
 // ---------------------------------------------------------------------------
 void globe_shutdown(GlobeState& s, Renderer& r)
 {
-    if (s.embedded) {
-        ImGui_ImplGlfw_RestoreCallbacks(r.window);
-        glfwSetKeyCallback(r.window, nullptr);
-        glfwSetMouseButtonCallback(r.window, nullptr);
-        glfwSetCursorPosCallback(r.window, nullptr);
-        glfwSetScrollCallback(r.window, nullptr);
-        glfwSetFramebufferSizeCallback(r.window, nullptr);
-        glfwSetWindowUserPointer(r.window, nullptr);
-        glfwSetInputMode(r.window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
-        ImGui_ImplGlfw_InstallCallbacks(r.window);
-    }
+    // Globe installs no GLFW input callbacks (input is polled by the host), so
+    // there's nothing to restore here — just hand the OS cursor back, since the
+    // RMB-look state machine may have left it captured/hidden.
+    glfwSetInputMode(r.window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    s.current_cursor_mode = -1;
 
     VkDevice device = r.device;
     VmaAllocator allocator = r.allocator;

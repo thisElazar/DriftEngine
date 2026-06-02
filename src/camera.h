@@ -7,7 +7,7 @@
 
 #include <functional>
 
-struct GLFWwindow;
+#include "input_frame.h"
 
 enum class CameraMode { Orbital, FirstPerson };
 
@@ -78,7 +78,10 @@ void camera_apply_mouse_look(Camera& cam, float dx, float dy,
 
 void camera_zoom(Camera& cam, double amount);
 
-CameraUpdateResult camera_update(Camera& cam, GLFWwindow* window, float dt,
+// Movement (WASD/QE tangent walk + Q/E vertical, shift/alt speed mods) is read
+// from the per-frame InputFrame. Mouse-look and zoom are applied separately by
+// the caller via camera_apply_mouse_look / camera_zoom.
+CameraUpdateResult camera_update(Camera& cam, const InputFrame& in, float dt,
                                  float planet_radius,
                                  std::function<float(glm::vec3)> height_fn);
 

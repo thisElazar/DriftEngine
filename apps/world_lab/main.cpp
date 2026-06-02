@@ -4,6 +4,7 @@
 // world_lab.cpp so the same code can be embedded in the unified launcher.
 
 #include "world_lab.h"
+#include "input_poll.h"
 #include "shared/lab_common.h"
 
 #include <imgui_impl_glfw.h>
@@ -13,12 +14,13 @@ int main()
     Renderer r{};
     renderer_init(r, 1280, 800, "World Lab");
 
-    glfwSetScrollCallback(r.window, lab_scroll_cb);
+    input_install_scroll_callback(r.window);
     ImGui_ImplGlfw_InstallCallbacks(r.window);
 
     WorldLabState state{};
     world_lab_init(state, r);
 
+    InputFrame input_prev{};
     double last_time = glfwGetTime();
 
     while (!glfwWindowShouldClose(r.window)) {
@@ -28,10 +30,13 @@ int main()
 
         glfwPollEvents();
 
-        if (glfwGetKey(r.window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        InputFrame in = poll_input_frame(r.window, input_prev);
+        input_prev = in;
+
+        if (in.esc_pressed)
             glfwSetWindowShouldClose(r.window, GLFW_TRUE);
 
-        world_lab_tick(state, r, dt);
+        world_lab_tick(state, r, in, dt);
 
         FrameData* frame = nullptr;
         uint32_t   image_index = 0;

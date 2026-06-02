@@ -106,7 +106,58 @@ capture + fly-to-cursor (C). Then confirm scroll-zoom survives a Globe round-tri
 
 ---
 
-## Increment B — Globe off callbacks (VERIFIED SCOPE, not yet done)
+## Increment B — Globe off callbacks (DONE)
+
+**Status: implemented.** Globe no longer installs any GLFW input callbacks; all
+input flows through the per-frame `InputFrame`. The whole `input_install_callbacks`
+/ `CallbackContext` / `InputState` machinery is gone, and the standalone orbit-lab
+executables (which Increment A had left calling the old 3-arg tick) build again.
+What actually shipped, vs. the original plan below:
+
+- **InputFrame** (src/input_frame.h) gained held movement keys (w/a/s/d/q/e,
+  shift, alt) and edge-triggered keys (f/c/space/f5/grave/[ /] /- /= `_pressed`,
+  plus `esc_pressed`). The unusable `want_cursor_capture` out-field was removed
+  (see cursor note below).
+- **Single poll, in core.** New `src/input_poll.{h,cpp}` owns the wheel
+  accumulator + its scroll callback (`input_install_scroll_callback`) and
+  `poll_input_frame(window, prev)`. This replaced the launcher's local
+  `poll_input` *and* `lab_common.h`'s `g_scroll_accum`/`lab_scroll_cb`. Every
+  host (launcher + all four standalone mains) now installs the scroll callback,
+  then ImGui's callbacks (which chain to it), and builds one frame per loop.
+- **camera_update** takes `const InputFrame&` instead of `GLFWwindow*` and reads
+  movement from `in.key_*`; mouse-look/zoom are applied by globe via
+  `camera_apply_mouse_look(in.mouse_dx/dy)` / `camera_zoom(in.scroll)`.
+- **Edge keys, not held.** f/c/space/f5/grave/brackets/minus/equal are derived in
+  the poll as `held && !prev.held`, so they fire once per press (the bracket /
+  minus / equal brush-tuning shortcuts lost OS key-repeat — they now step once
+  per tap; they also duplicate UI sliders).
+- **Cursor capture — deviation from step 4.** The plan had globe set
+  `want_cursor_capture` for the launcher to honor, but (a) tick receives
+  `const InputFrame&` so a lab can't write it, and (b) one bool can't express
+  globe's 3-state cursor (normal-over-UI / hidden-over-world / captured-during-
+  look). So globe keeps its `glfwSetInputMode(CURSOR, …)` state machine directly.
+  That's window cursor state, **not** GLFW callback ownership, so it does not
+  re-introduce the callback-theft bug class this increment targets. The
+  RMB-capture look-jump is handled centrally: `poll_input_frame` zeroes the mouse
+  delta on any `GLFW_CURSOR` mode change, replacing the old `first_mouse` skip.
+- **pulse_pending** moved to a `GlobeState` flag (set in tick on Space edge,
+  consumed in render) since Space is read in tick but the pulse fires in render.
+
+### Verification (human, no screenshots) — PASSED (2026-06-01)
+
+User confirmed Globe + labs behave correctly after the migration. Build is green
+for all targets. The checklist that was confirmed, in the launcher's Globe lab:
+orbital RMB-orbit + scroll-zoom; F → first-person; WASD+QE walk; RMB mouse-look
+with the cursor captured (and **no** look-jump on RMB press); C fly-to-cursor;
+1/2/3/4 brush modes + LMB paint (and that LMB does **not** paint through the UI
+panel); `[` `]` brush radius, `-` `=` strength, `` ` `` menu toggle; Space pulse;
+ESC → menu; and that scroll-zoom still works after a Globe round-trip (the old
+`install_launcher_input` patch is gone). Also sanity-check the standalone
+`drift_engine`, `plant_lab`, `world_lab`, `animals_lab` executables.
+
+---
+
+### Original plan (for reference)
 
 Increment A (InputFrame threaded through every tick; orbit labs fully ported)
 landed in commit 36cd189. Globe takes `const InputFrame&` but still `(void)in`s
@@ -152,5 +203,5 @@ first-person; WASD+QE walk; RMB mouse-look with cursor captured; C fly-to-cursor
 1/2/3/4 brush modes + LMB paint; Space pulse; ESC→menu; scroll-zoom survives a
 Globe round-trip with install_launcher_input removed.
 
-Status note: paused before starting — session file-read I/O was fabricating
-buffer content, unsafe for a precise shared-camera rewrite. Resume with clean I/O.
+Status note: superseded — see the "Increment B — DONE" section above for what
+actually shipped and the deviations from this plan.

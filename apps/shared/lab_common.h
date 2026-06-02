@@ -24,15 +24,8 @@
 #include <cstring>
 #include <cstdio>
 
-// ---------------------------------------------------------------------------
-// Scroll accumulator (global, set by GLFW callback)
-// ---------------------------------------------------------------------------
-inline float g_scroll_accum = 0.0f;
-
-inline void lab_scroll_cb(GLFWwindow*, double, double yoffset)
-{
-    g_scroll_accum += static_cast<float>(yoffset);
-}
+// Per-frame input arrives via InputFrame (input_frame.h); the wheel accumulator
+// and its GLFW callback now live in input_poll.{h,cpp} in drift_engine_core.
 
 // ---------------------------------------------------------------------------
 // Orbit camera

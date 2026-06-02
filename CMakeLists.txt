@@ -101,7 +101,7 @@ add_library(drift_engine_core STATIC
     src/grid_util.cpp
     src/vma_impl.cpp
     src/camera.cpp
-    src/input.cpp
+    src/input_poll.cpp
     src/pipeline.cpp
     src/planet.cpp
     src/terrain.cpp

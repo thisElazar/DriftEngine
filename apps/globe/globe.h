@@ -171,9 +171,12 @@ struct GlobeState {
 
     // --- Camera + input + UI ---
     Camera     camera{};
-    InputState input{};
     UIState    ui{};
-    CallbackContext cb_ctx{};
+    // Persistent brush mode (set by the 1/2/3/4 keys via InputFrame). All other
+    // input is read transiently from the per-frame InputFrame; see globe_tick.
+    BrushMode  brush_mode = BrushMode::Water;
+    // Space requests a water pulse; set in tick (edge), consumed in render.
+    bool       pulse_pending = false;
 
     bool   cursor_on_world        = false;
     double terrain_height_at_cam  = 0.0;

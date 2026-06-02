@@ -1,5 +1,4 @@
 #include "camera.h"
-#include <GLFW/glfw3.h>
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/quaternion.hpp>
 #include <algorithm>
@@ -72,7 +71,7 @@ static void orbital_mouse_look(OrbitalState& s, float dx, float dy, float sensit
     s.orientation = glm::normalize(glm::quat_cast(m));
 }
 
-static CameraUpdateResult orbital_update(OrbitalState& s, GLFWwindow* window, float dt,
+static CameraUpdateResult orbital_update(OrbitalState& s, const InputFrame& in, float dt,
                                          float planet_radius,
                                          const std::function<float(glm::vec3)>& height_fn)
 {
@@ -88,8 +87,8 @@ static CameraUpdateResult orbital_update(OrbitalState& s, GLFWwindow* window, fl
 
     float base_speed = static_cast<float>(std::max(altitude, 10.0)) * 1.5f;
     float speed = base_speed;
-    if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) speed *= 3.0f;
-    if (glfwGetKey(window, GLFW_KEY_LEFT_ALT) == GLFW_PRESS)   speed *= 0.2f;
+    if (in.key_shift) speed *= 3.0f;
+    if (in.key_alt)   speed *= 0.2f;
 
     glm::vec3 radial_up = pivot_dir;
     glm::vec3 fwd = glm::normalize(s.orientation * glm::vec3(0.0f, 0.0f, -1.0f));
@@ -101,12 +100,12 @@ static CameraUpdateResult orbital_update(OrbitalState& s, GLFWwindow* window, fl
     if (glm::dot(right_tangent, right_tangent) > 1e-6f) right_tangent = glm::normalize(right_tangent);
 
     glm::vec3 move(0.0f);
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) move += fwd_tangent;
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) move -= fwd_tangent;
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) move += right_tangent;
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) move -= right_tangent;
-    if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) move += radial_up;
-    if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) move -= radial_up;
+    if (in.key_w) move += fwd_tangent;
+    if (in.key_s) move -= fwd_tangent;
+    if (in.key_d) move += right_tangent;
+    if (in.key_a) move -= right_tangent;
+    if (in.key_q) move += radial_up;
+    if (in.key_e) move -= radial_up;
 
     if (glm::dot(move, move) > 0.0f) {
         glm::vec3 dir = glm::normalize(move);
@@ -157,7 +156,7 @@ static void fp_mouse_look(FirstPersonState& s, float dx, float dy, float sensiti
     s.orientation = glm::normalize(glm::quat_cast(m));
 }
 
-static CameraUpdateResult fp_update(FirstPersonState& s, GLFWwindow* window, float dt,
+static CameraUpdateResult fp_update(FirstPersonState& s, const InputFrame& in, float dt,
                                     float planet_radius,
                                     const std::function<float(glm::vec3)>& height_fn)
 {
@@ -221,14 +220,13 @@ static CameraUpdateResult fp_update(FirstPersonState& s, GLFWwindow* window, flo
     double eye_dist = glm::length(s.eye);
     double altitude = eye_dist - terrain_radius;
 
-    bool vertical_input = glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS
-                       || glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS;
+    bool vertical_input = in.key_q || in.key_e;
 
     float speed = s.walk_speed;
     if (!s.grounded && !vertical_input)
         speed *= std::clamp(static_cast<float>(altitude) * 0.1f, 1.0f, 20.0f);
-    if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) speed *= 4.0f;
-    if (glfwGetKey(window, GLFW_KEY_LEFT_ALT)   == GLFW_PRESS) speed *= 0.25f;
+    if (in.key_shift) speed *= 4.0f;
+    if (in.key_alt)   speed *= 0.25f;
 
     glm::vec3 radial_up = eye_dir;
     glm::vec3 fwd = glm::normalize(s.orientation * glm::vec3(0.0f, 0.0f, -1.0f));
@@ -241,10 +239,10 @@ static CameraUpdateResult fp_update(FirstPersonState& s, GLFWwindow* window, flo
 
     // Horizontal movement (tangent to sphere)
     glm::vec3 move(0.0f);
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS) move += fwd_tangent;
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS) move -= fwd_tangent;
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS) move += right_tangent;
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS) move -= right_tangent;
+    if (in.key_w) move += fwd_tangent;
+    if (in.key_s) move -= fwd_tangent;
+    if (in.key_d) move += right_tangent;
+    if (in.key_a) move -= right_tangent;
 
     if (glm::dot(move, move) > 0.0f) {
         glm::vec3 dir = glm::normalize(move);
@@ -254,8 +252,8 @@ static CameraUpdateResult fp_update(FirstPersonState& s, GLFWwindow* window, flo
     // Vertical: Q/E give direct thrust, otherwise gravity pulls toward ground
     if (vertical_input) {
         float vert = 0.0f;
-        if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS) vert += 1.0f;
-        if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) vert -= 1.0f;
+        if (in.key_q) vert += 1.0f;
+        if (in.key_e) vert -= 1.0f;
         s.vertical_velocity = vert * speed;
         s.grounded = false;
     } else if (!s.grounded) {
@@ -338,13 +336,13 @@ void camera_initialize_orientation(Camera& cam)
     }
 }
 
-CameraUpdateResult camera_update(Camera& cam, GLFWwindow* window, float dt,
+CameraUpdateResult camera_update(Camera& cam, const InputFrame& in, float dt,
                                  float planet_radius,
                                  std::function<float(glm::vec3)> height_fn)
 {
     return cam.mode == CameraMode::Orbital
-        ? orbital_update(cam.orbit, window, dt, planet_radius, height_fn)
-        : fp_update(cam.fp, window, dt, planet_radius, height_fn);
+        ? orbital_update(cam.orbit, in, dt, planet_radius, height_fn)
+        : fp_update(cam.fp, in, dt, planet_radius, height_fn);
 }
 
 glm::mat4 camera_build_view(const Camera& cam)
