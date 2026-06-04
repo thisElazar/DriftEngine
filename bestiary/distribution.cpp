@@ -80,10 +80,14 @@ static std::vector<DiskPoint> poisson_disk(float region_size,
                                            const std::function<float(float, float)>& density_fn,
                                            uint32_t seed)
 {
+    // Degenerate-radius guard: a tiny r_min blows up the acceleration grid
+    // (region_size/cell cells per side), risking OOM/hang. Clamp before sizing.
+    r_min = std::max(r_min, 0.05f);
+    if (r_max < r_min) r_max = r_min;
+
     float half = region_size * 0.5f;
     float cell = r_min / 1.41421356f;
-    int grid_w = static_cast<int>(std::ceil(region_size / cell));
-    if (grid_w < 1) grid_w = 1;
+    int grid_w = std::clamp(static_cast<int>(std::ceil(region_size / cell)), 1, 4096);
 
     std::vector<int> grid(static_cast<size_t>(grid_w * grid_w), -1);
     std::vector<DiskPoint> points;
@@ -537,9 +541,10 @@ void sprout_plants(
     constexpr float pi = 3.14159265f;
 
     // Spatial grid for O(1) minimum-distance checks.
-    // Cell size = r_min so only a 3x3 neighborhood needs checking.
-    float cell = eco.r_min;
-    int grid_w = static_cast<int>(std::ceil(eco.region_size / cell)) + 2;
+    // Cell size = r_min so only a 3x3 neighborhood needs checking. Clamp the
+    // cell (a tiny r_min would blow up the grid → OOM/hang) and cap the side.
+    float cell = std::max(eco.r_min, 0.05f);
+    int grid_w = std::clamp(static_cast<int>(std::ceil(eco.region_size / cell)) + 2, 1, 4096);
     auto cell_of = [&](float px, float pz) -> std::pair<int,int> {
         int ix = static_cast<int>((px + half) / cell);
         int iz = static_cast<int>((pz + half) / cell);
