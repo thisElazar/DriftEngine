@@ -77,8 +77,7 @@ static float density_at(float x, float z,
 
 static std::vector<DiskPoint> poisson_disk(float region_size,
                                            float r_min, float r_max,
-                                           const EnvironmentField& env,
-                                           const EcosystemParams& eco,
+                                           const std::function<float(float, float)>& density_fn,
                                            uint32_t seed)
 {
     float half = region_size * 0.5f;
@@ -118,7 +117,7 @@ static std::vector<DiskPoint> poisson_disk(float region_size,
         int pi_idx = active[ai];
         const auto& pt = points[static_cast<size_t>(pi_idx)];
 
-        float local_density = density_at(pt.x, pt.z, env, eco);
+        float local_density = density_fn(pt.x, pt.z);
         float local_r = r_min + (r_max - r_min) * (1.0f - local_density);
 
         bool found = false;
@@ -132,7 +131,7 @@ static std::vector<DiskPoint> poisson_disk(float region_size,
             if (cx < -half || cx > half || cz < -half || cz > half)
                 continue;
 
-            float cand_density = density_at(cx, cz, env, eco);
+            float cand_density = density_fn(cx, cz);
             float cand_r = r_min + (r_max - r_min) * (1.0f - cand_density);
             float min_sep = std::max(local_r, cand_r);
 
@@ -201,6 +200,52 @@ static int select_species(const EnvironmentSample& env,
         if (threshold <= accum) return i;
     }
     return PLANT_GRASS;
+}
+
+// ---------- roster-based placement (the N-species path) -----------------
+
+// Normalized planting density [0,1] at (x,z): best suitability×base_density
+// across the roster, scaled by the roster's peak base_density and eco scale.
+static float density_at_roster(float x, float z,
+                               const EnvironmentField& env,
+                               const std::vector<PlantSpecies>& roster,
+                               const EcosystemParams& eco)
+{
+    if (roster.empty()) return 0.0f;
+    auto s = env(x, z);
+    float max_d = 0.0f, max_possible = 0.0f;
+    for (const auto& sp : roster) {
+        max_d = std::max(max_d, compute_suitability(sp.suit, s) * sp.suit.base_density);
+        max_possible = std::max(max_possible, sp.suit.base_density);
+    }
+    if (max_possible < 0.001f) return 0.0f;
+    return std::clamp(max_d / max_possible * eco.density_scale, 0.0f, 1.0f);
+}
+
+// Pick a roster index for a point, weighted by suitability×base_density. -1 if
+// nothing is viable here.
+static int select_species_roster(const EnvironmentSample& env,
+                                  const std::vector<PlantSpecies>& roster,
+                                  float rand_val)
+{
+    float total = 0.0f;
+    for (const auto& sp : roster)
+        total += compute_suitability(sp.suit, env) * sp.suit.base_density;
+    if (total < 0.05f) return -1;
+
+    float threshold = rand_val * total;
+    float accum = 0.0f;
+    for (size_t i = 0; i < roster.size(); ++i) {
+        accum += compute_suitability(roster[i].suit, env) * roster[i].suit.base_density;
+        if (threshold <= accum) return static_cast<int>(i);
+    }
+    return 0;
+}
+
+// Is this kind ground-cover (spreads from a parent) vs. canopy (clusters)?
+static bool kind_is_ground_cover(int kind)
+{
+    return kind == PLANT_GRASS || kind == PLANT_REED || kind == PLANT_WILDFLOWER;
 }
 
 // -----------------------------------------------------------------------
@@ -306,7 +351,8 @@ VegetationMesh generate_ecosystem(
     VegetationMesh mesh;
 
     auto points = poisson_disk(eco.region_size, eco.r_min, eco.r_max,
-                               env, eco, eco.seed);
+                               [&](float x, float z) { return density_at(x, z, env, eco); },
+                               eco.seed);
 
     for (size_t i = 0; i < points.size(); ++i) {
         float x = points[i].x;
@@ -394,13 +440,16 @@ VegetationMesh generate_ecosystem(
 // -----------------------------------------------------------------------
 
 std::vector<PlantInstance> place_ecosystem(
+    const std::vector<PlantSpecies>& roster,
     const EcosystemParams& eco,
     const EnvironmentField& env)
 {
     std::vector<PlantInstance> plants;
+    if (roster.empty()) return plants;
 
     auto points = poisson_disk(eco.region_size, eco.r_min, eco.r_max,
-                               env, eco, eco.seed);
+                               [&](float x, float z) { return density_at_roster(x, z, env, roster, eco); },
+                               eco.seed);
 
     for (size_t i = 0; i < points.size(); ++i) {
         float x = points[i].x;
@@ -410,38 +459,43 @@ std::vector<PlantInstance> place_ecosystem(
         uint32_t pt_seed = dhash(eco.seed ^ static_cast<uint32_t>(i * 2654435761u));
         float rand_val = dhash_float(pt_seed, 0u);
 
-        int kind = select_species(sample, eco, rand_val);
-        if (kind < 0) continue;
+        int si = select_species_roster(sample, roster, rand_val);
+        if (si < 0) continue;
 
-        plants.push_back({x, z, kind, 0.01f, pt_seed});
+        plants.push_back({x, z, roster[static_cast<size_t>(si)].kind, 0.01f, pt_seed, si});
     }
 
     return plants;
 }
 
+void resolve_plant_species(std::vector<PlantInstance>& plants,
+                           const std::vector<PlantSpecies>& roster)
+{
+    for (auto& p : plants) {
+        if (p.species >= 0 && p.species < static_cast<int>(roster.size())) continue;
+        int match = -1;
+        for (size_t i = 0; i < roster.size(); ++i) {
+            if (roster[i].kind == p.kind) { match = static_cast<int>(i); break; }
+        }
+        if (match < 0) { p.health = 0.0f; continue; }  // no species of this kind → dies
+        p.species = match;
+    }
+}
+
 void tick_plant_population(
     std::vector<PlantInstance>& plants,
+    const std::vector<PlantSpecies>& roster,
     const EnvironmentField& env,
-    const EcosystemParams& eco,
     float dt,
     float growth_rate,
     float decay_rate)
 {
     for (auto& p : plants) {
         if (p.health <= 0.0f) continue;
+        if (p.species < 0 || p.species >= static_cast<int>(roster.size())) continue;
 
         auto sample = env(p.x, p.z);
-        const SpeciesSuitability* suit = nullptr;
-        switch (p.kind) {
-        case PLANT_GRASS:      suit = &eco.grass_suit;      break;
-        case PLANT_BUSH:       suit = &eco.bush_suit;       break;
-        case PLANT_TREE:       suit = &eco.tree_suit;       break;
-        case PLANT_REED:       suit = &eco.reed_suit;       break;
-        case PLANT_WILDFLOWER: suit = &eco.wildflower_suit; break;
-        }
-        if (!suit) continue;
-
-        float s = compute_suitability(*suit, sample);
+        float s = compute_suitability(roster[static_cast<size_t>(p.species)].suit, sample);
 
         if (s > 0.1f) {
             p.health = std::min(p.health + growth_rate * s * dt, 1.0f);
@@ -459,22 +513,25 @@ void tick_plant_population(
 }
 
 void collect_plant_instances(const std::vector<PlantInstance>& plants,
-                              int kind,
+                              int species_index,
                               std::vector<PlantGPUInstance>& out)
 {
     out.clear();
     for (const auto& p : plants)
-        if (p.kind == kind && p.health > 0.0f)
+        if (p.species == species_index && p.health > 0.0f)
             out.push_back({p.x, 0.0f, p.z, p.health, p.seed});
 }
 
 void sprout_plants(
     std::vector<PlantInstance>& plants,
+    const std::vector<PlantSpecies>& roster,
     const EcosystemParams& eco,
     const EnvironmentField& env,
     uint32_t seed,
     int max_sprouts)
 {
+    if (roster.empty()) return;
+
     float half = eco.region_size * 0.5f;
     float min_dist2 = eco.r_min * eco.r_min;
     constexpr float pi = 3.14159265f;
@@ -495,38 +552,39 @@ void sprout_plants(
         grid[iz * grid_w + ix].push_back(i);
     }
 
-    // Index existing plants by kind for parent selection
-    std::vector<size_t> kind_idx[PLANT_KIND_COUNT];
+    // Index established plants by roster species for parent selection.
+    std::vector<std::vector<size_t>> species_parents(roster.size());
     for (size_t i = 0; i < plants.size(); ++i) {
         if (plants[i].health < 0.3f) continue;
-        if (plants[i].kind >= 0 && plants[i].kind < PLANT_KIND_COUNT)
-            kind_idx[plants[i].kind].push_back(i);
+        int sp = plants[i].species;
+        if (sp >= 0 && sp < static_cast<int>(roster.size()))
+            species_parents[static_cast<size_t>(sp)].push_back(i);
     }
+
+    // Cumulative base-density weights for picking which species sprouts.
+    float weight_total = 0.0f;
+    for (const auto& sp : roster) weight_total += sp.suit.base_density;
+    if (weight_total < 1e-4f) return;
 
     int sprouted = 0;
 
     for (int attempt = 0; attempt < max_sprouts * 5 && sprouted < max_sprouts; ++attempt) {
         uint32_t s = dhash(seed ^ static_cast<uint32_t>(attempt * 2654435761u));
 
-        // Weighted species selection
-        float species_roll = dhash_float(s, 10);
-        int kind;
-        if (species_roll < 0.40f)       kind = PLANT_GRASS;      // 40%
-        else if (species_roll < 0.55f)  kind = PLANT_REED;       // 15%
-        else if (species_roll < 0.72f)  kind = PLANT_WILDFLOWER; // 17%
-        else if (species_roll < 0.88f)  kind = PLANT_BUSH;       // 16%
-        else                            kind = PLANT_TREE;       // 12%
-
-        bool enabled[] = {eco.grass_enabled, eco.bush_enabled, eco.tree_enabled,
-                          eco.reed_enabled, eco.wildflower_enabled};
-        if (!enabled[kind]) continue;
+        // Pick a roster species weighted by base_density.
+        float roll = dhash_float(s, 10) * weight_total;
+        int si = 0;
+        float accum = 0.0f;
+        for (size_t i = 0; i < roster.size(); ++i) {
+            accum += roster[i].suit.base_density;
+            if (roll <= accum) { si = static_cast<int>(i); break; }
+        }
+        int kind = roster[static_cast<size_t>(si)].kind;
+        const auto& parents = species_parents[static_cast<size_t>(si)];
 
         float x, z;
-        const auto& parents = kind_idx[kind];
-
-        if ((kind == PLANT_GRASS || kind == PLANT_REED || kind == PLANT_WILDFLOWER)
-            && !parents.empty()) {
-            // Ground cover: spread from parent (1-3m)
+        if (kind_is_ground_cover(kind) && !parents.empty()) {
+            // Ground cover: spread from a parent of the same species (1-3m).
             size_t pi_idx = static_cast<size_t>(
                 dhash_float(s, 0) * static_cast<float>(parents.size()));
             if (pi_idx >= parents.size()) pi_idx = parents.size() - 1;
@@ -535,7 +593,8 @@ void sprout_plants(
             float dist = 1.0f + dhash_float(s, 2) * 2.0f;
             x = parent.x + std::cos(angle) * dist;
             z = parent.z + std::sin(angle) * dist;
-        } else if (kind == PLANT_TREE && !parents.empty() && dhash_float(s, 3) < 0.85f) {
+        } else if (!kind_is_ground_cover(kind) && !parents.empty() && dhash_float(s, 3) < 0.85f) {
+            // Canopy/shrub: cluster near a parent of the same species (3-8m).
             size_t pi_idx = static_cast<size_t>(
                 dhash_float(s, 0) * static_cast<float>(parents.size()));
             if (pi_idx >= parents.size()) pi_idx = parents.size() - 1;
@@ -552,16 +611,7 @@ void sprout_plants(
         if (x < -half || x > half || z < -half || z > half) continue;
 
         auto sample = env(x, z);
-        const SpeciesSuitability* suit = nullptr;
-        switch (kind) {
-        case PLANT_GRASS:      suit = &eco.grass_suit;      break;
-        case PLANT_BUSH:       suit = &eco.bush_suit;       break;
-        case PLANT_TREE:       suit = &eco.tree_suit;       break;
-        case PLANT_REED:       suit = &eco.reed_suit;       break;
-        case PLANT_WILDFLOWER: suit = &eco.wildflower_suit; break;
-        }
-        if (!suit) continue;
-        if (compute_suitability(*suit, sample) < 0.3f) continue;
+        if (compute_suitability(roster[static_cast<size_t>(si)].suit, sample) < 0.3f) continue;
 
         // Spatial grid neighborhood check (3x3 cells)
         auto [cx, cz] = cell_of(x, z);
@@ -572,9 +622,9 @@ void sprout_plants(
                 if (nc < 0 || nc >= grid_w || nr < 0 || nr >= grid_w) continue;
                 auto it = grid.find(nr * grid_w + nc);
                 if (it == grid.end()) continue;
-                for (uint32_t pi : it->second) {
-                    float fdx = plants[pi].x - x;
-                    float fdz = plants[pi].z - z;
+                for (uint32_t pidx : it->second) {
+                    float fdx = plants[pidx].x - x;
+                    float fdz = plants[pidx].z - z;
                     if (fdx * fdx + fdz * fdz < min_dist2) { too_close = true; break; }
                 }
             }
@@ -582,7 +632,7 @@ void sprout_plants(
         if (too_close) continue;
 
         uint32_t pt_seed = dhash(s ^ 0x12345678u);
-        plants.push_back({x, z, kind, 0.01f, pt_seed});
+        plants.push_back({x, z, kind, 0.01f, pt_seed, si});
         auto [ax, az] = cell_of(x, z);
         grid[az * grid_w + ax].push_back(static_cast<uint32_t>(plants.size() - 1));
         ++sprouted;

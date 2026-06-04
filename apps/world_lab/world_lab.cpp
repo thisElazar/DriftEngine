@@ -725,34 +725,19 @@ static void write_image(VkDevice device, VkDescriptorSet set, uint32_t binding,
 }
 
 // ---------------------------------------------------------------------------
-// Build one canonical mesh per plant kind (called once at init / on species change)
+// Build one canonical mesh per roster species (rebuilt on species change).
+// Per-instance variation comes from the instance buffer, so the canonical mesh
+// is generated once at mid-moisture, at the origin (instancing translates it).
 // ---------------------------------------------------------------------------
 static void build_canonical_meshes(WorldLabState& s, VmaAllocator alloc)
 {
-    using namespace bestiary;
-    constexpr float mid = 0.5f;
-
-    auto upload = [&](int kind, const VegetationMesh& m) {
-        destroy_plant_mesh(alloc, s.plant_canonical[kind]);
-        upload_plant_mesh(alloc, s.plant_canonical[kind], m);
-    };
-
-    upload(PLANT_GRASS,
-           generate_clump(evaluate_expression(s.clump_params, s.clump_expr, mid),
-                          0, false, 0.0f, 0.0f));
-    upload(PLANT_BUSH,
-           generate_bush(evaluate_bush_expression(s.bush_params, s.bush_expr, mid),
-                         0, false, 0.0f, 0.0f));
-    upload(PLANT_TREE,
-           generate_tree(evaluate_tree_expression(s.tree_params, s.tree_expr, mid),
-                         0, false, 0.0f, 0.0f));
-    upload(PLANT_REED,
-           generate_clump(evaluate_expression(s.reed_params, s.reed_expr, mid),
-                          0, false, 0.0f, 0.0f));
-    upload(PLANT_WILDFLOWER,
-           generate_wildflower(evaluate_wildflower_expression(
-                                   s.wildflower_params, s.wildflower_expr, mid),
-                               0, false, 0.0f, 0.0f));
+    for (auto& m : s.plant_canonical) destroy_plant_mesh(alloc, m);
+    s.plant_canonical.assign(s.plant_roster.size(), {});
+    for (size_t i = 0; i < s.plant_roster.size(); ++i) {
+        if (!s.plant_roster[i].gen) continue;
+        upload_plant_mesh(alloc, s.plant_canonical[i],
+                          s.plant_roster[i].gen(0.5f, 0, 0.0f, 0.0f));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -763,16 +748,20 @@ static void upload_plant_instances(WorldLabState& s, VkDevice device, VmaAllocat
     constexpr float plant_lift = 0.01f;
     std::vector<bestiary::PlantGPUInstance> buf;
     vkDeviceWaitIdle(device);
-    for (int k = 0; k < bestiary::PLANT_KIND_COUNT; ++k) {
+
+    // Size the per-species buffers to the roster (freeing any stale ones).
+    for (auto& b : s.plant_inst) destroy_buffer(alloc, b);
+    s.plant_inst.assign(s.plant_roster.size(), GpuBuffer{});
+    s.plant_inst_count.assign(s.plant_roster.size(), 0u);
+
+    for (size_t k = 0; k < s.plant_roster.size(); ++k) {
         buf.clear();
         for (const auto& p : s.plant_population) {
-            if (p.kind != k || p.health <= 0.0f) continue;
+            if (p.species != static_cast<int>(k) || p.health <= 0.0f) continue;
             float terrain_y = sample_hm_bilinear(s.hm_cpu, WL_GRID_W, WL_GRID_H,
                                                   wl_world_to_gx(p.x), wl_world_to_gy(p.z));
             buf.push_back({p.x, terrain_y + plant_lift, p.z, p.health, p.seed});
         }
-        destroy_buffer(alloc, s.plant_inst[k]);
-        s.plant_inst_count[k] = 0;
         if (buf.empty()) continue;
         VkDeviceSize sz = buf.size() * sizeof(bestiary::PlantGPUInstance);
         s.plant_inst[k] = create_host_buffer(alloc, sz, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
@@ -822,7 +811,7 @@ static void run_replant(WorldLabState& s, VkDevice device, VmaAllocator alloc,
                         VkQueue gqueue, uint32_t gfamily)
 {
     refresh_env(s, device, alloc, gqueue, gfamily);
-    s.plant_population = bestiary::place_ecosystem(s.eco_params, s.persistent_env);
+    s.plant_population = bestiary::place_ecosystem(s.plant_roster, s.eco_params, s.persistent_env);
     upload_plant_instances(s, device, alloc);
     s.veg_rebuild_timer = 0.0f;
 }
@@ -936,8 +925,10 @@ static void save_plant_profiles(const WorldLabState& s)
                         &s.tree_expr);
     bestiary::save_wildflower(dir / "world_wildflower.toml", s.wildflower_params,
                               "world_wildflower", &s.wildflower_expr);
+    bestiary::save_lplant(dir / "world_lplant.toml", s.lplant_params,
+                          "world_lplant", &s.lplant_expr);
 
-    std::fprintf(stderr, "Saved 5 plant profiles to %s/\n", wl_species_dir());
+    std::fprintf(stderr, "Saved 6 plant profiles to %s/\n", wl_species_dir());
 }
 
 static bool load_plant_profiles(WorldLabState& s)
@@ -990,8 +981,126 @@ static bool load_plant_profiles(WorldLabState& s)
             std::fprintf(stderr, "Loaded plant: %s\n", name.c_str());
         }
     }
+    {
+        std::string name;
+        auto p = dir / "world_lplant.toml";
+        if (std::filesystem::exists(p) &&
+            bestiary::load_lplant(p, s.lplant_params, name, &s.lplant_expr)) {
+            any = true;
+            std::fprintf(stderr, "Loaded plant: %s\n", name.c_str());
+        }
+    }
 
     return any;
+}
+
+// ---------------------------------------------------------------------------
+// Build the plant roster (the data-driven palette). Entries: the six built-in
+// "house" species (editable in the lab, saved as world_*.toml) plus every other
+// plant .toml in the species library — so designing + saving any plant makes it
+// appear in the world. Each entry carries a type-erased generator closing over
+// a *copy* of its params, so the roster is a stable snapshot.
+// See docs/WORLD_LAB_INTEGRATION.md.
+// ---------------------------------------------------------------------------
+static bestiary::SpeciesSuitability suit_for_kind(int kind,
+                                                  const bestiary::EcosystemParams& e)
+{
+    switch (kind) {
+    case bestiary::PLANT_BUSH:       return e.bush_suit;
+    case bestiary::PLANT_TREE:       return e.tree_suit;
+    case bestiary::PLANT_REED:       return e.reed_suit;
+    case bestiary::PLANT_WILDFLOWER: return e.wildflower_suit;
+    case bestiary::PLANT_LPLANT:     return e.tree_suit;   // L-plants are tree-like
+    default:                         return e.grass_suit;
+    }
+}
+
+static void build_plant_roster(WorldLabState& s)
+{
+    using namespace bestiary;
+    s.plant_roster.clear();
+
+    auto add = [&](std::string name, int kind,
+                   std::function<VegetationMesh(float, uint32_t, float, float)> gen) {
+        PlantSpecies sp;
+        sp.name = std::move(name);
+        sp.kind = kind;
+        sp.suit = suit_for_kind(kind, s.eco_params);
+        sp.gen  = std::move(gen);
+        s.plant_roster.push_back(std::move(sp));
+    };
+
+    // --- Built-in "house" species (edited in the lab UI, saved as world_*) ---
+    add("world_grass", PLANT_GRASS,
+        [cp = s.clump_params, ce = s.clump_expr](float m, uint32_t sd, float x, float z) {
+            return generate_clump(evaluate_expression(cp, ce, m), sd, false, x, z); });
+    add("world_bush", PLANT_BUSH,
+        [bp = s.bush_params, be = s.bush_expr](float m, uint32_t sd, float x, float z) {
+            return generate_bush(evaluate_bush_expression(bp, be, m), sd, false, x, z); });
+    add("world_tree", PLANT_TREE,
+        [tp = s.tree_params, te = s.tree_expr](float m, uint32_t sd, float x, float z) {
+            return generate_tree(evaluate_tree_expression(tp, te, m), sd, false, x, z); });
+    add("world_reed", PLANT_REED,
+        [rp = s.reed_params, re = s.reed_expr](float m, uint32_t sd, float x, float z) {
+            return generate_clump(evaluate_expression(rp, re, m), sd, false, x, z); });
+    add("world_wildflower", PLANT_WILDFLOWER,
+        [wp = s.wildflower_params, we = s.wildflower_expr](float m, uint32_t sd, float x, float z) {
+            return generate_wildflower(evaluate_wildflower_expression(wp, we, m), sd, false, x, z); });
+    add("world_lplant", PLANT_LPLANT,
+        [lp = s.lplant_params, le = s.lplant_expr](float m, uint32_t sd, float x, float z) {
+            return generate_lplant(evaluate_lplant_expression(lp, le, m), sd, false, x, z); });
+
+    // --- Library species: any OTHER plant .toml becomes a roster entry ---
+    static const char* house[] = {"world_grass", "world_bush", "world_tree",
+                                  "world_reed", "world_wildflower", "world_lplant"};
+    auto is_house = [&](const std::string& stem) {
+        for (const char* h : house) if (stem == h) return true;
+        return false;
+    };
+
+    namespace fs = std::filesystem;
+    auto dir = fs::path(wl_species_dir());
+    if (!fs::exists(dir)) return;
+    for (auto& entry : fs::directory_iterator(dir)) {
+        if (entry.path().extension() != ".toml") continue;
+        std::string stem = entry.path().stem().string();
+        if (is_house(stem)) continue;
+        std::string kind = detect_species_kind(entry.path());
+        std::string nm;
+        if (kind == "grass_clump") {
+            ClumpParams p; ClumpExpression ex;
+            if (load_clump(entry.path(), p, nm, &ex))
+                add(stem, PLANT_GRASS, [p, ex](float m, uint32_t sd, float x, float z) {
+                    return generate_clump(evaluate_expression(p, ex, m), sd, false, x, z); });
+        } else if (kind == "reed") {
+            ClumpParams p; ClumpExpression ex;
+            if (load_clump(entry.path(), p, nm, &ex))
+                add(stem, PLANT_REED, [p, ex](float m, uint32_t sd, float x, float z) {
+                    return generate_clump(evaluate_expression(p, ex, m), sd, false, x, z); });
+        } else if (kind == "bush") {
+            BushParams p; BushExpression ex;
+            if (load_bush(entry.path(), p, nm, &ex))
+                add(stem, PLANT_BUSH, [p, ex](float m, uint32_t sd, float x, float z) {
+                    return generate_bush(evaluate_bush_expression(p, ex, m), sd, false, x, z); });
+        } else if (kind == "tree") {
+            TreeParams p; TreeExpression ex;
+            if (load_tree(entry.path(), p, nm, &ex))
+                add(stem, PLANT_TREE, [p, ex](float m, uint32_t sd, float x, float z) {
+                    return generate_tree(evaluate_tree_expression(p, ex, m), sd, false, x, z); });
+        } else if (kind == "wildflower") {
+            WildflowerParams p; WildflowerExpression ex;
+            if (load_wildflower(entry.path(), p, nm, &ex))
+                add(stem, PLANT_WILDFLOWER, [p, ex](float m, uint32_t sd, float x, float z) {
+                    return generate_wildflower(evaluate_wildflower_expression(p, ex, m), sd, false, x, z); });
+        } else if (kind == "lplant") {
+            LPlantParams p; LPlantExpression ex;
+            if (load_lplant(entry.path(), p, nm, &ex))
+                add(stem, PLANT_LPLANT, [p, ex](float m, uint32_t sd, float x, float z) {
+                    return generate_lplant(evaluate_lplant_expression(p, ex, m), sd, false, x, z); });
+        }
+    }
+
+    std::fprintf(stderr, "Plant roster: %zu species\n", s.plant_roster.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,7 +1471,6 @@ void world_lab_init(WorldLabState& s, Renderer& r)
 
     // ---- Plant + ecosystem default params ---------------------------------
     load_plant_profiles(s);
-    build_canonical_meshes(s, alloc);
 
     s.eco_params.region_size   = static_cast<float>(WL_GRID_W) * WL_DX;
     s.eco_params.density_scale = 1.0f;
@@ -1420,6 +1528,11 @@ void world_lab_init(WorldLabState& s, Renderer& r)
     s.wildflower_expr.flower_count.enabled = true;
     s.wildflower_expr.flower_count.low  = 4.0f;
     s.wildflower_expr.flower_count.high = 10.0f;
+
+    // Build the plant roster (house species + library scan) now that params are
+    // set, then the canonical meshes from it.
+    build_plant_roster(s);
+    build_canonical_meshes(s, alloc);
 
     // ---- Creature profiles --------------------------------------------------
     if (!load_creature_profiles(s))
@@ -1983,34 +2096,24 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, const InputFrame& in, float d
         ImGui::SameLine();
         if (ImGui::Button("Load Plants")) {
             if (load_plant_profiles(s)) {
+                build_plant_roster(s);
                 build_canonical_meshes(s, alloc);
                 s.replant_pending = 1;
             }
         }
         ImGui::Separator();
 
-        // Per-species plant count
-        int n_grass = 0, n_bush = 0, n_tree = 0, n_reed = 0, n_wf = 0;
-        for (const auto& p : s.plant_population) {
-            switch (p.kind) {
-            case bestiary::PLANT_GRASS:      ++n_grass; break;
-            case bestiary::PLANT_BUSH:       ++n_bush;  break;
-            case bestiary::PLANT_TREE:       ++n_tree;  break;
-            case bestiary::PLANT_REED:       ++n_reed;  break;
-            case bestiary::PLANT_WILDFLOWER: ++n_wf;    break;
-            }
-        }
+        // Per-roster-species plant count.
         int n_plants = static_cast<int>(s.plant_population.size());
-        ImGui::Text("plants: %d total", n_plants);
-        ImGui::Text("  grass:%d  bush:%d  tree:%d", n_grass, n_bush, n_tree);
-        ImGui::Text("  reed:%d  wildflower:%d", n_reed, n_wf);
+        ImGui::Text("plants: %d total across %zu species",
+                    n_plants, s.plant_roster.size());
         uint32_t total_inst = 0;
-        for (int k = 0; k < bestiary::PLANT_KIND_COUNT; ++k) total_inst += s.plant_inst_count[k];
-        ImGui::Text("instances: %u  canonical verts/kind: %u/%u/%u/%u/%u",
-                    total_inst,
-                    s.plant_canonical[0].vertex_count, s.plant_canonical[1].vertex_count,
-                    s.plant_canonical[2].vertex_count, s.plant_canonical[3].vertex_count,
-                    s.plant_canonical[4].vertex_count);
+        for (size_t k = 0; k < s.plant_roster.size(); ++k) {
+            uint32_t cnt = (k < s.plant_inst_count.size()) ? s.plant_inst_count[k] : 0u;
+            total_inst += cnt;
+            ImGui::Text("  %-16s x%u", s.plant_roster[k].name.c_str(), cnt);
+        }
+        ImGui::Text("instances: %u", total_inst);
     }
 
     // ---- Creatures ---------------------------------------------------------
@@ -2195,9 +2298,10 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, const InputFrame& in, float d
     s.prev_rain_key = rain_key;
 
     // ---- Plant population tick (always, independent of creatures) --------
-    bestiary::tick_plant_population(s.plant_population, s.persistent_env,
-                                    s.eco_params, sim_dt,
-                                    s.plant_growth_rate, s.plant_decay_rate);
+    // Resolve any creature-dispersed seeds (species < 0) to a roster entry first.
+    bestiary::resolve_plant_species(s.plant_population, s.plant_roster);
+    bestiary::tick_plant_population(s.plant_population, s.plant_roster, s.persistent_env,
+                                    sim_dt, s.plant_growth_rate, s.plant_decay_rate);
 
     constexpr float VEG_REBUILD_INTERVAL = 0.5f;
     s.veg_rebuild_timer += dt;
@@ -2266,7 +2370,7 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, const InputFrame& in, float d
             refresh_env(s, device, alloc, gqueue, gfamily);
 
             // Sprout new plants where conditions are favorable
-            bestiary::sprout_plants(s.plant_population, s.eco_params,
+            bestiary::sprout_plants(s.plant_population, s.plant_roster, s.eco_params,
                                      s.persistent_env, s.sprout_seed);
             ++s.sprout_seed;
         }
@@ -2580,7 +2684,8 @@ void world_lab_render(WorldLabState& s, Renderer& r,
         cpc.time = s.accumulated_time;
         vkCmdPushConstants(cmd, s.pipe_clump.layout, VK_SHADER_STAGE_VERTEX_BIT,
                            0, sizeof(cpc), &cpc);
-        for (int k = 0; k < bestiary::PLANT_KIND_COUNT; ++k) {
+        for (size_t k = 0; k < s.plant_inst.size(); ++k) {
+            if (k >= s.plant_canonical.size()) break;
             if (s.plant_inst_count[k] == 0 || s.plant_canonical[k].index_count == 0) continue;
             VkBuffer     vbufs[2]   = {s.plant_canonical[k].vbo.buffer, s.plant_inst[k].buffer};
             VkDeviceSize offsets[2] = {0, 0};
@@ -2683,10 +2788,11 @@ void world_lab_shutdown(WorldLabState& s, Renderer& r)
 
     vkDeviceWaitIdle(device);
 
-    for (int k = 0; k < bestiary::PLANT_KIND_COUNT; ++k) {
-        destroy_plant_mesh(alloc, s.plant_canonical[k]);
-        destroy_buffer(alloc, s.plant_inst[k]);
-    }
+    for (auto& m : s.plant_canonical) destroy_plant_mesh(alloc, m);
+    for (auto& b : s.plant_inst)      destroy_buffer(alloc, b);
+    s.plant_canonical.clear();
+    s.plant_inst.clear();
+    s.plant_inst_count.clear();
     destroy_plant_mesh(alloc, s.creature_mesh_gpu);
     destroy_buffer(alloc, s.terrain_mesh.vbo);
     destroy_buffer(alloc, s.terrain_mesh.ibo);

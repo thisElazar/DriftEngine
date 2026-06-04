@@ -202,10 +202,11 @@ struct WorldLabState {
     // --- Terrain mesh ---
     StaticGridMesh terrain_mesh{};
 
-    // --- Plant rendering (instanced) ---
-    WL_PlantMesh plant_canonical[bestiary::PLANT_KIND_COUNT]{};  // static, built once
-    GpuBuffer    plant_inst[bestiary::PLANT_KIND_COUNT]{};        // per-kind instance buffers
-    uint32_t     plant_inst_count[bestiary::PLANT_KIND_COUNT]{};
+    // --- Plant rendering (instanced) — one entry per roster species ---
+    std::vector<bestiary::PlantSpecies> plant_roster;     // built from the species library
+    std::vector<WL_PlantMesh>           plant_canonical;  // canonical mesh per species
+    std::vector<GpuBuffer>              plant_inst;        // per-species instance buffer
+    std::vector<uint32_t>               plant_inst_count;
 
     // --- Camera ---
     OrbitCamera camera{};
@@ -222,6 +223,8 @@ struct WorldLabState {
     bestiary::ClumpExpression       reed_expr{};
     bestiary::WildflowerParams      wildflower_params{};
     bestiary::WildflowerExpression  wildflower_expr{};
+    bestiary::LPlantParams          lplant_params{};
+    bestiary::LPlantExpression      lplant_expr{};
 
     // --- Brush + sim controls ---
     int   ui_brush_radius_cells = 12;
