@@ -292,6 +292,7 @@ struct WorldLabState {
     // --- Creature state ---
     std::vector<bestiary::Agent> agents;
     std::vector<bestiary::CreatureProfile> creature_profiles;
+    std::vector<std::string>               creature_names;   // parallel to creature_profiles
     WL_PlantMesh creature_mesh_gpu{};
     std::vector<float> persistent_water_depth;
     bestiary::EnvironmentField persistent_env;

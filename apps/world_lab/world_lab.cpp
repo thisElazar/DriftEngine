@@ -871,35 +871,35 @@ static void save_creature_profiles(const WorldLabState& s)
 {
     std::filesystem::create_directories(wl_species_dir());
     for (size_t i = 0; i < s.creature_profiles.size(); ++i) {
+        std::string nm = (i < s.creature_names.size() && !s.creature_names[i].empty())
+                       ? s.creature_names[i]
+                       : ("species" + std::to_string(i));
         std::filesystem::path p = std::filesystem::path(wl_species_dir())
-            / (std::string(wl_profile_names[i]) + ".toml");
-        bestiary::save_creature(p, s.creature_profiles[i], wl_profile_names[i]);
+            / (nm + ".toml");
+        bestiary::save_creature(p, s.creature_profiles[i], nm);
     }
     std::fprintf(stderr, "Saved %zu creature profiles to %s/\n",
                  s.creature_profiles.size(), wl_species_dir());
 }
 
+// Load every creature species file in the library as the world's roster (the
+// "whole library is the palette" model). Returns false only if there are none,
+// in which case the caller builds the default cast. Sorted by name for a stable
+// species_id ordering across reloads.
 static bool load_creature_profiles(WorldLabState& s)
 {
     auto loaded = bestiary::load_creature_dir(wl_species_dir());
     if (loaded.empty()) return false;
 
-    s.creature_profiles.clear();
+    std::sort(loaded.begin(), loaded.end(),
+              [](const bestiary::NamedCreatureProfile& a,
+                 const bestiary::NamedCreatureProfile& b) { return a.name < b.name; });
 
-    for (size_t i = 0; i < 8; ++i) {
-        const char* want = wl_profile_names[i];
-        bool found = false;
-        for (auto& ncp : loaded) {
-            if (ncp.name == want) {
-                s.creature_profiles.push_back(ncp.profile);
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            std::fprintf(stderr, "Warning: species '%s' not found on disk, using default\n", want);
-            return false;
-        }
+    s.creature_profiles.clear();
+    s.creature_names.clear();
+    for (auto& ncp : loaded) {
+        s.creature_profiles.push_back(ncp.profile);
+        s.creature_names.push_back(ncp.name);
     }
 
     std::fprintf(stderr, "Loaded %zu creature profiles from %s/\n",
@@ -1106,35 +1106,39 @@ static void build_plant_roster(WorldLabState& s)
 // ---------------------------------------------------------------------------
 // Spawn creatures across all species
 // ---------------------------------------------------------------------------
+// Spawn the whole creature roster, distributing ui_creature_count across species
+// by an archetype weight (prey abundant, hunters sparse). Every species in the
+// roster gets at least one individual so the full library is represented.
 static void spawn_all_creatures(WorldLabState& s)
 {
     s.agents.clear();
+    if (s.creature_profiles.empty()) return;
+
+    auto archetype_weight = [](bestiary::Archetype a) -> float {
+        switch (a) {
+        case bestiary::Archetype::Herbivore: return 3.0f;
+        case bestiary::Archetype::Rabbit:    return 3.0f;
+        case bestiary::Archetype::Bird:      return 2.0f;
+        case bestiary::Archetype::Predator:  return 1.0f;
+        case bestiary::Archetype::Raptor:    return 1.0f;
+        case bestiary::Archetype::Snake:     return 1.0f;
+        }
+        return 1.0f;
+    };
+
+    float wsum = 0.0f;
+    for (const auto& p : s.creature_profiles) wsum += archetype_weight(p.archetype);
+    if (wsum < 1e-4f) wsum = 1.0f;
+
     int total = s.ui_creature_count;
-    int wolf_count   = std::max(2, total / 10);
-    int rabbit_count = total / 5;
-    int bird_count   = total / 6;
-    int raptor_count = std::max(1, total / 20);
-    int snake_count  = std::max(1, total / 15);
-    int herb_count   = total - wolf_count - rabbit_count - bird_count - raptor_count - snake_count;
-    herb_count = std::max(0, herb_count);
-    int per_herb = herb_count / 3;
-    int herb_extra = herb_count - per_herb * 3;
-    bestiary::spawn_creatures(s.agents, 0, per_herb + (herb_extra > 0 ? 1 : 0),
-        s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 42u);
-    bestiary::spawn_creatures(s.agents, 1, per_herb + (herb_extra > 1 ? 1 : 0),
-        s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 137u);
-    bestiary::spawn_creatures(s.agents, 2, per_herb,
-        s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 271u);
-    bestiary::spawn_creatures(s.agents, 3, wolf_count,
-        s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 404u);
-    bestiary::spawn_creatures(s.agents, 4, rabbit_count,
-        s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 555u);
-    bestiary::spawn_creatures(s.agents, 5, bird_count,
-        s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 666u);
-    bestiary::spawn_creatures(s.agents, 6, raptor_count,
-        s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 777u);
-    bestiary::spawn_creatures(s.agents, 7, snake_count,
-        s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z, 888u);
+    for (size_t i = 0; i < s.creature_profiles.size(); ++i) {
+        float w = archetype_weight(s.creature_profiles[i].archetype);
+        int count = static_cast<int>(std::round(static_cast<float>(total) * w / wsum));
+        if (count < 1) count = 1;
+        bestiary::spawn_creatures(s.agents, static_cast<uint16_t>(i), count,
+            s.persistent_env, WL_TILE_HALF_X, WL_TILE_HALF_Z,
+            42u + static_cast<uint32_t>(i) * 101u);
+    }
 }
 
 // ===========================================================================
@@ -1818,6 +1822,7 @@ void world_lab_init(WorldLabState& s, Renderer& r)
         snake.slope_cost_factor = 0.5f;
         snake.max_age = 1800.0f;
         s.creature_profiles.push_back(snake);
+        s.creature_names.assign(wl_profile_names, wl_profile_names + 8);
     }
 
     s.persistent_water_depth.assign(WL_GRID_W * WL_GRID_H, 0.0f);
@@ -2169,10 +2174,10 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, const InputFrame& in, float d
                     }
                 }
                 ImGui::SameLine();
-                const char* sp_names[] = {"Sprinter","Grazer","Browser","Wolf","Rabbit","Bird","Raptor","Snake"};
                 int sp = s.agents[s.ui_follow_agent].species_id;
-                ImGui::TextDisabled("#%d %s", s.ui_follow_agent,
-                    (sp >= 0 && sp < 8) ? sp_names[sp] : "?");
+                const char* nm = (sp >= 0 && sp < static_cast<int>(s.creature_names.size()))
+                               ? s.creature_names[static_cast<size_t>(sp)].c_str() : "?";
+                ImGui::TextDisabled("#%d %s", s.ui_follow_agent, nm);
             }
         }
 
@@ -2185,9 +2190,12 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, const InputFrame& in, float d
         int s5 = bestiary::count_alive_species(s.agents, 5);
         int s6 = bestiary::count_alive_species(s.agents, 6);
         int s7 = bestiary::count_alive_species(s.agents, 7);
-        ImGui::Text("alive: %d", alive);
-        ImGui::Text("  S:%d G:%d B:%d W:%d R:%d Bi:%d Ra:%d Sn:%d",
-                    s0, s1, s2, s3, s4, s5, s6, s7);
+        ImGui::Text("alive: %d  (%zu species)", alive, s.creature_profiles.size());
+        for (size_t i = 0; i < s.creature_profiles.size(); ++i) {
+            const char* nm = (i < s.creature_names.size()) ? s.creature_names[i].c_str() : "?";
+            ImGui::Text("  %-14s %d", nm,
+                        bestiary::count_alive_species(s.agents, static_cast<uint16_t>(i)));
+        }
         float cur_avg_energy = bestiary::avg_energy(s.agents);
         float cur_min_energy = bestiary::min_energy(s.agents);
         float cur_max_energy = bestiary::max_energy(s.agents);
@@ -2229,15 +2237,22 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, const InputFrame& in, float d
             for (int k = 0; k < s.graph.count; ++k)
                 if (s.graph.pop_total[k] > pop_max) pop_max = s.graph.pop_total[k];
             pop_max = std::ceil(pop_max / 10.0f) * 10.0f;
-            plot_ring("Sprinter", s.graph.pop_sprinter, ImVec4(0.9f, 0.7f, 0.3f, 1.0f), 0.0f, pop_max);
-            plot_ring("Grazer",   s.graph.pop_grazer,   ImVec4(0.5f, 0.8f, 0.3f, 1.0f), 0.0f, pop_max);
-            plot_ring("Browser",  s.graph.pop_browser,  ImVec4(0.4f, 0.3f, 0.2f, 1.0f), 0.0f, pop_max);
-            plot_ring("Wolf",     s.graph.pop_wolf,     ImVec4(0.8f, 0.2f, 0.2f, 1.0f), 0.0f, pop_max);
-            plot_ring("Rabbit",   s.graph.pop_rabbit,   ImVec4(0.7f, 0.6f, 0.9f, 1.0f), 0.0f, pop_max);
-            plot_ring("Bird",     s.graph.pop_bird,     ImVec4(0.3f, 0.7f, 0.9f, 1.0f), 0.0f, pop_max);
-            plot_ring("Raptor",   s.graph.pop_raptor,   ImVec4(0.9f, 0.5f, 0.1f, 1.0f), 0.0f, pop_max);
-            plot_ring("Snake",    s.graph.pop_snake,    ImVec4(0.2f, 0.5f, 0.2f, 1.0f), 0.0f, pop_max);
-            plot_ring("Total",    s.graph.pop_total,    ImVec4(1.0f, 1.0f, 1.0f, 1.0f), 0.0f, pop_max);
+            // Labels come from the roster (species_id 0..7). The graph tracks
+            // only the first 8 species; with a larger roster the rest aren't
+            // plotted (the per-species text readout above covers all of them).
+            auto gname = [&](int i) {
+                return (i < static_cast<int>(s.creature_names.size()))
+                       ? s.creature_names[static_cast<size_t>(i)].c_str() : "-";
+            };
+            plot_ring(gname(0), s.graph.pop_sprinter, ImVec4(0.9f, 0.7f, 0.3f, 1.0f), 0.0f, pop_max);
+            plot_ring(gname(1), s.graph.pop_grazer,   ImVec4(0.5f, 0.8f, 0.3f, 1.0f), 0.0f, pop_max);
+            plot_ring(gname(2), s.graph.pop_browser,  ImVec4(0.4f, 0.3f, 0.2f, 1.0f), 0.0f, pop_max);
+            plot_ring(gname(3), s.graph.pop_wolf,     ImVec4(0.8f, 0.2f, 0.2f, 1.0f), 0.0f, pop_max);
+            plot_ring(gname(4), s.graph.pop_rabbit,   ImVec4(0.7f, 0.6f, 0.9f, 1.0f), 0.0f, pop_max);
+            plot_ring(gname(5), s.graph.pop_bird,     ImVec4(0.3f, 0.7f, 0.9f, 1.0f), 0.0f, pop_max);
+            plot_ring(gname(6), s.graph.pop_raptor,   ImVec4(0.9f, 0.5f, 0.1f, 1.0f), 0.0f, pop_max);
+            plot_ring(gname(7), s.graph.pop_snake,    ImVec4(0.2f, 0.5f, 0.2f, 1.0f), 0.0f, pop_max);
+            plot_ring("Total",  s.graph.pop_total,    ImVec4(1.0f, 1.0f, 1.0f, 1.0f), 0.0f, pop_max);
         }
 
         if (ImGui::CollapsingHeader("Energy Graph")) {
@@ -2255,8 +2270,20 @@ bool world_lab_tick(WorldLabState& s, Renderer& r, const InputFrame& in, float d
 
         ImGui::Separator();
         ImGui::TextUnformatted("Species");
-        const char* species_names[] = {"Sprinter", "Grazer", "Browser", "Wolf", "Rabbit", "Bird", "Raptor", "Snake"};
-        ImGui::Combo("##species", &s.ui_species_sel, species_names, 8);
+        if (s.ui_species_sel < 0 ||
+            s.ui_species_sel >= static_cast<int>(s.creature_profiles.size()))
+            s.ui_species_sel = 0;
+        const char* cur_name = s.creature_names.empty()
+            ? "" : s.creature_names[static_cast<size_t>(s.ui_species_sel)].c_str();
+        if (ImGui::BeginCombo("##species", cur_name)) {
+            for (int i = 0; i < static_cast<int>(s.creature_names.size()); ++i) {
+                bool sel = (i == s.ui_species_sel);
+                if (ImGui::Selectable(s.creature_names[static_cast<size_t>(i)].c_str(), sel))
+                    s.ui_species_sel = i;
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
         auto& sp = s.creature_profiles[static_cast<size_t>(s.ui_species_sel)];
 
         ImGui::SliderFloat("body mass",       &sp.body_mass,            1.0f, 200.0f, "%.0f kg");

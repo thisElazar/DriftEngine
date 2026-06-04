@@ -96,13 +96,22 @@ but spawning is a fixed 8-id cast that must become a dynamic roster.
    in `species/` — so the whole library is the palette. L-Plant uses static bulk
    instancing for now (incremental growth is a later enhancement — see note).
    Plant Lab's baked preview path was left untouched.
-3. **Creature roster.** Spawn every creature file found as its own species_id
-   with a per-profile (or default) population count; retire the hardcoded 8-cast
-   and fixed-name matching.
-4. **Launcher wiring.** "Open World Lab" loads the whole current library; add a
-   refresh path so species saved during the session appear (rescan on enter, and
-   a manual "Reload library" button). Single-species routing is unnecessary under
-   the palette model.
+3. **Creature roster.** — DONE (builds green 2026-06-04; runtime verification by
+   the user pending). `load_creature_profiles` now loads *every* creature file in
+   `species/` (sorted by name for stable species_ids), not 8 fixed names; the
+   hardcoded 8-cast remains only as the empty-library fallback (and now sets
+   `creature_names`). `spawn_all_creatures` distributes `ui_creature_count` across
+   the whole roster by an archetype weight (prey abundant, hunters sparse; every
+   species gets ≥1). UI generalized to the roster: species combo, per-species
+   alive readout, follow-agent label, and population-graph legends are all
+   name-driven. Known cosmetic limit: the population *graph* still tracks only the
+   first 8 species_ids (its ring buffers are fixed-8); the text readout covers all.
+4. **Launcher wiring.** — SATISFIED BY DESIGN. Under the palette model, entering
+   World Lab re-inits it (`world_state = {}; world_lab_init`), which rescans the
+   whole library (plants + creatures); a species saved mid-session appears on the
+   next entry. In-lab "Load Plants" / "Load Species" buttons rescan live. Species
+   double-click still correctly opens the *design* lab. No per-species routing
+   needed. (Optional future polish: a single "Reload library" button.)
 5. **World persistence (later).** Save/load a composed world (seed + roster
    snapshot + climate), making a "world" a first-class artifact.
 
