@@ -92,78 +92,62 @@ CpuWorleyResult cpu_worley3d(glm::vec3 p, float seed_ofs) {
     return r;
 }
 
-static constexpr float PLATE_FREQ      = 1.1f;
-static constexpr float BOUNDARY_WIDTH  = 0.12f;
-static constexpr float BASIN_FREQ_MAJ  = 12.0f;
-static constexpr float BASIN_FREQ_MIN  = 40.0f;
-static constexpr float RIDGE_SHARP_MAJ = 0.08f;
-static constexpr float RIDGE_SHARP_MIN = 0.06f;
-static constexpr float RIDGE_H_MAJ     = 1500.0f;
-static constexpr float RIDGE_H_MIN     = 600.0f;
-static constexpr float BASIN_DEPTH_MAJ = 800.0f;
-static constexpr float BASIN_DEPTH_MIN = 300.0f;
-static constexpr float VALLEY_FLOOR_W  = 0.02f;
-static constexpr float VALLEY_FLOOR_H  = 200.0f;
+// NOTE: must stay in lockstep with shaders/planet_gen.cs.hlsl `terrain_height`.
+// The CPU mirror is what the camera, ray-pick, brush and (future) flow
+// accumulation run against; if it drifts from the GPU noise, physics happens
+// on an invisible planet. Constants and math below are copied verbatim.
+static constexpr float CONT_FREQ   = 1.25f;   // continental scale (lower => bigger landmasses)
+static constexpr float CONT_WARP   = 0.45f;   // coastline meander strength
+static constexpr float CONT_SPAN   = 4000.0f; // abyssal-plain..plateau span (m)
+static constexpr float CONT_BIAS   = 0.55f;   // fBm cut for shoreline (higher => less land)
+static constexpr float PLATE_FREQ  = 2.6f;    // tectonic plate count
+static constexpr float BELT_WIDTH  = 0.32f;   // soft width of a mountain belt
+static constexpr float RANGE_H     = 3200.0f; // peak height added along belts (m)
+static constexpr float RANGE_WARP  = 0.55f;   // how much ranges wander off the plate edge
+static constexpr float HILL_H      = 280.0f;  // rolling-hill amplitude on land
+
+// 3D domain-warp offset, recentered to roughly [-0.5, 0.5]. Mirrors warp3().
+static glm::vec3 cpu_warp3(glm::vec3 p, float seed_ofs) {
+    return glm::vec3(
+        cpu_fbm3d(p + glm::vec3(seed_ofs + 11.5f, 0, 0), 4, 2.0f, 0.5f),
+        cpu_fbm3d(p + glm::vec3(seed_ofs + 31.9f, 0, 0), 4, 2.0f, 0.5f),
+        cpu_fbm3d(p + glm::vec3(seed_ofs + 57.3f, 0, 0), 4, 2.0f, 0.5f)) - 0.5f;
+}
 
 float cpu_terrain_height(glm::vec3 sphere_dir) {
-    glm::vec3 sp = sphere_dir * 1000.0f;
+    glm::vec3 n  = sphere_dir;
+    glm::vec3 sp = n * 1000.0f;
     constexpr uint32_t seed = 42;
 
-    // ===== LAYER 1: TECTONIC PLATES =====
-    CpuWorleyResult plate = cpu_worley3d(sphere_dir * PLATE_FREQ, seed * 0.07f);
+    // ===== CONTINENTS (smooth, domain-warped) =====
+    glm::vec3 wn = n + CONT_WARP * cpu_warp3(n * 1.6f, seed * 0.07f);
+    float cont = cpu_fbm3d(wn * CONT_FREQ, 6, 2.0f, 0.5f);
+    float land_signal = cont - CONT_BIAS;
+    float base = 800.0f + land_signal * CONT_SPAN;
+    float land = glm::smoothstep(800.0f, 1400.0f, base);
 
-    float continental_A = (cpu_hash31(plate.cell_A + 77.7f) >= 0.45f) ? 1.0f : 0.0f;
-    float plate_base = glm::mix(-200.0f, 1000.0f, continental_A);
+    // ===== TECTONIC MOUNTAIN BELTS (warped, land only) =====
+    glm::vec3 pw = n + 0.15f * cpu_warp3(n * PLATE_FREQ, seed * 0.21f);
+    CpuWorleyResult plate = cpu_worley3d(pw * PLATE_FREQ, seed * 0.13f);
+    float belt = 1.0f - glm::smoothstep(0.0f, BELT_WIDTH, plate.F2 - plate.F1);
+    belt *= land;
+    glm::vec3 rw = sp * 0.02f + RANGE_WARP * cpu_warp3(sp * 0.01f, seed * 0.4f);
+    float ranges = cpu_ridged3d(rw, 5) * RANGE_H * belt;
 
-    float boundary = 1.0f - glm::smoothstep(0.0f, BOUNDARY_WIDTH, plate.F2 - plate.F1);
+    // ===== ROLLING HILLS + MULTI-OCTAVE DETAIL =====
+    float hills = (cpu_fbm3d(sp * 0.05f, 5, 2.0f, 0.5f) - 0.5f) * HILL_H * land;
 
-    glm::vec3 vel_A = cpu_hash33(plate.cell_A + seed * 0.31f) * 2.0f - 1.0f;
-    glm::vec3 vel_B = cpu_hash33(plate.cell_B + seed * 0.31f) * 2.0f - 1.0f;
-    glm::vec3 bn = glm::normalize(plate.cell_B - plate.cell_A + 1e-6f);
-    float approach = glm::dot(vel_A - vel_B, bn);
-    float convergent = glm::smoothstep(-0.2f, 0.2f, approach);
-
-    float mountain_h = boundary * convergent * 3500.0f;
-    float rift_h = boundary * (1.0f - convergent) * -600.0f;
-
-    float cont_swell = (cpu_fbm3d(sp * 0.0003f, 4, 2.0f, 0.5f) - 0.5f) * 800.0f;
-
-    float tectonic_h = plate_base + mountain_h + rift_h + cont_swell;
-
-    // ===== LAYER 2: DRAINAGE BASINS =====
-    CpuWorleyResult basin_maj = cpu_worley3d(sphere_dir * BASIN_FREQ_MAJ, seed * 0.13f + 1000.0f);
-    CpuWorleyResult basin_min = cpu_worley3d(sphere_dir * BASIN_FREQ_MIN, seed * 0.19f + 2000.0f);
-
-    float ridge_maj = glm::smoothstep(RIDGE_SHARP_MAJ, 0.0f, basin_maj.F2 - basin_maj.F1) * RIDGE_H_MAJ;
-
-    float in_basin = glm::smoothstep(0.0f, 0.15f, basin_maj.F2 - basin_maj.F1);
-    float ridge_min = glm::smoothstep(RIDGE_SHARP_MIN, 0.0f, basin_min.F2 - basin_min.F1)
-                    * RIDGE_H_MIN * in_basin;
-
-    float slope_maj = std::pow(std::clamp(basin_maj.F1 * 3.0f, 0.0f, 1.0f), 0.6f) * BASIN_DEPTH_MAJ;
-    float slope_min = std::pow(std::clamp(basin_min.F1 * 5.0f, 0.0f, 1.0f), 0.6f) * BASIN_DEPTH_MIN * in_basin;
-
-    // ===== LAYER 3: VALLEY PROFILE =====
-    float valley_flat = glm::smoothstep(VALLEY_FLOOR_W, 0.0f, basin_maj.F1) * VALLEY_FLOOR_H;
-    float valley_flat_min = glm::smoothstep(VALLEY_FLOOR_W, 0.0f, basin_min.F1)
-                          * (VALLEY_FLOOR_H * 0.4f) * in_basin;
-
-    float drainage_h = ridge_maj + ridge_min + slope_maj + slope_min - valley_flat - valley_flat_min;
-
-    float mtn_detail = cpu_ridged3d(sp * 0.006f, 5) * 1500.0f * boundary * convergent;
-
-    // ===== LAYER 4: SURFACE DETAIL =====
     float detail = 0.0f;
-    detail += cpu_ridged3d(sp * 0.4f, 5) * 200.0f;
-    detail += (cpu_fbm3d(sp * 0.08f, 6, 2.0f, 0.5f) - 0.5f) * 300.0f;
+    detail += cpu_ridged3d(sp * 0.4f, 4) * 120.0f * land;
+    detail += (cpu_fbm3d(sp * 0.08f, 6, 2.0f, 0.5f) - 0.5f) * 120.0f;
     detail += (cpu_gradient_noise_3d(sp * 0.15f) - 0.5f) * 40.0f;
-    detail += (cpu_fbm3d(sp * 1.6f, 3, 2.0f, 0.5f) - 0.5f) * 150.0f;
-    detail += (cpu_gradient_noise_3d(sp * 13.0f) - 0.5f) * 30.0f;
+    detail += (cpu_fbm3d(sp * 1.6f, 3, 2.0f, 0.5f) - 0.5f) * 90.0f;
+    detail += (cpu_gradient_noise_3d(sp * 13.0f) - 0.5f) * 25.0f;
     detail += (cpu_gradient_noise_3d(sp * 80.0f) - 0.5f) * 8.0f;
     detail += (cpu_gradient_noise_3d(sp * 640.0f) - 0.5f) * 1.5f;
 
-    float h = tectonic_h + drainage_h + mtn_detail + detail;
-    return std::clamp(h, -2000.0f, 8000.0f);
+    float h = base + ranges + hills + detail;
+    return std::clamp(h, -3000.0f, 8000.0f);
 }
 
 float cpu_terrain_height_with_stamps(glm::vec3 sphere_dir,

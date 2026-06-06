@@ -156,85 +156,81 @@ WorleyResult worley3d(float3 p, float seed_ofs)
 }
 
 // ---------------------------------------------------------------------------
-// Tectonic + watershed terrain height
+// Planet terrain height
+//
+// Rewritten to kill the old "leaf-vein" look. The previous version painted
+// raised ridges directly along Worley cell boundaries at three scales
+// (tectonic + two drainage-basin layers), which wraps the whole sphere in a
+// polygonal vein web, and split land/sea by a per-plate binary mask, giving a
+// few lobed polygonal continents. Both reads as a leaf.
+//
+// New approach:
+//   * Continents come from smooth, DOMAIN-WARPED fBm centered on sea level,
+//     so coastlines meander organically instead of tracing noise cells.
+//   * Mountain belts are warped ridged-fBm confined to soft tectonic zones and
+//     MASKED TO LAND -> wandering ranges, never clean cell-edge lines.
+//   * No global cellular boundary ridges. Real valleys / drainage are left to
+//     the hydrology + erosion pass, not faked with noise.
+//
+// Calibrated against sea_level = 800 m (src/ui.h): ocean floor sinks well
+// below it, continental interiors rise above it, coastline crosses it.
 // ---------------------------------------------------------------------------
 
-static const float PLATE_FREQ      = 1.1;
-static const float BOUNDARY_WIDTH  = 0.12;
+static const float CONT_FREQ   = 1.25;   // continental scale (lower => bigger landmasses)
+static const float CONT_WARP   = 0.45;   // coastline meander strength
+static const float CONT_SPAN   = 4000.0; // abyssal-plain..plateau span (m)
+static const float CONT_BIAS   = 0.55;   // fBm cut for shoreline (~higher => less land)
 
-static const float BASIN_FREQ_MAJ  = 12.0;
-static const float BASIN_FREQ_MIN  = 40.0;
+static const float PLATE_FREQ  = 2.6;    // tectonic plate count (higher => more, smaller plates)
+static const float BELT_WIDTH  = 0.32;   // soft width of a mountain belt around a plate edge
+static const float RANGE_H     = 3200.0; // peak height added along belts (m)
+static const float RANGE_WARP  = 0.55;   // how much ranges wander off the raw plate edge
 
-static const float RIDGE_SHARP_MAJ = 0.08;
-static const float RIDGE_SHARP_MIN = 0.06;
-static const float RIDGE_H_MAJ     = 1500.0;
-static const float RIDGE_H_MIN     = 600.0;
+static const float HILL_H      = 280.0;  // rolling-hill amplitude on land
 
-static const float BASIN_DEPTH_MAJ = 800.0;
-static const float BASIN_DEPTH_MIN = 300.0;
-
-static const float VALLEY_FLOOR_W  = 0.02;
-static const float VALLEY_FLOOR_H  = 200.0;
+// 3D domain-warp offset built from fBm, recentered to roughly [-0.5, 0.5].
+float3 warp3(float3 p, float seed_ofs)
+{
+    return float3(
+        fbm3d(p + float3(seed_ofs + 11.5, 0, 0), 4, 2.0, 0.5),
+        fbm3d(p + float3(seed_ofs + 31.9, 0, 0), 4, 2.0, 0.5),
+        fbm3d(p + float3(seed_ofs + 57.3, 0, 0), 4, 2.0, 0.5)) - 0.5;
+}
 
 float terrain_height(float3 sphere_dir)
 {
-    float3 sp = sphere_dir * 1000.0;
+    float3 n  = sphere_dir;          // unit direction
+    float3 sp = n * 1000.0;          // detail-noise sample space
 
-    // ===== LAYER 1: TECTONIC PLATES =====
-    WorleyResult plate = worley3d(sphere_dir * PLATE_FREQ, seed * 0.07);
+    // ===== CONTINENTS (smooth, domain-warped) =====
+    float3 wn   = n + CONT_WARP * warp3(n * 1.6, seed * 0.07);
+    float  cont = fbm3d(wn * CONT_FREQ, 6, 2.0, 0.5);     // ~0..1
+    float  land_signal = cont - CONT_BIAS;                // >0 inland, <0 ocean
+    float  base = 800.0 + land_signal * CONT_SPAN;        // centered on sea level
+    float  land = smoothstep(800.0, 1400.0, base);        // 0 shore/ocean .. 1 inland
 
-    float continental_A = step(0.45, hash31(plate.cell_A + 77.7));
-    float plate_base = lerp(-200.0, 1000.0, continental_A);
+    // ===== TECTONIC MOUNTAIN BELTS (warped, land only) =====
+    float3 pw    = n + 0.15 * warp3(n * PLATE_FREQ, seed * 0.21);
+    WorleyResult plate = worley3d(pw * PLATE_FREQ, seed * 0.13);
+    float belt   = 1.0 - smoothstep(0.0, BELT_WIDTH, plate.F2 - plate.F1);
+    belt        *= land;                                  // ranges ride on continents
+    float3 rw    = sp * 0.02 + RANGE_WARP * warp3(sp * 0.01, seed * 0.4);
+    float  ranges = ridged3d(rw, 5) * RANGE_H * belt;
 
-    float boundary = 1.0 - smoothstep(0.0, BOUNDARY_WIDTH, plate.F2 - plate.F1);
+    // ===== ROLLING HILLS + MULTI-OCTAVE DETAIL =====
+    float hills = (fbm3d(sp * 0.05, 5, 2.0, 0.5) - 0.5) * HILL_H * land;
 
-    float3 vel_A = hash33(plate.cell_A + seed * 0.31) * 2.0 - 1.0;
-    float3 vel_B = hash33(plate.cell_B + seed * 0.31) * 2.0 - 1.0;
-    float3 bn = normalize(plate.cell_B - plate.cell_A + 1e-6);
-    float approach = dot(vel_A - vel_B, bn);
-    float convergent = smoothstep(-0.2, 0.2, approach);
-
-    float mountain_h = boundary * convergent * 3500.0;
-    float rift_h = boundary * (1.0 - convergent) * -600.0;
-
-    float cont_swell = (fbm3d(sp * 0.0003, 4, 2.0, 0.5) - 0.5) * 800.0;
-
-    float tectonic_h = plate_base + mountain_h + rift_h + cont_swell;
-
-    // ===== LAYER 2: DRAINAGE BASINS =====
-    WorleyResult basin_maj = worley3d(sphere_dir * BASIN_FREQ_MAJ, seed * 0.13 + 1000.0);
-    WorleyResult basin_min = worley3d(sphere_dir * BASIN_FREQ_MIN, seed * 0.19 + 2000.0);
-
-    float ridge_maj = smoothstep(RIDGE_SHARP_MAJ, 0.0, basin_maj.F2 - basin_maj.F1) * RIDGE_H_MAJ;
-
-    float in_basin = smoothstep(0.0, 0.15, basin_maj.F2 - basin_maj.F1);
-    float ridge_min = smoothstep(RIDGE_SHARP_MIN, 0.0, basin_min.F2 - basin_min.F1)
-                    * RIDGE_H_MIN * in_basin;
-
-    float slope_maj = pow(saturate(basin_maj.F1 * 3.0), 0.6) * BASIN_DEPTH_MAJ;
-    float slope_min = pow(saturate(basin_min.F1 * 5.0), 0.6) * BASIN_DEPTH_MIN * in_basin;
-
-    // ===== LAYER 3: VALLEY PROFILE =====
-    float valley_flat = smoothstep(VALLEY_FLOOR_W, 0.0, basin_maj.F1) * VALLEY_FLOOR_H;
-    float valley_flat_min = smoothstep(VALLEY_FLOOR_W, 0.0, basin_min.F1) * (VALLEY_FLOOR_H * 0.4) * in_basin;
-
-    float drainage_h = ridge_maj + ridge_min + slope_maj + slope_min - valley_flat - valley_flat_min;
-
-    // Mountain detail on convergent boundaries
-    float mtn_detail = ridged3d(sp * 0.006, 5) * 1500.0 * boundary * convergent;
-
-    // ===== LAYER 4: SURFACE DETAIL =====
     float detail = 0.0;
-    detail += ridged3d(sp * 0.4, 5) * 200.0;
-    detail += (fbm3d(sp * 0.08, 6, 2.0, 0.5) - 0.5) * 300.0;
+    detail += ridged3d(sp * 0.4, 4) * 120.0 * land;       // ridged texture on land
+    detail += (fbm3d(sp * 0.08, 6, 2.0, 0.5) - 0.5) * 120.0;
     detail += (gradient_noise_3d(sp * 0.15) - 0.5) * 40.0;
-    detail += (fbm3d(sp * 1.6, 3, 2.0, 0.5) - 0.5) * 150.0;
-    detail += (gradient_noise_3d(sp * 13.0) - 0.5) * 30.0;
+    detail += (fbm3d(sp * 1.6, 3, 2.0, 0.5) - 0.5) * 90.0;
+    detail += (gradient_noise_3d(sp * 13.0) - 0.5) * 25.0;
     detail += (gradient_noise_3d(sp * 80.0) - 0.5) * 8.0;
     detail += (gradient_noise_3d(sp * 640.0) - 0.5) * 1.5;
 
-    float h = tectonic_h + drainage_h + mtn_detail + detail;
-    return clamp(h, -2000.0, 8000.0);
+    float h = base + ranges + hills + detail;
+    return clamp(h, -3000.0, 8000.0);
 }
 
 [numthreads(8, 8, 1)]

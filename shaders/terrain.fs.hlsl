@@ -2,7 +2,7 @@
     float4x4 view;
     float4x4 proj;
     float3 sun_dir;   float _pad0;
-    float3 sun_color; float _pad1;
+    float3 sun_color; float time;
     float3 cam_pos;   float _pad2;
     float4 brush_world;
     float4 brush_color;
@@ -45,7 +45,27 @@ float3 elevation_ramp(float h)
 
 float3 compute_water_color(float depth, float3 sphere_dir, float3 world_pos)
 {
-    float3 N = normalize(sphere_dir);
+    float3 baseN = normalize(sphere_dir);
+
+    // --- Planetary water motion ----------------------------------------------
+    // Large-scale travelling swells across the whole sphere: an analytic stand-in
+    // for global ocean currents / convection (NOT a sim). Two slow wave trains in
+    // different directions, banded by latitude into gyre-scale swirls, perturb the
+    // surface normal so sun highlights drift across the ocean, plus a low-freq
+    // brightness "meta-wave". Tuning knobs: amplitudes, the *FREQ/*SPEED below.
+    float3 up = (abs(baseN.y) < 0.99) ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 T  = normalize(cross(up, baseN));
+    float3 Bt = cross(baseN, T);
+    float3 A  = normalize(float3(0.80, 0.25, 0.55));
+    float3 B  = normalize(float3(-0.35, 0.15, 0.92));
+    float swirl = sin(baseN.y * 9.4 + time * 0.07);              // latitude-banded gyres
+    float w1 = sin(dot(baseN, A)     * 16.0 - time * 0.35 + swirl);
+    float w2 = sin(dot(baseN, B)     * 24.0 - time * 0.28);
+    float w3 = sin(dot(baseN, A + B) * 40.0 - time * 0.55);      // finer chop
+    float2 grad = float2(0.6 * w1 + 0.4 * w3, 0.6 * w2 + 0.4 * w3);
+    float3 N = normalize(baseN + 0.09 * (grad.x * T + grad.y * Bt));
+    float meta = 0.5 + 0.5 * (0.5 * w1 + 0.5 * w2);             // global brightness undulation
+
     float3 V = normalize(-world_pos);
     float3 L = normalize(sun_dir);
 
@@ -69,7 +89,7 @@ float3 compute_water_color(float depth, float3 sphere_dir, float3 world_pos)
     float3 specular = sun_color * spec * 0.8;
 
     float NdotL = saturate(dot(N, L));
-    float3 diffuse = base * (0.4 + 0.6 * NdotL);
+    float3 diffuse = base * (0.4 + 0.6 * NdotL) * (0.90 + 0.20 * meta);
 
     return lerp(diffuse, sky, fresnel) + specular;
 }

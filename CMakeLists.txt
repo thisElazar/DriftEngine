@@ -105,6 +105,7 @@ add_library(drift_engine_core STATIC
     src/pipeline.cpp
     src/planet.cpp
     src/terrain.cpp
+    src/hydrology.cpp
     src/ui.cpp
 )
 

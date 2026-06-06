@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <chrono>
 
 // Alias constants from globe.h for code compatibility.
 static constexpr uint32_t SWE_GRID_W = GLOBE_SWE_GRID_W;
@@ -39,6 +40,51 @@ static constexpr uint32_t PLANET_MAX_LEVEL = GLOBE_MAX_LEVEL;
 static constexpr float    PLANET_RADIUS = GLOBE_PLANET_RADIUS;
 static constexpr float    PLANET_MAX_ELEVATION = GLOBE_MAX_ELEVATION;
 static constexpr float    TILE_SUBDIVIDE_PX = GLOBE_TILE_SUBDIVIDE_PX;
+
+static constexpr double HYDRO_UPLOAD_INTERVAL = 0.08;  // min seconds between texture uploads
+
+// Persistent hydrology worker loop: rebuilds the drainage structure when the
+// terrain changes, otherwise steps the live water and publishes a baked field.
+// Owns its LiveHydrology so nothing but the published snapshot crosses threads.
+static void hydrology_worker_main(HydroAsync* ha)
+{
+    LiveHydrology live;
+    live.res = ha->res;
+    live.sea_level = ha->sea_level;
+    bool have_structure = false;
+
+    while (!ha->stop.load(std::memory_order_acquire)) {
+        if (ha->structure_dirty.exchange(false, std::memory_order_acq_rel)) {
+            std::vector<TerrainStamp> snap;
+            { std::lock_guard<std::mutex> lk(ha->stamps_mtx); snap = ha->pending_stamps; }
+            live.rebuild_structure(snap.data(), static_cast<uint32_t>(snap.size()), &ha->stop);
+            if (ha->stop.load(std::memory_order_acquire)) break;  // shutdown mid-rebuild
+            have_structure = true;
+        }
+        if (have_structure) {
+            // Drain brush deposits into the live field, then route them this step.
+            std::vector<WaterDeposit> drained;
+            { std::lock_guard<std::mutex> lk(ha->deposits_mtx); drained.swap(ha->pending_deposits); }
+            for (const auto& d : drained) live.add_water_deposit(d.dir, d.cos_radius, d.amount);
+            live.step();
+            { std::lock_guard<std::mutex> lk(ha->pub_mtx); live.bake(ha->published); }
+            ha->publish_ready.store(true, std::memory_order_release);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));  // ~25 steps/sec
+    }
+}
+
+// Start the persistent worker (once, in globe_init) seeded from the current stamps.
+static void start_hydrology_worker(GlobeState& s)
+{
+    s.hydro = std::make_unique<HydroAsync>();
+    s.hydro->res = GLOBE_HYDRO_RES;
+    s.hydro->sea_level = s.ui.sea_level;
+    { std::lock_guard<std::mutex> lk(s.hydro->stamps_mtx); s.hydro->pending_stamps = s.stamps; }
+    s.hydro->structure_dirty.store(true, std::memory_order_release);
+    s.hydro_solved_stamp_count = static_cast<uint32_t>(s.stamps.size());
+    s.hydro->worker = std::thread(hydrology_worker_main, s.hydro.get());
+}
 
 void globe_init(GlobeState& s, Renderer& r)
 {
@@ -380,6 +426,45 @@ void globe_init(GlobeState& s, Renderer& r)
     create_water_array(s.water_state_b_img, s.water_state_b_alloc, s.water_state_b_view);
     create_water_array(s.water_output_img, s.water_output_alloc, s.water_output_view);
 
+    // ---- Hydrology field (coarse global drainage, 6-layer RGBA32F) -------------
+    {
+        VkImageCreateInfo hci{};
+        hci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        hci.imageType = VK_IMAGE_TYPE_2D;
+        hci.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        hci.extent = {GLOBE_HYDRO_RES, GLOBE_HYDRO_RES, 1};
+        hci.mipLevels = 1;
+        hci.arrayLayers = 6;
+        hci.samples = VK_SAMPLE_COUNT_1_BIT;
+        hci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        hci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        hci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        VmaAllocationCreateInfo hai{};
+        hai.usage = VMA_MEMORY_USAGE_AUTO;
+        hai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        VK_CHECK(vmaCreateImage(allocator, &hci, &hai, &s.hydrology_img, &s.hydrology_alloc, nullptr));
+
+        VkImageViewCreateInfo hvi{};
+        hvi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        hvi.image = s.hydrology_img;
+        hvi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        hvi.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        hvi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
+        VK_CHECK(vkCreateImageView(device, &hvi, nullptr, &s.hydrology_view));
+
+        // Upload a zeroed field so the image is immediately valid to sample
+        // (river overlay just discards everywhere until the real field arrives).
+        std::vector<float> zeros(static_cast<size_t>(GLOBE_HYDRO_RES) * GLOBE_HYDRO_RES * 6 * 4, 0.0f);
+        update_rgba32f_array(device, allocator, graphics_queue, gfx_family,
+                             s.hydrology_img, zeros, GLOBE_HYDRO_RES, GLOBE_HYDRO_RES, 6,
+                             VK_IMAGE_LAYOUT_UNDEFINED);
+
+        // Start the persistent live-water worker (the field solves + steps off
+        // the main thread; structure rebuilds are signaled on terrain edits).
+        start_hydrology_worker(s);
+    }
+
     // ---- Sand particle buffer --------------------------------------------------
     VkBufferCreateInfo sand_buf_ci{};
     sand_buf_ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -424,7 +509,7 @@ void globe_init(GlobeState& s, Renderer& r)
     pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     pool_sizes[1].descriptorCount = 48;
     pool_sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    pool_sizes[2].descriptorCount = 4;
+    pool_sizes[2].descriptorCount = 6;
     pool_sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     pool_sizes[3].descriptorCount = 12;
     pool_sizes[4].type = VK_DESCRIPTOR_TYPE_SAMPLER;
@@ -432,7 +517,7 @@ void globe_init(GlobeState& s, Renderer& r)
 
     VkDescriptorPoolCreateInfo dp_ci{};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dp_ci.maxSets = 25;
+    dp_ci.maxSets = 26;
     dp_ci.poolSizeCount = 5;
     dp_ci.pPoolSizes = pool_sizes;
 
@@ -1643,6 +1728,63 @@ void globe_init(GlobeState& s, Renderer& r)
         vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
     }
 
+    // ---- River overlay descriptor set: camera UBO + heightmap + hydrology + sampler
+    {
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = s.desc_pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &s.pipelines.river_desc_layout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &ai, &s.river_desc_set));
+
+        VkDescriptorBufferInfo cam_bi{};
+        cam_bi.buffer = s.camera_ubo;
+        cam_bi.offset = 0;
+        cam_bi.range  = VK_WHOLE_SIZE;
+
+        VkDescriptorImageInfo hm_info{};
+        hm_info.imageView   = s.clipmap_hm_view;
+        hm_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo hyd_info{};
+        hyd_info.imageView   = s.hydrology_view;
+        hyd_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo samp_info{};
+        samp_info.sampler = s.sampler;
+
+        VkWriteDescriptorSet writes[4]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = s.river_desc_set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].pBufferInfo = &cam_bi;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = s.river_desc_set;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[1].pImageInfo = &hm_info;
+
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = s.river_desc_set;
+        writes[2].dstBinding = 2;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[2].pImageInfo = &hyd_info;
+
+        writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[3].dstSet = s.river_desc_set;
+        writes[3].dstBinding = 3;
+        writes[3].descriptorCount = 1;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes[3].pImageInfo = &samp_info;
+
+        vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
+    }
+
     {
         VkDescriptorSetLayout layouts[2] = {s.pipelines.planet_swe_step_desc_layout, s.pipelines.planet_swe_step_desc_layout};
         VkDescriptorSetAllocateInfo ai{};
@@ -1944,6 +2086,36 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
     s.last_dt = dt;
     s.ui.embedded = s.embedded;
     s.ui.first_person_mode = (s.camera.mode == CameraMode::FirstPerson);
+
+    // Upload the latest published live-water field (throttled). The image holds a
+    // zeroed field until the worker's first bake, so the globe renders normally
+    // meanwhile; thereafter rivers update live as the water flows / re-routes.
+    if (s.hydro && s.hydro->publish_ready.load(std::memory_order_acquire) &&
+        (glfwGetTime() - s.hydro_last_upload) > HYDRO_UPLOAD_INTERVAL) {
+        // Retain the snapshot on the CPU (for ecosystem sampling) and upload it.
+        { std::lock_guard<std::mutex> lk(s.hydro->pub_mtx); s.hydro_field_cpu = s.hydro->published; }
+        s.hydro_field_res = GLOBE_HYDRO_RES;
+        s.hydro->publish_ready.store(false, std::memory_order_release);
+        if (!s.hydro_field_cpu.empty()) {
+            std::vector<float> flat(s.hydro_field_cpu.size() * 4);
+            std::memcpy(flat.data(), s.hydro_field_cpu.data(), flat.size() * sizeof(float));
+            update_rgba32f_array(device, allocator, graphics_queue, gfx_family,
+                                 s.hydrology_img, flat, GLOBE_HYDRO_RES, GLOBE_HYDRO_RES, 6,
+                                 VK_IMAGE_LAYOUT_GENERAL);
+        }
+        s.hydro_last_upload = glfwGetTime();
+    }
+
+    // Signal a drainage-structure rebuild whenever the terrain changes — every
+    // new stamp, in real time. The rebuild is cheap (cached noise + incremental
+    // stamps + routing), so the worker re-routes the live water continuously as
+    // you brush, rather than snapping after release.
+    if (s.hydro &&
+        static_cast<uint32_t>(s.stamps.size()) != s.hydro_solved_stamp_count) {
+        { std::lock_guard<std::mutex> lk(s.hydro->stamps_mtx); s.hydro->pending_stamps = s.stamps; }
+        s.hydro->structure_dirty.store(true, std::memory_order_release);
+        s.hydro_solved_stamp_count = static_cast<uint32_t>(s.stamps.size());
+    }
 
         if (in.key_f5_pressed) {
             pipelines_reload(s.pipelines, device);
@@ -2494,29 +2666,24 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
             }
         }
 
-        // ---- Place water stamp on LMB (parallel to terrain stamps) ----
-        // Persistent record of brushed water; applied to every LOD's SWE init so
-        // a brushed lake stays visible from any zoom. The dynamic SWE step still
-        // adds waves on top at the brushed level — this is the static skeleton.
-        if (s.brush_hit && s.brush_mode == BrushMode::Water &&
-            s.water_stamps.size() < MAX_WATER_STAMPS)
+        // ---- Water brush → coarse field deposit (field-only water) ----
+        // The brush no longer seeds the SWE directly; it hands a one-shot slug of
+        // water mass to the hydrology worker, which adds it to the live field and
+        // routes it downstream every step. Result: a flood pulse that flows downhill
+        // and drains to the sea, continuing coarsely even while the camera flies away.
+        if (s.brush_hit && s.brush_mode == BrushMode::Water && s.hydro)
         {
             double now_s = glfwGetTime();
             if (now_s - s.last_water_stamp_time > 0.1) {
-                float angular_radius = s.effective_angular;
-
-                WaterStamp ws{};
-                ws.pos_x = s.stamp_sphere_dir.x;
-                ws.pos_y = s.stamp_sphere_dir.y;
-                ws.pos_z = s.stamp_sphere_dir.z;
-                ws.radius = angular_radius;
-                // The brush deposits a *column*: per stamp adds brush_strength
-                // metres at the center, falling off via the gaussian. This makes
-                // brushing build up a lake over a couple of seconds.
-                ws.water_amount = s.ui.brush_strength;
-                ws.cos_radius = std::cos(angular_radius);
-                s.water_stamps.push_back(ws);
-                s.water_stamps_dirty = true;
+                WaterDeposit d{};
+                d.dir        = s.stamp_sphere_dir;
+                d.cos_radius = std::cos(s.effective_angular);
+                // brush_strength was "metres of column" for the SWE; scale it into
+                // the field's accumulation-based water units (steady river ≈ 2*accum,
+                // river threshold accum≈4). WATER_BRUSH_DEPOSIT is the feel knob.
+                d.amount     = s.ui.brush_strength * WATER_BRUSH_DEPOSIT;
+                { std::lock_guard<std::mutex> lk(s.hydro->deposits_mtx);
+                  s.hydro->pending_deposits.push_back(d); }
                 s.last_water_stamp_time = now_s;
             }
         }
@@ -2541,7 +2708,7 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
             cam.sun_dir = glm::normalize(glm::vec3(0.4f, 0.7f, -0.3f));
             cam._pad0 = 0.0f;
             cam.sun_color = glm::vec3(1.0f, 0.95f, 0.85f);
-            cam._pad1 = 0.0f;
+            cam.time = static_cast<float>(glfwGetTime());  // drives water-surface animation
             cam.cam_pos = glm::vec3(0.0f);  // camera-relative rendering
             cam._pad2 = s.ui.mud_visibility;
             // Two protocols, picked by brush_color.a:
@@ -3484,6 +3651,42 @@ void globe_render(GlobeState& s, Renderer& r,
                 vkCmdDrawIndexed(frame.cmd, s.clipmap_index_count, 1, 0, 0, 0);
             }
 
+            // River overlay pass — animated global drainage, drawn on the surface.
+            {
+                vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipelines.river_pipeline);
+                vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    s.pipelines.river_pipeline_layout, 0, 1, &s.river_desc_set, 0, nullptr);
+                vkCmdBindVertexBuffers(frame.cmd, 0, 1, &s.clipmap_vbo, &clip_offset);
+                vkCmdBindIndexBuffer(frame.cmd, s.clipmap_ibo, 0, VK_INDEX_TYPE_UINT32);
+
+                float river_time = static_cast<float>(glfwGetTime());
+                for (uint32_t i = 0; i < visible_tiles.size(); i++) {
+                    const auto& tile = visible_tiles[i];
+                    float ts = 2.0f / static_cast<float>(1u << tile.level);
+                    glm::dvec3 dir = planet_tile_center_dir(tile);
+                    glm::dvec3 rel_d = dir * static_cast<double>(PLANET_RADIUS) - cam_pos_d;
+
+                    RiverOverlayPC rpc{};
+                    rpc.rel_x = static_cast<float>(rel_d.x);
+                    rpc.rel_y = static_cast<float>(rel_d.y);
+                    rpc.rel_z = static_cast<float>(rel_d.z);
+                    rpc.u_min = -1.0f + tile.x * ts;
+                    rpc.v_min = -1.0f + tile.y * ts;
+                    rpc.tile_size = ts;
+                    rpc.face = tile.face;
+                    rpc.pool_index = tile_slots[i];
+                    rpc.planet_radius = PLANET_RADIUS;
+                    rpc.heightmap_texel = 1.0f / static_cast<float>(PLANET_TILE_RES);
+                    rpc.time = river_time;
+                    rpc.river_threshold = 0.25f;
+
+                    vkCmdPushConstants(frame.cmd, s.pipelines.river_pipeline_layout,
+                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                        0, sizeof(rpc), &rpc);
+                    vkCmdDrawIndexed(frame.cmd, s.clipmap_index_count, 1, 0, 0, 0);
+                }
+            }
+
             // Water pass (disabled for planet mode — Phase 2)
             if (false) {
                 vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipelines.water_pipeline);
@@ -3605,6 +3808,11 @@ void globe_shutdown(GlobeState& s, Renderer& r)
 
     vkDestroyImageView(device, s.clipmap_hm_view, nullptr);
     vmaDestroyImage(allocator, s.clipmap_hm_image, s.clipmap_hm_alloc);
+
+    s.hydro.reset();  // join the background solve before tearing down
+
+    vkDestroyImageView(device, s.hydrology_view, nullptr);
+    vmaDestroyImage(allocator, s.hydrology_img, s.hydrology_alloc);
 
     vmaDestroyBuffer(allocator, s.clipmap_ibo, s.clipmap_ibo_alloc);
     vmaDestroyBuffer(allocator, s.clipmap_vbo, s.clipmap_vbo_alloc);

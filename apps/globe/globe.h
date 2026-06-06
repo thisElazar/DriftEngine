@@ -11,6 +11,7 @@
 #include "pipeline.h"
 #include "planet.h"
 #include "terrain.h"
+#include "hydrology.h"
 #include "ui.h"
 #include "vk_util.h"
 #include "input_frame.h"
@@ -18,6 +19,10 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <memory>
+#include <thread>
+#include <atomic>
+#include <mutex>
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -37,6 +42,46 @@ constexpr uint32_t GLOBE_MAX_LEVEL         = 14;
 constexpr float    GLOBE_PLANET_RADIUS     = 6371000.0f;
 constexpr float    GLOBE_MAX_ELEVATION     = 8000.0f;
 constexpr float    GLOBE_TILE_SUBDIVIDE_PX = 512.0f;
+constexpr uint32_t GLOBE_HYDRO_RES         = 128;  // coarse global drainage grid, per cube face
+                                                   // (128 keeps the synchronous build fast; raised
+                                                   //  once the solve moves to a worker thread)
+constexpr float    WATER_BRUSH_DEPOSIT     = 75.0f; // brush_strength → field water units per deposit
+                                                    // (feel knob for the field-only flood pulse)
+
+// Persistent background hydrology worker. Owns a live water sim (LiveHydrology)
+// that it steps continuously and publishes; the main thread uploads published
+// snapshots and signals structure rebuilds on terrain edits. The field is the
+// live ground truth, so edits make the water re-route organically (not snap).
+// Held behind a unique_ptr so GlobeState stays move-assignable (the launcher
+// does `globe_state = {}` on re-entry); the destructor stops + joins the worker.
+// A one-shot water-brush deposit, handed main-thread → hydrology worker. The
+// worker drains these into LiveHydrology::water before each step (field-only
+// water: the brush feeds the field, the field drives everything downstream).
+struct WaterDeposit { glm::vec3 dir; float cos_radius; float amount; };
+
+struct HydroAsync {
+    std::thread       worker;
+    std::atomic<bool> stop{false};
+    std::atomic<bool> structure_dirty{true};   // recompute drainage from pending_stamps
+    std::atomic<bool> publish_ready{false};     // a fresh baked field is available
+
+    std::mutex                stamps_mtx;
+    std::vector<TerrainStamp> pending_stamps;   // guarded by stamps_mtx
+
+    std::mutex                deposits_mtx;
+    std::vector<WaterDeposit> pending_deposits; // brush deposits, guarded by deposits_mtx
+
+    std::mutex             pub_mtx;
+    std::vector<glm::vec4> published;           // latest baked field, guarded by pub_mtx
+
+    uint32_t res = 0;
+    float    sea_level = 800.0f;
+
+    ~HydroAsync() {
+        stop.store(true, std::memory_order_release);
+        if (worker.joinable()) worker.join();
+    }
+};
 
 // ---------------------------------------------------------------------------
 // All globe state, bundled into a single struct.
@@ -117,6 +162,18 @@ struct GlobeState {
     VmaAllocation water_output_alloc = VK_NULL_HANDLE;
     VkImageView   water_output_view = VK_NULL_HANDLE;
 
+    // --- Hydrology: coarse global drainage field (6-layer RGBA32F, GLOBE_HYDRO_RES²) ---
+    VkImage       hydrology_img   = VK_NULL_HANDLE;
+    VmaAllocation hydrology_alloc = VK_NULL_HANDLE;
+    VkImageView   hydrology_view  = VK_NULL_HANDLE;
+    std::unique_ptr<HydroAsync> hydro;          // persistent live-water worker (see HydroAsync)
+    uint32_t      hydro_solved_stamp_count = 0; // stamp count the structure is based on
+    double        hydro_last_upload = 0.0;      // throttle for uploading published fields
+    // Latest published hydrology field retained on the CPU so the ecosystem can
+    // sample it (moisture/river/lake) by sphere direction — see sample_planet_field.
+    std::vector<glm::vec4> hydro_field_cpu;
+    uint32_t      hydro_field_res = 0;
+
     // --- Sand particle buffer ---
     VkBuffer      sand_particle_buf   = VK_NULL_HANDLE;
     VmaAllocation sand_particle_alloc = VK_NULL_HANDLE;
@@ -145,6 +202,7 @@ struct GlobeState {
     VkDescriptorSet planet_swe_init_desc_set = VK_NULL_HANDLE;
     VkDescriptorSet planet_swe_h_adjust_desc_set = VK_NULL_HANDLE;
     VkDescriptorSet planet_swe_step_desc_sets[2]{};
+    VkDescriptorSet river_desc_set = VK_NULL_HANDLE;
 
     // --- Frame state ---
     uint32_t swe_ping_pong      = 0;

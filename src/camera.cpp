@@ -71,12 +71,26 @@ static void orbital_mouse_look(OrbitalState& s, float dx, float dy, float sensit
     s.orientation = glm::normalize(glm::quat_cast(m));
 }
 
+// Feel-tuning constants for the orbital camera.
+static constexpr float  ORBIT_LOOK_SENS = 0.0015f; // rad/px (was 0.002 — less overshoot)
+static constexpr float  ORBIT_LOOK_TAU  = 0.05f;   // s — mouse-look ease-in/out time constant
+static constexpr double ORBIT_MOVE_TAU  = 0.14;    // s — movement ease-in/out (weighty glide)
+
 static CameraUpdateResult orbital_update(OrbitalState& s, const InputFrame& in, float dt,
                                          float planet_radius,
                                          const std::function<float(glm::vec3)>& height_fn)
 {
+    // ----- Drain accumulated mouse-look with easing (smooth & weighty) -----
+    if (glm::dot(s.look_pending, s.look_pending) > 1e-12f) {
+        float a = 1.0f - std::exp(-dt / ORBIT_LOOK_TAU);
+        glm::vec2 step = s.look_pending * a;
+        s.look_pending -= step;
+        orbital_mouse_look(s, step.x, step.y, ORBIT_LOOK_SENS);
+    }
+
     glm::dvec3 pivot = s.pivot;
-    glm::vec3 pivot_dir = glm::normalize(glm::vec3(pivot));
+    glm::dvec3 pivot_dir_d = glm::normalize(pivot);
+    glm::vec3  pivot_dir = glm::vec3(pivot_dir_d);
     double terrain_height = static_cast<double>(height_fn(pivot_dir));
     double terrain_radius = static_cast<double>(planet_radius) + terrain_height;
 
@@ -85,6 +99,7 @@ static CameraUpdateResult orbital_update(OrbitalState& s, const InputFrame& in, 
     double eye_dist = glm::length(eye);
     double altitude = eye_dist - terrain_radius;
 
+    // Speed scales with altitude so panning feels constant on screen.
     float base_speed = static_cast<float>(std::max(altitude, 10.0)) * 1.5f;
     float speed = base_speed;
     if (in.key_shift) speed *= 3.0f;
@@ -99,20 +114,64 @@ static CameraUpdateResult orbital_update(OrbitalState& s, const InputFrame& in, 
     if (glm::dot(fwd_tangent, fwd_tangent) > 1e-6f)   fwd_tangent = glm::normalize(fwd_tangent);
     if (glm::dot(right_tangent, right_tangent) > 1e-6f) right_tangent = glm::normalize(right_tangent);
 
-    glm::vec3 move(0.0f);
-    if (in.key_w) move += fwd_tangent;
-    if (in.key_s) move -= fwd_tangent;
-    if (in.key_d) move += right_tangent;
-    if (in.key_a) move -= right_tangent;
-    if (in.key_q) move += radial_up;
-    if (in.key_e) move -= radial_up;
+    // Target velocities from keys: tangential (WASD) and radial (Q/E).
+    glm::vec3 tdir(0.0f);
+    if (in.key_w) tdir += fwd_tangent;
+    if (in.key_s) tdir -= fwd_tangent;
+    if (in.key_d) tdir += right_tangent;
+    if (in.key_a) tdir -= right_tangent;
+    glm::dvec3 target_move_vel(0.0);
+    if (glm::dot(tdir, tdir) > 1e-6f)
+        target_move_vel = glm::dvec3(glm::normalize(tdir)) * static_cast<double>(speed);
 
-    if (glm::dot(move, move) > 0.0f) {
-        glm::vec3 dir = glm::normalize(move);
-        s.pivot += glm::dvec3(dir) * static_cast<double>(speed * dt);
+    double radial_sign = (in.key_q ? 1.0 : 0.0) - (in.key_e ? 1.0 : 0.0);
+    double target_radial_vel = radial_sign * static_cast<double>(speed);
+
+    // Ease velocities toward target — glides to a stop on release (weighty).
+    double am = 1.0 - std::exp(-static_cast<double>(dt) / ORBIT_MOVE_TAU);
+    s.move_vel   += (target_move_vel - s.move_vel) * am;
+    s.radial_vel += (target_radial_vel - s.radial_vel) * am;
+    // Keep smoothed velocity strictly tangential (no altitude leak).
+    s.move_vel -= glm::dot(s.move_vel, pivot_dir_d) * pivot_dir_d;
+
+    // Apply tangential motion as a ROTATION about the planet center so the
+    // pivot stays glued to the surface. (Linear translation slid off along the
+    // tangent and the horizon crept up — the bug this replaces.)
+    double v = glm::length(s.move_vel);
+    if (v > 1e-6) {
+        glm::dvec3 mdir = s.move_vel / v;
+        double dtheta = v * static_cast<double>(dt) / glm::length(pivot);
+        glm::dvec3 axis = glm::cross(pivot_dir_d, mdir);
+        double axis_len = glm::length(axis);
+        if (axis_len > 1e-9) {
+            axis /= axis_len;
+            s.pivot = glm::dquat(glm::angleAxis(dtheta, axis)) * s.pivot;
+            // Parallel-transport the view so it tilts with the surface curve.
+            s.orientation = glm::normalize(
+                glm::angleAxis(static_cast<float>(dtheta), glm::vec3(axis)) * s.orientation);
+        }
     }
 
-    eye = pivot + glm::dvec3(s.orientation * arm_offset);
+    // Radial motion (Q/E) changes altitude — straight in/out from center.
+    if (std::abs(s.radial_vel) > 1e-6)
+        s.pivot += pivot_dir_d * (s.radial_vel * static_cast<double>(dt));
+
+    // Re-anchor the basis to the (new) radial up so roll never accumulates and
+    // the horizon stays level. Guard against the fwd≈up singularity at zenith.
+    {
+        glm::vec3 up2 = glm::vec3(glm::normalize(s.pivot));
+        glm::vec3 f2  = glm::normalize(s.orientation * glm::vec3(0.0f, 0.0f, -1.0f));
+        glm::vec3 r2  = glm::cross(f2, up2);
+        if (glm::dot(r2, r2) > 1e-6f) {
+            r2 = glm::normalize(r2);
+            glm::vec3 u2 = glm::cross(r2, f2);
+            glm::mat3 m(r2, u2, -f2);
+            s.orientation = glm::normalize(glm::quat_cast(m));
+        }
+    }
+
+    // Eye-vs-terrain collision: push the pivot out if the eye dips below ground.
+    eye = s.pivot + glm::dvec3(s.orientation * arm_offset);
     eye_dist = glm::length(eye);
     glm::vec3 eye_dir = glm::normalize(glm::vec3(eye));
     double h_at_eye = static_cast<double>(height_fn(eye_dir));
@@ -308,7 +367,9 @@ static CameraUpdateResult fp_update(FirstPersonState& s, const InputFrame& in, f
 void camera_apply_mouse_look(Camera& cam, float dx, float dy, float sensitivity)
 {
     if (cam.mode == CameraMode::Orbital)
-        orbital_mouse_look(cam.orbit, dx, dy, sensitivity);
+        // Accumulate; drained with easing in orbital_update (sensitivity is
+        // applied there via ORBIT_LOOK_SENS).
+        cam.orbit.look_pending += glm::vec2(dx, dy);
     else
         fp_mouse_look(cam.fp, dx, dy, sensitivity);
 }

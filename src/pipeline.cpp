@@ -409,6 +409,80 @@ void pipelines_create(Pipelines& p, VkDevice device)
 
     VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &water_pipe_ci, nullptr, &p.water_pipeline));
 
+    // ---- River overlay pipeline (animated drainage, alpha blend, no depth write)
+    {
+        auto river_vs_spirv = load_spirv("shaders/river_overlay_vs.spv");
+        auto river_fs_spirv = load_spirv("shaders/river_overlay_fs.spv");
+
+        VkShaderModuleCreateInfo rvs_ci{};
+        rvs_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        rvs_ci.codeSize = river_vs_spirv.size() * sizeof(uint32_t);
+        rvs_ci.pCode = river_vs_spirv.data();
+        VK_CHECK(vkCreateShaderModule(device, &rvs_ci, nullptr, &p.river_vs));
+
+        VkShaderModuleCreateInfo rfs_ci{};
+        rfs_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        rfs_ci.codeSize = river_fs_spirv.size() * sizeof(uint32_t);
+        rfs_ci.pCode = river_fs_spirv.data();
+        VK_CHECK(vkCreateShaderModule(device, &rfs_ci, nullptr, &p.river_fs));
+
+        // Own minimal descriptor layout: camera UBO + heightmap pool + hydrology + sampler.
+        VkDescriptorSetLayoutBinding rb[4]{};
+        rb[0].binding = 0;
+        rb[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        rb[0].descriptorCount = 1;
+        rb[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        rb[1].binding = 1;
+        rb[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;   // terrain heightmap pool
+        rb[1].descriptorCount = 1;
+        rb[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        rb[2].binding = 2;
+        rb[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;   // hydrology field
+        rb[2].descriptorCount = 1;
+        rb[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        rb[3].binding = 3;
+        rb[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        rb[3].descriptorCount = 1;
+        rb[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo rdsl_ci{};
+        rdsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        rdsl_ci.bindingCount = 4;
+        rdsl_ci.pBindings = rb;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &rdsl_ci, nullptr, &p.river_desc_layout));
+
+        VkPushConstantRange river_push{};
+        river_push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        river_push.offset = 0;
+        river_push.size = sizeof(RiverOverlayPC);
+
+        VkPipelineLayoutCreateInfo river_pl_ci{};
+        river_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        river_pl_ci.setLayoutCount = 1;
+        river_pl_ci.pSetLayouts = &p.river_desc_layout;
+        river_pl_ci.pushConstantRangeCount = 1;
+        river_pl_ci.pPushConstantRanges = &river_push;
+        VK_CHECK(vkCreatePipelineLayout(device, &river_pl_ci, nullptr, &p.river_pipeline_layout));
+
+        VkPipelineShaderStageCreateInfo river_stages[2]{};
+        river_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        river_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        river_stages[0].module = p.river_vs;
+        river_stages[0].pName = "main";
+        river_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        river_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        river_stages[1].module = p.river_fs;
+        river_stages[1].pName = "main";
+
+        // Same tile grid mesh, alpha blend, depth test on / write off (like water).
+        VkGraphicsPipelineCreateInfo river_pipe_ci = gfx_pipe_ci;
+        river_pipe_ci.pStages = river_stages;
+        river_pipe_ci.pDepthStencilState = &water_depth_stencil;
+        river_pipe_ci.pColorBlendState = &water_color_blend;
+        river_pipe_ci.layout = p.river_pipeline_layout;
+        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &river_pipe_ci, nullptr, &p.river_pipeline));
+    }
+
     // ---- Cloud raymarch pipeline (fullscreen, alpha blend, no depth) ---------
     auto rm_vs_spirv = load_spirv("shaders/cloud_raymarch_vs.spv");
     auto rm_fs_spirv = load_spirv("shaders/cloud_raymarch_fs.spv");
@@ -1941,8 +2015,10 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
     vkDestroyPipeline(device, p.planet_swe_init_pipeline, nullptr);
     vkDestroyPipeline(device, p.planet_swe_step_pipeline, nullptr);
     vkDestroyPipeline(device, p.planet_swe_h_adjust_pipeline, nullptr);
+    vkDestroyPipeline(device, p.river_pipeline, nullptr);
 
     // Destroy pipeline layouts
+    vkDestroyPipelineLayout(device, p.river_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.clipmap_gfx_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.terrain_gen_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.sand_render_pipeline_layout, nullptr);
@@ -1959,6 +2035,7 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
     vkDestroyPipelineLayout(device, p.planet_swe_h_adjust_pipeline_layout, nullptr);
 
     // Destroy descriptor set layouts
+    vkDestroyDescriptorSetLayout(device, p.river_desc_layout, nullptr);
     vkDestroyDescriptorSetLayout(device, p.sand_render_desc_layout, nullptr);
     vkDestroyDescriptorSetLayout(device, p.sand_sim_desc_layout, nullptr);
     vkDestroyDescriptorSetLayout(device, p.terrain_gen_desc_layout, nullptr);
@@ -1973,6 +2050,8 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
     vkDestroyDescriptorSetLayout(device, p.planet_swe_h_adjust_desc_layout, nullptr);
 
     // Destroy shader modules
+    vkDestroyShaderModule(device, p.river_vs, nullptr);
+    vkDestroyShaderModule(device, p.river_fs, nullptr);
     vkDestroyShaderModule(device, p.terrain_gen_shader, nullptr);
     vkDestroyShaderModule(device, p.sand_render_fs, nullptr);
     vkDestroyShaderModule(device, p.sand_render_vs, nullptr);

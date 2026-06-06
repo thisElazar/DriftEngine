@@ -187,6 +187,20 @@ struct PlanetTilePC {
     float    sea_level;
 };
 
+// River overlay: a subset of PlanetTilePC (the fields the overlay VS needs to
+// rebuild the on-surface position) plus animation time and the river threshold.
+// Layout matches the [[vk::push_constant]] cbuffer in river_overlay.{vs,fs}.hlsl.
+struct RiverOverlayPC {
+    float    rel_x, rel_y, rel_z;
+    float    u_min, v_min, tile_size;
+    uint32_t face;
+    uint32_t pool_index;
+    float    planet_radius;
+    float    heightmap_texel;
+    float    time;
+    float    river_threshold;
+};
+
 struct PlanetGenPC {
     float    u_min;
     float    v_min;
@@ -250,6 +264,8 @@ struct Pipelines {
     VkShaderModule planet_swe_init_shader = VK_NULL_HANDLE;
     VkShaderModule planet_swe_step_shader = VK_NULL_HANDLE;
     VkShaderModule planet_swe_h_adjust_shader = VK_NULL_HANDLE;
+    VkShaderModule river_vs = VK_NULL_HANDLE;
+    VkShaderModule river_fs = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout swe_init_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout swe_step_desc_layout = VK_NULL_HANDLE;
@@ -263,6 +279,7 @@ struct Pipelines {
     VkDescriptorSetLayout planet_swe_init_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout planet_swe_step_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout planet_swe_h_adjust_desc_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout river_desc_layout = VK_NULL_HANDLE;
 
     VkPipelineLayout swe_init_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout swe_step_pipeline_layout = VK_NULL_HANDLE;
@@ -278,6 +295,7 @@ struct Pipelines {
     VkPipelineLayout planet_swe_init_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout planet_swe_step_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout planet_swe_h_adjust_pipeline_layout = VK_NULL_HANDLE;
+    VkPipelineLayout river_pipeline_layout = VK_NULL_HANDLE;
 
     VkPipeline swe_init_pipeline = VK_NULL_HANDLE;
     VkPipeline swe_step_pipeline = VK_NULL_HANDLE;
@@ -294,6 +312,7 @@ struct Pipelines {
     VkPipeline planet_swe_init_pipeline = VK_NULL_HANDLE;
     VkPipeline planet_swe_step_pipeline = VK_NULL_HANDLE;
     VkPipeline planet_swe_h_adjust_pipeline = VK_NULL_HANDLE;
+    VkPipeline river_pipeline = VK_NULL_HANDLE;
 };
 
 void pipelines_create(Pipelines& p, VkDevice device);
