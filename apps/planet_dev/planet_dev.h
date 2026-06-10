@@ -87,6 +87,20 @@ struct PlanetDevTerrainPC {
 };
 static_assert(sizeof(PlanetDevTerrainPC) == 128, "terrain PC must fit min push range");
 
+// Push constant for the array-layer terrain brush (planet_dev_brush.cs.hlsl).
+struct PD_BrushPC {
+    float    brush_x;       // tile-local grid coords (may be off-tile)
+    float    brush_y;
+    float    brush_radius;
+    float    brush_amount;
+    uint32_t grid_w;
+    uint32_t grid_h;
+    uint32_t layer;
+    uint32_t _pad0;
+};
+
+enum class PD_BrushMode { Raise, Lower, Water };
+
 // ---------------------------------------------------------------------------
 // Module-local GPU helper types
 // ---------------------------------------------------------------------------
@@ -150,12 +164,14 @@ struct PlanetDevState {
 
     // --- Pipelines ---
     ComputePipeline    pipe_swe_step{};   // shaders/planet_swe_step_cs.spv (shared with the planet)
+    ComputePipeline    pipe_brush{};      // array-layer terrain brush
     PD_TerrainPipeline pipe_terrain{};
     PD_ClumpPipeline   pipe_clump{};
 
     // --- Descriptors ---
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     VkDescriptorSet  ds_step[2]{};       // ping/pong; tile + neighbors ride push constants
+    VkDescriptorSet  ds_brush = VK_NULL_HANDLE;
     VkDescriptorSet  ds_terrain = VK_NULL_HANDLE;
 
     // --- Terrain mesh (shared by all 4 tile draws) ---
@@ -216,7 +232,9 @@ struct PlanetDevState {
     float ui_swe_dt         = 0.05f;
     bool  ui_paused         = false;
     int   ui_brush_radius   = 12;       // grid cells
-    float ui_brush_strength = 1.5f;
+    float ui_brush_strength = 1.5f;     // water (m/s of column)
+    float ui_terrain_strength = 4.0f;   // terrain (m/s of height)
+    PD_BrushMode brush_mode = PD_BrushMode::Water;
     float ui_capillary_depth = 0.05f;
     int   ui_capillary_blur  = 4;
     bool  ui_show_plants    = true;

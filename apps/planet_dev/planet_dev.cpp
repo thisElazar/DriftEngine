@@ -951,7 +951,8 @@ void planet_dev_init(PlanetDevState& s, Renderer& r)
 
     // ---- Pools (one array layer per tile) -----------------------------------
     s.terrain_pool = create_array_image(device, alloc, VK_FORMAT_R32_SFLOAT,
-        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT
+        | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     s.swe_state_a = create_array_image(device, alloc, VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
         | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
@@ -1045,6 +1046,10 @@ void planet_dev_init(PlanetDevState& s, Renderer& r)
          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},  // 4: edge flags
         sizeof(PlanetSweStepPC));
 
+    s.pipe_brush = make_compute_pipeline(device, "shaders/planet_dev_brush_cs.spv",
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+        sizeof(PD_BrushPC));
+
     // ---- Descriptor pool + sets ----------------------------------------------
     {
         VkDescriptorPoolSize pool_sizes[] = {
@@ -1063,6 +1068,8 @@ void planet_dev_init(PlanetDevState& s, Renderer& r)
 
     s.ds_step[0] = alloc_set(device, s.desc_pool, s.pipe_swe_step.dsl);
     s.ds_step[1] = alloc_set(device, s.desc_pool, s.pipe_swe_step.dsl);
+    s.ds_brush   = alloc_set(device, s.desc_pool, s.pipe_brush.dsl);
+    write_image(device, s.ds_brush, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, s.terrain_pool.view, VK_NULL_HANDLE);
 
     // set 0: read A -> write B; set 1: read B -> write A
     for (int i = 0; i < 2; ++i) {
@@ -1150,6 +1157,13 @@ bool planet_dev_tick(PlanetDevState& s, Renderer& r, const InputFrame& in, float
         s.cursor_gy = (wz - pd_tile_origin_z(s.cursor_tile)) / PD_DX;
     }
     s.brushing = s.cursor_valid && in.lmb && !in.ui_wants_mouse;
+
+    // Globe-style brush mode keys: 1 = raise, 2 = lower, 3 = water.
+    if (!in.ui_wants_keyboard) {
+        if (in.brush_digit == 1) s.brush_mode = PD_BrushMode::Raise;
+        if (in.brush_digit == 2) s.brush_mode = PD_BrushMode::Lower;
+        if (in.brush_digit == 3) s.brush_mode = PD_BrushMode::Water;
+    }
 
     // ---- Latch edge flags (the frame about to record will clear them) -------
     {
@@ -1244,8 +1258,19 @@ bool planet_dev_tick(PlanetDevState& s, Renderer& r, const InputFrame& in, float
         if (ImGui::Button("< Back")) back = true;
         ImGui::Separator();
     }
-    ImGui::TextDisabled("2x2 tiles | planet SWE, flat | LMB = pour water");
-    ImGui::TextDisabled("WASD pan, RMB orbit, wheel zoom");
+    ImGui::TextDisabled("2x2 tiles | planet SWE, flat | LMB = apply brush");
+    ImGui::TextDisabled("WASD pan, RMB orbit, wheel zoom | 1=raise 2=lower 3=water");
+
+    if (ImGui::CollapsingHeader("Brush", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int mode = static_cast<int>(s.brush_mode);
+        ImGui::RadioButton("Raise", &mode, 0); ImGui::SameLine();
+        ImGui::RadioButton("Lower", &mode, 1); ImGui::SameLine();
+        ImGui::RadioButton("Water", &mode, 2);
+        s.brush_mode = static_cast<PD_BrushMode>(mode);
+        ImGui::SliderInt("Radius (cells)", &s.ui_brush_radius, 2, 40);
+        ImGui::SliderFloat("Water strength", &s.ui_brush_strength, 0.1f, 10.0f);
+        ImGui::SliderFloat("Terrain strength", &s.ui_terrain_strength, 0.5f, 20.0f);
+    }
 
     if (ImGui::CollapsingHeader("Water", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("Paused", &s.ui_paused);
@@ -1254,8 +1279,6 @@ bool planet_dev_tick(PlanetDevState& s, Renderer& r, const InputFrame& in, float
         ImGui::SliderFloat("Gravity", &s.ui_gravity, 0.5f, 30.0f);
         ImGui::SliderFloat("Friction", &s.ui_friction, 0.0f, 0.2f);
         ImGui::SliderFloat("Damping", &s.ui_damping, 0.0f, 0.1f);
-        ImGui::SliderInt("Brush radius", &s.ui_brush_radius, 2, 40);
-        ImGui::SliderFloat("Brush strength", &s.ui_brush_strength, 0.1f, 10.0f);
     }
 
     if (ImGui::CollapsingHeader("Plants", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1311,6 +1334,37 @@ void planet_dev_render(PlanetDevState& s, Renderer& r,
     glm::mat4 view = orbit_view(s.camera);
     glm::mat4 mvp = proj * view;
 
+    // ---- Terrain brush (raise/lower): world-space, applied to EVERY tile ----
+    // with the brush expressed in tile-local coords; tiles the falloff misses
+    // do no work, and edits straddling a seam stay seamless. CPU heightmaps
+    // mirror the same falloff so plants/creatures/picking track the edit.
+    bool terrain_brushing = s.brushing && s.brush_mode != PD_BrushMode::Water;
+    if (terrain_brushing) {
+        float sign = (s.brush_mode == PD_BrushMode::Raise) ? 1.0f : -1.0f;
+        float amount = sign * s.ui_terrain_strength * std::min(s.last_dt, 0.033f);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipe_brush.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                s.pipe_brush.layout, 0, 1, &s.ds_brush, 0, nullptr);
+        for (uint32_t t = 0; t < PD_TILE_COUNT; ++t) {
+            PD_BrushPC bpc{};
+            bpc.brush_x      = (s.cursor_wx - pd_tile_origin_x(t)) / PD_DX;
+            bpc.brush_y      = (s.cursor_wz - pd_tile_origin_z(t)) / PD_DX;
+            bpc.brush_radius = static_cast<float>(s.ui_brush_radius);
+            bpc.brush_amount = amount;
+            bpc.grid_w       = PD_GRID;
+            bpc.grid_h       = PD_GRID;
+            bpc.layer        = t;
+            vkCmdPushConstants(cmd, s.pipe_brush.layout, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(bpc), &bpc);
+            vkCmdDispatch(cmd, (PD_GRID + 15) / 16, (PD_GRID + 15) / 16, 1);
+
+            cpu_apply_brush(s.hm_cpu[t], PD_GRID, PD_GRID,
+                            bpc.brush_x, bpc.brush_y, bpc.brush_radius, bpc.brush_amount);
+        }
+        compute_memory_barrier(cmd);
+    }
+
     // ---- Clear edge flags, then run the SWE substeps over all 4 tiles -------
     vkCmdFillBuffer(cmd, s.edge_flags_buf, 0, VK_WHOLE_SIZE, 0u);
     {
@@ -1350,9 +1404,12 @@ void planet_dev_render(PlanetDevState& s, Renderer& r,
                 pc.pool_index = t;
                 pc.grid_w     = PD_GRID;
                 pc.grid_h     = PD_GRID;
-                if (s.brushing && t == s.cursor_tile) {
-                    pc.pulse_x      = s.cursor_gx;
-                    pc.pulse_y      = s.cursor_gy;
+                // Water brush: same world-space treatment as the terrain brush
+                // — every tile gets the pulse in its own local frame, so pours
+                // straddling a seam fill both sides symmetrically.
+                if (s.brushing && s.brush_mode == PD_BrushMode::Water) {
+                    pc.pulse_x      = (s.cursor_wx - pd_tile_origin_x(t)) / PD_DX;
+                    pc.pulse_y      = (s.cursor_wz - pd_tile_origin_z(t)) / PD_DX;
                     pc.pulse_radius = static_cast<float>(s.ui_brush_radius);
                     pc.pulse_amount = s.ui_brush_strength * s.ui_swe_dt;
                 }
@@ -1550,6 +1607,7 @@ void planet_dev_shutdown(PlanetDevState& s, Renderer& r)
     destroy_pd_clump_pipeline(device, s.pipe_creature);
     destroy_pd_clump_pipeline(device, s.pipe_clump);
     destroy_pd_terrain_pipeline(device, s.pipe_terrain);
+    destroy_compute_pipeline(device, s.pipe_brush);
     destroy_compute_pipeline(device, s.pipe_swe_step);
 
     vkDestroyDescriptorPool(device, s.desc_pool, nullptr);
