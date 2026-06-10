@@ -439,6 +439,116 @@ static void destroy_pd_clump_pipeline(VkDevice device, PD_ClumpPipeline& p)
 }
 
 // ---------------------------------------------------------------------------
+// Graphics pipeline — creatures (non-instanced, pre-baked world-space
+// vertices; clone of world_lab's creature pipeline)
+// ---------------------------------------------------------------------------
+static PD_ClumpPipeline create_pd_creature_pipeline(VkDevice device)
+{
+    PD_ClumpPipeline p{};
+    p.vs = make_shader(device, "shaders/world_creature_vs.spv");
+    p.fs = make_shader(device, "shaders/world_clump_fs.spv");
+
+    VkPushConstantRange push{};
+    push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    push.size       = sizeof(glm::mat4);
+
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges    = &push;
+    VK_CHECK(vkCreatePipelineLayout(device, &plci, nullptr, &p.layout));
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = p.vs;
+    stages[0].pName  = "main";
+    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = p.fs;
+    stages[1].pName  = "main";
+
+    VkVertexInputBindingDescription vb{};
+    vb.binding   = 0;
+    vb.stride    = sizeof(bestiary::VegetationVertex);
+    vb.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription attrs[3]{};
+    attrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(bestiary::VegetationVertex, position)};
+    attrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(bestiary::VegetationVertex, normal)};
+    attrs[2] = {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(bestiary::VegetationVertex, color)};
+
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount   = 1;
+    vi.pVertexBindingDescriptions      = &vb;
+    vi.vertexAttributeDescriptionCount = 3;
+    vi.pVertexAttributeDescriptions    = &attrs[0];
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1; vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode    = VK_CULL_MODE_NONE;
+    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth   = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable  = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState ba{};
+    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                      | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1; cb.pAttachments = &ba;
+
+    VkDynamicState dyns[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = 2; dyn.pDynamicStates = dyns;
+
+    VkFormat color_fmt = VK_FORMAT_B8G8R8A8_UNORM;
+    VkFormat depth_fmt = VK_FORMAT_D32_SFLOAT;
+    VkPipelineRenderingCreateInfo rci{};
+    rci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    rci.colorAttachmentCount = 1;
+    rci.pColorAttachmentFormats = &color_fmt;
+    rci.depthAttachmentFormat = depth_fmt;
+
+    VkGraphicsPipelineCreateInfo gp{};
+    gp.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gp.pNext               = &rci;
+    gp.stageCount          = 2;
+    gp.pStages             = stages;
+    gp.pVertexInputState   = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState      = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState   = &ms;
+    gp.pDepthStencilState  = &ds;
+    gp.pColorBlendState    = &cb;
+    gp.pDynamicState       = &dyn;
+    gp.layout              = p.layout;
+    VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gp, nullptr, &p.pipeline));
+    return p;
+}
+
+// ---------------------------------------------------------------------------
 // Plant roster (copied from world_lab; extraction to apps/shared is a
 // follow-up once the seam settles with two consumers)
 // ---------------------------------------------------------------------------
@@ -569,6 +679,86 @@ static void destroy_pd_plant_mesh(VmaAllocator alloc, PD_PlantMesh& m)
     m = {};
 }
 
+static void upload_pd_mesh(VmaAllocator alloc, PD_PlantMesh& dst,
+                           const bestiary::VegetationMesh& src)
+{
+    VkDeviceSize vbs = src.vertices.size() * sizeof(bestiary::VegetationVertex);
+    VkDeviceSize ibs = src.indices.size() * sizeof(uint32_t);
+    dst.vbo = create_host_buffer(alloc, vbs, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    dst.ibo = create_host_buffer(alloc, ibs, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    dst.index_count = static_cast<uint32_t>(src.indices.size());
+
+    void* mapped = nullptr;
+    VK_CHECK(vmaMapMemory(alloc, dst.vbo.allocation, &mapped));
+    std::memcpy(mapped, src.vertices.data(), vbs);
+    vmaUnmapMemory(alloc, dst.vbo.allocation);
+    VK_CHECK(vmaMapMemory(alloc, dst.ibo.allocation, &mapped));
+    std::memcpy(mapped, src.indices.data(), ibs);
+    vmaUnmapMemory(alloc, dst.ibo.allocation);
+}
+
+// World-routed terrain height (creatures and their meshes query world coords).
+static float pd_terrain_height_world(const PlanetDevState& s, float x, float z)
+{
+    uint32_t t = pd_tile_of(x, z);
+    return sample_hm_bilinear(s.hm_cpu[t], PD_GRID, PD_GRID,
+                              pd_world_to_local_gx(x, t),
+                              pd_world_to_local_gy(z, t));
+}
+
+// ---------------------------------------------------------------------------
+// Creatures: whole species library as the roster, spawned across the WHOLE
+// 2x2 world — agents wander over tile seams because, in world coordinates,
+// there is nothing there.
+// ---------------------------------------------------------------------------
+static void load_creature_profiles(PlanetDevState& s)
+{
+    auto loaded = bestiary::load_creature_dir(pd_species_dir());
+    std::sort(loaded.begin(), loaded.end(),
+              [](const bestiary::NamedCreatureProfile& a,
+                 const bestiary::NamedCreatureProfile& b) { return a.name < b.name; });
+    s.creature_profiles.clear();
+    s.creature_names.clear();
+    for (auto& ncp : loaded) {
+        s.creature_profiles.push_back(ncp.profile);
+        s.creature_names.push_back(ncp.name);
+    }
+    std::fprintf(stderr, "[planet_dev] Creature roster: %zu species\n",
+                 s.creature_profiles.size());
+}
+
+static void spawn_all_creatures(PlanetDevState& s)
+{
+    s.agents.clear();
+    if (s.creature_profiles.empty()) return;
+
+    auto archetype_weight = [](bestiary::Archetype a) -> float {
+        switch (a) {
+        case bestiary::Archetype::Herbivore: return 3.0f;
+        case bestiary::Archetype::Rabbit:    return 3.0f;
+        case bestiary::Archetype::Bird:      return 2.0f;
+        case bestiary::Archetype::Predator:  return 1.0f;
+        case bestiary::Archetype::Raptor:    return 1.0f;
+        case bestiary::Archetype::Snake:     return 1.0f;
+        }
+        return 1.0f;
+    };
+
+    float wsum = 0.0f;
+    for (const auto& p : s.creature_profiles) wsum += archetype_weight(p.archetype);
+    if (wsum < 1e-4f) wsum = 1.0f;
+
+    int total = s.ui_creature_count;
+    for (size_t i = 0; i < s.creature_profiles.size(); ++i) {
+        float w = archetype_weight(s.creature_profiles[i].archetype);
+        int count = static_cast<int>(std::round(static_cast<float>(total) * w / wsum));
+        if (count < 1) count = 1;
+        bestiary::spawn_creatures(s.agents, static_cast<uint16_t>(i), count,
+            s.persistent_env, PD_WORLD_HALF, PD_WORLD_HALF,
+            42u + static_cast<uint32_t>(i) * 101u);
+    }
+}
+
 static void build_canonical_meshes(PlanetDevState& s, VmaAllocator alloc)
 {
     for (auto& m : s.plant_canonical) destroy_pd_plant_mesh(alloc, m);
@@ -630,31 +820,57 @@ static void upload_plant_instances(PlanetDevState& s, VkDevice device, VmaAlloca
 }
 
 // ---------------------------------------------------------------------------
-// Environment refresh: per-tile water readback -> moisture -> world env field
+// Environment refresh: stitch the per-tile water readbacks into ONE world
+// grid, blur globally (so moisture crosses tile seams exactly like the water
+// does), then slice back per tile for the GPU overlay.
 // ---------------------------------------------------------------------------
+constexpr uint32_t PD_WORLD_GRID = PD_GRID * PD_TILES_X;   // 512
+
+static size_t pd_world_cell(float wx, float wz)
+{
+    int wi = std::clamp(static_cast<int>(wx + PD_WORLD_HALF), 0, static_cast<int>(PD_WORLD_GRID) - 1);
+    int wj = std::clamp(static_cast<int>(wz + PD_WORLD_HALF), 0, static_cast<int>(PD_WORLD_GRID) - 1);
+    return static_cast<size_t>(wj) * PD_WORLD_GRID + wi;
+}
+
 static void refresh_env(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
                         VkQueue gqueue, uint32_t gfamily)
 {
     VkImage fresh = (s.swe_ping_pong & 1) ? s.swe_state_b.image : s.swe_state_a.image;
 
+    s.water_world.assign(static_cast<size_t>(PD_WORLD_GRID) * PD_WORLD_GRID, 0.0f);
     for (uint32_t t = 0; t < PD_TILE_COUNT; ++t) {
-        s.water_depth[t] = readback_water_depth(device, alloc, gqueue, gfamily,
-                                                fresh, PD_GRID, PD_GRID, t);
-        s.moisture_cpu[t] = build_moisture_grid(s.water_depth[t], PD_GRID, PD_GRID,
-                                                s.ui_capillary_depth, s.ui_capillary_blur);
+        std::vector<float> tile = readback_water_depth(device, alloc, gqueue, gfamily,
+                                                       fresh, PD_GRID, PD_GRID, t);
+        size_t oxg = (t % PD_TILES_X) * PD_GRID;
+        size_t ozg = (t / PD_TILES_X) * PD_GRID;
+        for (uint32_t j = 0; j < PD_GRID; ++j)
+            std::memcpy(&s.water_world[(ozg + j) * PD_WORLD_GRID + oxg],
+                        &tile[static_cast<size_t>(j) * PD_GRID],
+                        PD_GRID * sizeof(float));
+    }
+
+    s.moisture_world = build_moisture_grid(s.water_world, PD_WORLD_GRID, PD_WORLD_GRID,
+                                           s.ui_capillary_depth, s.ui_capillary_blur);
+
+    for (uint32_t t = 0; t < PD_TILE_COUNT; ++t) {
+        size_t oxg = (t % PD_TILES_X) * PD_GRID;
+        size_t ozg = (t / PD_TILES_X) * PD_GRID;
+        s.moisture_cpu[t].resize(static_cast<size_t>(PD_GRID) * PD_GRID);
+        for (uint32_t j = 0; j < PD_GRID; ++j)
+            std::memcpy(&s.moisture_cpu[t][static_cast<size_t>(j) * PD_GRID],
+                        &s.moisture_world[(ozg + j) * PD_WORLD_GRID + oxg],
+                        PD_GRID * sizeof(float));
         update_r32_image(device, alloc, gqueue, gfamily,
                          s.moisture_pool.image, s.moisture_cpu[t], PD_GRID, PD_GRID, t);
     }
 
-    // World-coordinate env field routing to the owning tile's grids.
-    // Known v1 limitation: the capillary blur is per-tile, so moisture can
-    // show a faint seam (water itself crosses fine — it lives in the solver).
+    // World-coordinate env field straight off the world grids.
     s.persistent_env.sample = [&s](float x, float z) -> bestiary::EnvironmentSample {
+        float m = s.moisture_world.empty() ? 0.0f : s.moisture_world[pd_world_cell(x, z)];
         uint32_t t = pd_tile_of(x, z);
         int ix = std::clamp(static_cast<int>(x - pd_tile_origin_x(t)), 0, static_cast<int>(PD_GRID) - 1);
         int iz = std::clamp(static_cast<int>(z - pd_tile_origin_z(t)), 0, static_cast<int>(PD_GRID) - 1);
-        float m = s.moisture_cpu[t].empty() ? 0.0f
-                : s.moisture_cpu[t][static_cast<size_t>(iz) * PD_GRID + ix];
         float h = s.hm_cpu[t][static_cast<size_t>(iz) * PD_GRID + ix];
         float temp = std::clamp(0.5f + 0.05f * h, 0.0f, 1.0f);
         return {m, temp};
@@ -877,6 +1093,11 @@ void planet_dev_init(PlanetDevState& s, Renderer& r)
     build_canonical_meshes(s, alloc);
     run_replant(s, device, alloc, gqueue, gfamily);
 
+    // ---- Creatures ---------------------------------------------------------------
+    s.pipe_creature = create_pd_creature_pipeline(device);
+    load_creature_profiles(s);
+    spawn_all_creatures(s);
+
     s.initialized = true;
 }
 
@@ -973,6 +1194,44 @@ bool planet_dev_tick(PlanetDevState& s, Renderer& r, const InputFrame& in, float
         s.replant_pending = 0;
         run_replant(s, device, alloc, gqueue, gfamily);
     }
+    if (s.respawn_pending) {
+        s.respawn_pending = 0;
+        spawn_all_creatures(s);
+    }
+
+    // ---- Creatures: world-spanning update + per-frame mesh rebuild -----------
+    if (s.ui_creatures_enabled && !s.agents.empty() && sim_dt > 0.0f) {
+        bestiary::CreatureWorldView world_view{};
+        world_view.plant_population = &s.plant_population;
+        world_view.env_field = &s.persistent_env;
+        world_view.terrain_height = [&s](float x, float z) {
+            return pd_terrain_height_world(s, x, z);
+        };
+        world_view.water_depth = [&s](float x, float z) {
+            return s.water_world.empty() ? 0.0f : s.water_world[pd_world_cell(x, z)];
+        };
+        // The whole 2x2 world is one roaming range — tile seams don't exist
+        // for agents; this is the cross-tile movement test.
+        world_view.tile_half_x = PD_WORLD_HALF;
+        world_view.tile_half_z = PD_WORLD_HALF;
+        world_view.has_threat = s.brushing;
+        world_view.threat_pos[0] = s.cursor_wx;
+        world_view.threat_pos[1] = s.cursor_wz;
+        world_view.threat_radius = static_cast<float>(s.ui_brush_radius) * PD_DX + 10.0f;
+
+        bestiary::update_creatures(s.agents, s.creature_profiles, world_view,
+                                   sim_dt * s.ui_creature_speed, s.creature_tick);
+        ++s.creature_tick;
+
+        auto cm = bestiary::generate_creature_meshes(
+            s.agents, s.creature_profiles,
+            [&s](float x, float z) { return pd_terrain_height_world(s, x, z); }, dt);
+
+        vkDeviceWaitIdle(device);   // world_lab wart, inherited knowingly
+        destroy_pd_plant_mesh(alloc, s.creature_mesh_gpu);
+        if (!cm.vertices.empty())
+            upload_pd_mesh(alloc, s.creature_mesh_gpu, cm);
+    }
 
     // ---- UI -------------------------------------------------------------------
     ImGui_ImplVulkan_NewFrame();
@@ -1005,6 +1264,16 @@ bool planet_dev_tick(PlanetDevState& s, Renderer& r, const InputFrame& in, float
         ImGui::SliderFloat("Density", &s.eco_params.density_scale, 0.1f, 3.0f);
         ImGui::Text("Population: %zu", s.plant_population.size());
         if (ImGui::Button("Replant")) s.replant_pending = 1;
+    }
+
+    if (ImGui::CollapsingHeader("Creatures", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Checkbox("Creatures enabled", &s.ui_creatures_enabled);
+        ImGui::SliderInt("Count", &s.ui_creature_count, 4, 100);
+        ImGui::SliderFloat("Speed", &s.ui_creature_speed, 0.1f, 4.0f);
+        ImGui::Text("Alive: %d / %zu agents (%zu species)",
+                    bestiary::count_alive(s.agents), s.agents.size(),
+                    s.creature_profiles.size());
+        if (ImGui::Button("Respawn")) s.respawn_pending = 1;
     }
 
     if (ImGui::CollapsingHeader("Tiles (debug)", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1225,6 +1494,16 @@ void planet_dev_render(PlanetDevState& s, Renderer& r,
                              s.plant_inst_count[k], 0, 0, 0);
         }
     }
+
+    // Creatures (pre-baked world-space mesh, one draw)
+    if (s.ui_creatures_enabled && s.creature_mesh_gpu.index_count > 0) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipe_creature.pipeline);
+        vkCmdPushConstants(cmd, s.pipe_creature.layout, VK_SHADER_STAGE_VERTEX_BIT,
+                           0, sizeof(glm::mat4), &mvp);
+        vkCmdBindVertexBuffers(cmd, 0, 1, &s.creature_mesh_gpu.vbo.buffer, &zero);
+        vkCmdBindIndexBuffer(cmd, s.creature_mesh_gpu.ibo.buffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed(cmd, s.creature_mesh_gpu.index_count, 1, 0, 0, 0);
+    }
     vkCmdEndRendering(cmd);
 
     // ---- ImGui pass ------------------------------------------------------------
@@ -1264,9 +1543,11 @@ void planet_dev_shutdown(PlanetDevState& s, Renderer& r)
     s.plant_canonical.clear();
     s.plant_inst.clear();
     s.plant_inst_count.clear();
+    destroy_pd_plant_mesh(alloc, s.creature_mesh_gpu);
     destroy_buffer(alloc, s.terrain_mesh.vbo);
     destroy_buffer(alloc, s.terrain_mesh.ibo);
 
+    destroy_pd_clump_pipeline(device, s.pipe_creature);
     destroy_pd_clump_pipeline(device, s.pipe_clump);
     destroy_pd_terrain_pipeline(device, s.pipe_terrain);
     destroy_compute_pipeline(device, s.pipe_swe_step);

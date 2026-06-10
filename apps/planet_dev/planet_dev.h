@@ -25,6 +25,9 @@
 #include "morphology/lplant.h"
 #include "environment.h"
 #include "distribution.h"
+#include "creature/agent.h"
+#include "creature/creature_profile.h"
+#include "creature/creature_mesh.h"
 
 // ---------------------------------------------------------------------------
 // World layout: 2x2 tiles, 256 m each, world spans [-256, +256]^2.
@@ -135,8 +138,12 @@ struct PlanetDevState {
 
     // --- CPU mirrors ---
     std::vector<float> hm_cpu[PD_TILE_COUNT];
-    std::vector<float> water_depth[PD_TILE_COUNT];
-    std::vector<float> moisture_cpu[PD_TILE_COUNT];
+    std::vector<float> moisture_cpu[PD_TILE_COUNT];   // GPU-upload slices of the world grid
+    // Seam-free WORLD grids (PD_GRID*2 squared): the per-tile water readbacks
+    // are stitched into one grid, the capillary blur runs globally (so moisture
+    // crosses seams exactly like the water does), then sliced back per tile.
+    std::vector<float> water_world;
+    std::vector<float> moisture_world;
 
     // --- Sampler ---
     VkSampler sampler = VK_NULL_HANDLE;
@@ -182,6 +189,18 @@ struct PlanetDevState {
     bestiary::LPlantParams         lplant_params{};
     bestiary::LPlantExpression     lplant_expr{};
     bestiary::EcosystemParams      eco_params{};
+
+    // --- Creatures (world-spanning agents; seams don't exist for them) ---
+    std::vector<bestiary::Agent>           agents;
+    std::vector<bestiary::CreatureProfile> creature_profiles;
+    std::vector<std::string>               creature_names;
+    PD_PlantMesh                           creature_mesh_gpu{};
+    PD_ClumpPipeline                       pipe_creature{};
+    bool     ui_creatures_enabled = true;
+    int      ui_creature_count    = 24;
+    float    ui_creature_speed    = 1.0f;
+    int      respawn_pending      = 0;
+    uint32_t creature_tick        = 0;
 
     // --- Cursor pick (world plane) ---
     bool     cursor_valid = false;
