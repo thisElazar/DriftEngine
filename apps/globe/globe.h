@@ -72,7 +72,8 @@ struct HydroAsync {
     std::vector<WaterDeposit> pending_deposits; // brush deposits, guarded by deposits_mtx
 
     std::mutex             pub_mtx;
-    std::vector<glm::vec4> published;           // latest baked field, guarded by pub_mtx
+    std::vector<glm::vec4> published;           // latest baked hydrology field, guarded by pub_mtx
+    std::vector<glm::vec4> climate_published;   // latest baked climate field (sst/current), guarded by pub_mtx
 
     uint32_t res = 0;
     float    sea_level = 800.0f;
@@ -173,6 +174,13 @@ struct GlobeState {
     // sample it (moisture/river/lake) by sphere direction — see sample_planet_field.
     std::vector<glm::vec4> hydro_field_cpu;
     uint32_t      hydro_field_res = 0;
+
+    // --- Climate: coarse ocean circulation field (6-layer RGBA32F, GLOBE_HYDRO_RES²) ---
+    // r=sst, g=sst_base(reserved for humidity), b=current angle, a=current speed.
+    VkImage       climate_img   = VK_NULL_HANDLE;
+    VmaAllocation climate_alloc = VK_NULL_HANDLE;
+    VkImageView   climate_view  = VK_NULL_HANDLE;
+    std::vector<glm::vec4> climate_field_cpu;
 
     // --- Sand particle buffer ---
     VkBuffer      sand_particle_buf   = VK_NULL_HANDLE;

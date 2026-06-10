@@ -241,6 +241,7 @@ struct ClumpPC {
 static_assert(sizeof(SweStepPC) == 56, "SweStepPC layout must match shader");
 static_assert(sizeof(TerrainBrushPC) == 32, "TerrainBrushPC layout must match shader");
 static_assert(sizeof(ErosionPC) == 64, "ErosionPC layout must match shader");
+static_assert(sizeof(RiverOverlayPC) == 48, "RiverOverlayPC layout must match shader");
 
 constexpr uint32_t MAX_STAMPS = 4096;
 constexpr uint32_t MAX_WATER_STAMPS = 4096;
@@ -313,8 +314,12 @@ struct Pipelines {
     VkPipeline planet_swe_step_pipeline = VK_NULL_HANDLE;
     VkPipeline planet_swe_h_adjust_pipeline = VK_NULL_HANDLE;
     VkPipeline river_pipeline = VK_NULL_HANDLE;
+
+    // Swapchain color format the graphics pipelines were built against;
+    // remembered so pipelines_reload can recreate them identically.
+    VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
 };
 
-void pipelines_create(Pipelines& p, VkDevice device);
+void pipelines_create(Pipelines& p, VkDevice device, VkFormat color_format);
 void pipelines_reload(Pipelines& p, VkDevice device);
 void pipelines_destroy(Pipelines& p, VkDevice device);

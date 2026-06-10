@@ -95,6 +95,12 @@ struct LiveHydrology {
                                     // to this stays as a standing lake, the rest spills.
     std::vector<float> water;       // LIVE water volume (≤cap_w = lake, excess = river flow)
 
+    // --- Climate / ocean circulation (static current field + advected SST) ---
+    std::vector<glm::vec2> current;   // surface current, local tangent frame (east, north)
+    std::vector<float>     sst_base;  // solar baseline temperature (static, per structure)
+    std::vector<float>     sst;       // LIVE sea-surface temperature (advected by current)
+    std::vector<int>       nE, nW, nN, nS;  // cached cardinal neighbour indices (-1 = none)
+
     // Recompute the drainage structure for the given terrain stamps. Preserves
     // the current `water` (so it re-routes); seeds water to steady state the
     // first time. Expensive — call off the main thread. If `cancel` is set true
@@ -108,6 +114,13 @@ struct LiveHydrology {
     void add_water_deposit(glm::vec3 dir, float cos_radius, float amount);
     // Advance the live water by one step: rain in, route downstream, ocean sink.
     void step();
+    // Advance the ocean climate by one step: advect SST along the current field,
+    // relax toward the solar baseline. Cheap O(N) pass; call after step().
+    void step_climate();
+    // Bake the climate state into an RGBA payload:
+    //   r = sst, g = sst_base (reserved for humidity), b = current angle [0,1],
+    //   a = current speed.
+    void bake_climate(std::vector<glm::vec4>& out) const;
     // Bake the current state into the RGBA payload
     // (r=river strength from live water, g=moisture, b=flow angle, a=lake depth).
     void bake(std::vector<glm::vec4>& out) const;

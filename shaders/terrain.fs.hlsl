@@ -8,6 +8,9 @@
     float4 brush_color;
 };
 
+[[vk::binding(8, 0)]] SamplerState tex_sampler;
+[[vk::binding(9, 0)]] Texture2DArray<float4> climate;  // r=sst g=base b=cur angle a=cur speed
+
 [[vk::push_constant]]
 cbuffer PlanetTilePC {
     float rel_x, rel_y, rel_z;
@@ -43,39 +46,52 @@ float3 elevation_ramp(float h)
     return c;
 }
 
-float3 compute_water_color(float depth, float3 sphere_dir, float3 world_pos)
+float3 compute_water_color(float depth, float3 sphere_dir, float3 world_pos, float sst)
 {
     float3 baseN = normalize(sphere_dir);
+    float3 ref = (abs(baseN.y) > 0.999) ? float3(1.0, 0.0, 0.0) : float3(0.0, 1.0, 0.0);
+    float3 east  = normalize(cross(ref, baseN));   // +longitude (zonal)
+    float3 north = normalize(cross(baseN, east));   // +latitude
 
-    // --- Planetary water motion ----------------------------------------------
-    // Large-scale travelling swells across the whole sphere: an analytic stand-in
-    // for global ocean currents / convection (NOT a sim). Two slow wave trains in
-    // different directions, banded by latitude into gyre-scale swirls, perturb the
-    // surface normal so sun highlights drift across the ocean, plus a low-freq
-    // brightness "meta-wave". Tuning knobs: amplitudes, the *FREQ/*SPEED below.
-    float3 up = (abs(baseN.y) < 0.99) ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
-    float3 T  = normalize(cross(up, baseN));
-    float3 Bt = cross(baseN, T);
-    float3 A  = normalize(float3(0.80, 0.25, 0.55));
-    float3 B  = normalize(float3(-0.35, 0.15, 0.92));
-    float swirl = sin(baseN.y * 9.4 + time * 0.07);              // latitude-banded gyres
-    float w1 = sin(dot(baseN, A)     * 16.0 - time * 0.35 + swirl);
-    float w2 = sin(dot(baseN, B)     * 24.0 - time * 0.28);
-    float w3 = sin(dot(baseN, A + B) * 40.0 - time * 0.55);      // finer chop
-    float2 grad = float2(0.6 * w1 + 0.4 * w3, 0.6 * w2 + 0.4 * w3);
-    float3 N = normalize(baseN + 0.09 * (grad.x * T + grad.y * Bt));
-    float meta = 0.5 + 0.5 * (0.5 * w1 + 0.5 * w2);             // global brightness undulation
+    // --- Zonal ocean swell that WRAPS the planet -----------------------------
+    // Built from global latitude/longitude (NOT cube-face uv) so it is seam-free
+    // across faces; the longitude wavenumbers are integers so the wave is also
+    // continuous across the ±180° meridian. Crests run roughly N–S and drift
+    // east/west around the globe, banded by latitude (Coriolis: trade-easterlies
+    // vs mid-latitude westerlies) — Earth-like currents going around. Low
+    // amplitude + low frequency → calm ocean sheen, no moiré.
+    float lat = asin(clamp(baseN.y, -1.0, 1.0));
+    float lon = atan2(baseN.z, baseN.x);
+    float poleFade = saturate(cos(lat) * 1.3);            // calm the polar convergence
+    // Integer longitude wavenumbers → continuous across the ±180° meridian; uniform
+    // eastward drift → no band-boundary seams. Crests run ~N–S and circle the globe.
+    float phase1 =  9.0 * lon + 2.0 * lat - time * 0.10;
+    float phase2 = 14.0 * lon - 4.0 * lat - time * 0.07;
+    float w1 = sin(phase1);
+    float w2 = sin(phase2);
+    float amp = 0.030 * poleFade;
+    float3 N = normalize(baseN + amp * (w1 * east + 0.5 * w2 * north));
+    float  meta = 0.5 + 0.5 * (0.6 * w1 + 0.4 * w2);
 
     float3 V = normalize(-world_pos);
     float3 L = normalize(sun_dir);
 
-    float3 shallow = float3(0.55, 0.85, 0.90);
-    float3 mid     = float3(0.10, 0.40, 0.65);
-    float3 deep_c  = float3(0.02, 0.10, 0.22);
+    // Shared water palette (matches river_overlay.fs), then tinted by SST so warm
+    // and cold currents are visible: warm → teal, cold → steel blue.
+    float3 shallow = float3(0.35, 0.60, 0.85);
+    float3 mid     = float3(0.12, 0.35, 0.62);
+    float3 deep_c  = float3(0.03, 0.13, 0.34);
     float depth_scale = max(max_elevation, 100.0);
     float t1 = smoothstep(0.0,  depth_scale * 0.05, depth);
     float t2 = smoothstep(depth_scale * 0.05, depth_scale * 0.3, depth);
     float3 base = lerp(lerp(shallow, mid, t1), deep_c, t2);
+
+    float3 cold = float3(0.10, 0.24, 0.55);
+    float3 warm = float3(0.18, 0.52, 0.60);
+    base = lerp(base, lerp(cold, warm, saturate(sst)), 0.30);
+
+    float3 crest = float3(0.60, 0.82, 1.00);
+    base = lerp(base, crest, 0.10 * (0.5 + 0.5 * w1));
 
     float NdotV = saturate(dot(N, V));
     float fresnel = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);
@@ -98,9 +114,15 @@ float4 main(PSInput input) : SV_Target
 {
     float3 color;
 
+    // Sample the coarse climate field for sea-surface temperature at this point.
+    // The cube-face uv comes from the tile uv + the tile's face/region push constants.
+    float2 face_uv = float2(u_min + input.uv.x * tile_size, v_min + input.uv.y * tile_size);
+    float2 clim_uv = face_uv * 0.5 + 0.5;
+    float  sst     = climate.SampleLevel(tex_sampler, float3(clim_uv, float(face)), 0).r;
+
     float shore_band = max(max_elevation * 0.005, 0.5);
     if (input.water_depth > shore_band) {
-        color = compute_water_color(input.water_depth, input.sphere_direction, input.world_pos);
+        color = compute_water_color(input.water_depth, input.sphere_direction, input.world_pos, sst);
         color = lerp(color, float3(0.95, 0.95, 0.97), saturate(input.foam));
     } else if (input.water_depth > 0.0) {
         float3 terrain_color = elevation_ramp(input.height_normalized);
@@ -109,7 +131,7 @@ float4 main(PSInput input) : SV_Target
         float NdotL = max(dot(N, L), 0.0);
         terrain_color *= 0.3 + 0.7 * NdotL;
 
-        float3 water_col = compute_water_color(input.water_depth, input.sphere_direction, input.world_pos);
+        float3 water_col = compute_water_color(input.water_depth, input.sphere_direction, input.world_pos, sst);
         float blend = smoothstep(0.0, shore_band, input.water_depth);
         color = lerp(terrain_color, water_col, blend);
     } else {

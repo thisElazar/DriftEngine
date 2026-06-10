@@ -32,6 +32,8 @@ struct VSOutput {
     [[vk::location(0)]] float2 hyd_uv  : TEXCOORD0;             // [0,1] cube-face uv
     [[vk::location(1)]] nointerpolation uint face_out : TEXCOORD1;
     [[vk::location(2)]] float2 tile_uv : TEXCOORD2;
+    [[vk::location(3)]] float3 world_pos : TEXCOORD3;           // camera-relative, for view vector
+    [[vk::location(4)]] float3 normal    : TEXCOORD4;           // surface (radial) normal
 };
 
 static const float GRID_MAX = 63.0;
@@ -79,9 +81,11 @@ VSOutput main(VSInput input)
     float3 world_rel = displacement + float3(rel_x, rel_y, rel_z);
 
     VSOutput o;
-    o.position = mul(proj, mul(view, float4(world_rel, 1.0)));
-    o.hyd_uv   = face_uv * 0.5 + 0.5;
-    o.face_out = face;
-    o.tile_uv  = tile_uv;
+    o.position  = mul(proj, mul(view, float4(world_rel, 1.0)));
+    o.hyd_uv    = face_uv * 0.5 + 0.5;
+    o.face_out  = face;
+    o.tile_uv   = tile_uv;
+    o.world_pos = world_rel;        // camera-relative (cam at origin)
+    o.normal    = sphere_dir;       // radial surface normal
     return o;
 }

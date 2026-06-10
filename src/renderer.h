@@ -15,7 +15,6 @@ struct FrameData {
     VkCommandPool   pool;
     VkCommandBuffer cmd;
     VkSemaphore     image_available;
-    VkSemaphore     render_finished;
     VkFence         in_flight;
 };
 
@@ -36,6 +35,9 @@ struct Renderer {
     vkb::Swapchain vkb_swapchain;
     std::vector<VkImage> swapchain_images;
     std::vector<VkImageView> swapchain_views;
+    // One per swapchain image: a present may still wait on the semaphore after
+    // the frame fence signals, so these cannot live in FrameData.
+    std::vector<VkSemaphore> render_finished;
     DepthBuffer depth_buffer{};
 
     std::array<FrameData, FRAMES_IN_FLIGHT> frames{};

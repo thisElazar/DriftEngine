@@ -67,7 +67,12 @@ static void hydrology_worker_main(HydroAsync* ha)
             { std::lock_guard<std::mutex> lk(ha->deposits_mtx); drained.swap(ha->pending_deposits); }
             for (const auto& d : drained) live.add_water_deposit(d.dir, d.cos_radius, d.amount);
             live.step();
-            { std::lock_guard<std::mutex> lk(ha->pub_mtx); live.bake(ha->published); }
+            live.step_climate();
+            {
+                std::lock_guard<std::mutex> lk(ha->pub_mtx);
+                live.bake(ha->published);
+                live.bake_climate(ha->climate_published);
+            }
             ha->publish_ready.store(true, std::memory_order_release);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(40));  // ~25 steps/sec
@@ -460,6 +465,16 @@ void globe_init(GlobeState& s, Renderer& r)
                              s.hydrology_img, zeros, GLOBE_HYDRO_RES, GLOBE_HYDRO_RES, 6,
                              VK_IMAGE_LAYOUT_UNDEFINED);
 
+        // ---- Climate field (coarse ocean circulation, 6-layer RGBA32F) --------
+        VkImageCreateInfo cci = hci;   // identical format/extent/usage
+        VK_CHECK(vmaCreateImage(allocator, &cci, &hai, &s.climate_img, &s.climate_alloc, nullptr));
+        VkImageViewCreateInfo cvi = hvi;
+        cvi.image = s.climate_img;
+        VK_CHECK(vkCreateImageView(device, &cvi, nullptr, &s.climate_view));
+        update_rgba32f_array(device, allocator, graphics_queue, gfx_family,
+                             s.climate_img, zeros, GLOBE_HYDRO_RES, GLOBE_HYDRO_RES, 6,
+                             VK_IMAGE_LAYOUT_UNDEFINED);
+
         // Start the persistent live-water worker (the field solves + steps off
         // the main thread; structure rebuilds are signaled on terrain edits).
         start_hydrology_worker(s);
@@ -499,7 +514,7 @@ void globe_init(GlobeState& s, Renderer& r)
     terrain_samp_ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VK_CHECK(vkCreateSampler(device, &terrain_samp_ci, nullptr, &s.terrain_linear_sampler));
 
-    pipelines_create(s.pipelines, device);
+    pipelines_create(s.pipelines, device, r.vkb_swapchain.image_format);
 
     // ---- Descriptor pool + sets ---------------------------------------------
     // Counts: SWE init(2) + SWE step×2(8) + terrain brush(1) + gfx(4 incl sediment) + erosion×2(8) = needs ~23 descriptors
@@ -507,7 +522,7 @@ void globe_init(GlobeState& s, Renderer& r)
     pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     pool_sizes[0].descriptorCount = 45;
     pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    pool_sizes[1].descriptorCount = 48;
+    pool_sizes[1].descriptorCount = 56;   // +climate binding(9) on gfx + clipmap sets
     pool_sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     pool_sizes[2].descriptorCount = 6;
     pool_sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -789,7 +804,7 @@ void globe_init(GlobeState& s, Renderer& r)
         sampler_only_info.sampler = s.sampler;
 
         for (int si = 0; si < 2; si++) {
-            VkWriteDescriptorSet writes[9]{};
+            VkWriteDescriptorSet writes[10]{};
 
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = s.gfx_desc_sets[si];
@@ -854,7 +869,17 @@ void globe_init(GlobeState& s, Renderer& r)
             writes[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
             writes[8].pImageInfo = &sampler_only_info;
 
-            vkUpdateDescriptorSets(device, 9, writes, 0, nullptr);
+            VkDescriptorImageInfo climate_info{};
+            climate_info.imageView   = s.climate_view;
+            climate_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[9].dstSet = s.gfx_desc_sets[si];
+            writes[9].dstBinding = 9;
+            writes[9].descriptorCount = 1;
+            writes[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            writes[9].pImageInfo = &climate_info;
+
+            vkUpdateDescriptorSets(device, 10, writes, 0, nullptr);
         }
     }
 
@@ -1558,7 +1583,7 @@ void globe_init(GlobeState& s, Renderer& r)
         sampler_only_info.sampler = s.sampler;
 
         for (int si = 0; si < 2; si++) {
-            VkWriteDescriptorSet writes[9]{};
+            VkWriteDescriptorSet writes[10]{};
 
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = s.clipmap_gfx_desc_sets[si];
@@ -1623,7 +1648,17 @@ void globe_init(GlobeState& s, Renderer& r)
             writes[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
             writes[8].pImageInfo = &sampler_only_info;
 
-            vkUpdateDescriptorSets(device, 9, writes, 0, nullptr);
+            VkDescriptorImageInfo climate_info{};
+            climate_info.imageView   = s.climate_view;
+            climate_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[9].dstSet = s.clipmap_gfx_desc_sets[si];
+            writes[9].dstBinding = 9;
+            writes[9].descriptorCount = 1;
+            writes[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            writes[9].pImageInfo = &climate_info;
+
+            vkUpdateDescriptorSets(device, 10, writes, 0, nullptr);
         }
     }
 
@@ -2093,7 +2128,11 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
     if (s.hydro && s.hydro->publish_ready.load(std::memory_order_acquire) &&
         (glfwGetTime() - s.hydro_last_upload) > HYDRO_UPLOAD_INTERVAL) {
         // Retain the snapshot on the CPU (for ecosystem sampling) and upload it.
-        { std::lock_guard<std::mutex> lk(s.hydro->pub_mtx); s.hydro_field_cpu = s.hydro->published; }
+        {
+            std::lock_guard<std::mutex> lk(s.hydro->pub_mtx);
+            s.hydro_field_cpu    = s.hydro->published;
+            s.climate_field_cpu  = s.hydro->climate_published;
+        }
         s.hydro_field_res = GLOBE_HYDRO_RES;
         s.hydro->publish_ready.store(false, std::memory_order_release);
         if (!s.hydro_field_cpu.empty()) {
@@ -2101,6 +2140,13 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
             std::memcpy(flat.data(), s.hydro_field_cpu.data(), flat.size() * sizeof(float));
             update_rgba32f_array(device, allocator, graphics_queue, gfx_family,
                                  s.hydrology_img, flat, GLOBE_HYDRO_RES, GLOBE_HYDRO_RES, 6,
+                                 VK_IMAGE_LAYOUT_GENERAL);
+        }
+        if (!s.climate_field_cpu.empty()) {
+            std::vector<float> flat(s.climate_field_cpu.size() * 4);
+            std::memcpy(flat.data(), s.climate_field_cpu.data(), flat.size() * sizeof(float));
+            update_rgba32f_array(device, allocator, graphics_queue, gfx_family,
+                                 s.climate_img, flat, GLOBE_HYDRO_RES, GLOBE_HYDRO_RES, 6,
                                  VK_IMAGE_LAYOUT_GENERAL);
         }
         s.hydro_last_upload = glfwGetTime();
@@ -2172,19 +2218,9 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
                     uint16_t hx = px[i * 4 + 0];
                     uint16_t hy = px[i * 4 + 1];
                     uint16_t hp = px[i * 4 + 3];
-                    // IEEE 754 half-to-float conversion
-                    auto h2f = [](uint16_t h) -> float {
-                        uint32_t sign = (h >> 15) & 1;
-                        uint32_t exp  = (h >> 10) & 0x1F;
-                        uint32_t mant = h & 0x3FF;
-                        if (exp == 0) return sign ? -0.0f : 0.0f;
-                        if (exp == 31) return sign ? -1e30f : 1e30f;
-                        float f = std::ldexp(static_cast<float>(1024 + mant), static_cast<int>(exp) - 25);
-                        return sign ? -f : f;
-                    };
-                    float pressure = h2f(hp);
-                    float wx = h2f(hx);
-                    float wy = h2f(hy);
+                    float pressure = half_to_float(hp);
+                    float wx = half_to_float(hx);
+                    float wy = half_to_float(hy);
                     if (pressure > 10.0f) {
                         p_min = std::min(p_min, pressure);
                         p_max = std::max(p_max, pressure);
@@ -2773,6 +2809,26 @@ void globe_render(GlobeState& s, Renderer& r,
     GLFWwindow* window = r.window;
     float terrain_size = s.terrain_size;
     (void)allocator; (void)graphics_queue; (void)gfx_family; (void)window;
+
+        // ---- Cross-frame WAR guard -------------------------------------------
+        // With FRAMES_IN_FLIGHT > 1 the previous frame's draws may still be
+        // sampling the sim images this frame's dispatches overwrite. The frame
+        // fence only protects the command buffer, not GPU resources, so an
+        // execution dependency (no access masks needed for write-after-read)
+        // must order prior-frame shader reads before this frame's first writes.
+        {
+            VkMemoryBarrier2 war_bar{};
+            war_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            war_bar.srcStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                                 | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            war_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                 | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            VkDependencyInfo war_dep{};
+            war_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            war_dep.memoryBarrierCount = 1;
+            war_dep.pMemoryBarriers = &war_bar;
+            vkCmdPipelineBarrier2(frame.cmd, &war_dep);
+        }
 
         // ---- Terrain brush dispatch (flat-grid only, before SWE) ----
         if (!s.ui.ocean_enabled && s.brush_hit && (s.brush_mode == BrushMode::Raise || s.brush_mode == BrushMode::Lower)) {
@@ -3424,6 +3480,19 @@ void globe_render(GlobeState& s, Renderer& r,
                 copy.regionCount = 1;
                 copy.pRegions = &region;
                 vkCmdCopyImageToBuffer2(frame.cmd, &copy);
+
+                // Make the copy visible to the host readback in globe_tick.
+                VkMemoryBarrier2 host_bar{};
+                host_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                host_bar.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                host_bar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                host_bar.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+                host_bar.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+                VkDependencyInfo host_dep{};
+                host_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                host_dep.memoryBarrierCount = 1;
+                host_dep.pMemoryBarriers = &host_bar;
+                vkCmdPipelineBarrier2(frame.cmd, &host_dep);
             }
 
             s.atmo_ping_pong ^= 1;
@@ -3813,6 +3882,8 @@ void globe_shutdown(GlobeState& s, Renderer& r)
 
     vkDestroyImageView(device, s.hydrology_view, nullptr);
     vmaDestroyImage(allocator, s.hydrology_img, s.hydrology_alloc);
+    vkDestroyImageView(device, s.climate_view, nullptr);
+    vmaDestroyImage(allocator, s.climate_img, s.climate_alloc);
 
     vmaDestroyBuffer(allocator, s.clipmap_ibo, s.clipmap_ibo_alloc);
     vmaDestroyBuffer(allocator, s.clipmap_vbo, s.clipmap_vbo_alloc);

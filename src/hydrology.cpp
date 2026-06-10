@@ -28,6 +28,10 @@ static constexpr float LIVE_FLOW_F = 0.5f;   // fraction of a cell's water route
 static constexpr float LAKE_FILL_K = 1.0f;   // metres of depression depth → water units of storage
 static constexpr float LIVE_SEEP   = 0.05f;  // water lost per land cell per step (settles transients)
 static constexpr float LAKE_FLOOD   = 1.30f; // how far above "full" a brushed overfill shows as a lake
+// --- Ocean climate tunables ---
+static constexpr float GYRE_BANDS    = 3.0f;  // zonal wind/current bands per hemisphere
+static constexpr float CLIMATE_ADVECT = 0.20f;// SST advected per step (keep |current|*this < 1 for stability)
+static constexpr float CLIMATE_RELAX  = 0.01f;// pull back toward the solar baseline per step (slow)
 
 static const int OFF[8][2] = {{-1,-1},{0,-1},{1,-1},{-1,0},{1,0},{-1,1},{0,1},{1,1}};
 
@@ -323,6 +327,43 @@ void LiveHydrology::rebuild_structure(const TerrainStamp* stamps, uint32_t stamp
                 water[c] = std::max((LIVE_RAIN / LIVE_FLOW_F) * static_cast<float>(accum[c]),
                                     cap_w[c]);
     }
+
+    // --- Climate: cardinal neighbours, solar baseline, analytic ocean currents ---
+    nE.assign(N, -1); nW.assign(N, -1); nN.assign(N, -1); nS.assign(N, -1);
+    sst_base.assign(N, 0.0f);
+    current.assign(N, glm::vec2(0.0f));
+    const uint32_t rr = res;
+    for (size_t c = 0; c < N; ++c) {
+        uint32_t face = static_cast<uint32_t>(c / (static_cast<size_t>(rr) * rr));
+        uint32_t rem  = static_cast<uint32_t>(c % (static_cast<size_t>(rr) * rr));
+        int i = static_cast<int>(rem % rr), j = static_cast<int>(rem / rr);
+        nE[c] = neighbor_index(face, i, j,  1,  0, rr);
+        nW[c] = neighbor_index(face, i, j, -1,  0, rr);
+        nN[c] = neighbor_index(face, i, j,  0,  1, rr);
+        nS[c] = neighbor_index(face, i, j,  0, -1, rr);
+
+        sst_base[c] = planet_temperature(dir[c], 0.0f);
+        if (height[c] < sea_level) {                       // ocean: zonal circulation
+            // Dominantly EAST-WEST flow banded by latitude (Coriolis / trade winds vs
+            // westerlies) — currents that wrap around the planet. Smooth in longitude
+            // (no per-longitude term) so SST advects into clean latitude bands.
+            float phi = std::asin(std::clamp(dir[c].y, -1.0f, 1.0f));     // latitude
+            float e = std::cos(phi * GYRE_BANDS);                         // zonal: alternating E/W bands
+            float n = 0.12f * std::sin(phi * GYRE_BANDS * 2.0f);          // gentle poleward mixing
+            current[c] = glm::vec2(e, n);
+        }
+    }
+    // Coast tangency: zero any current component that points into a land neighbour,
+    // so currents run ALONG shorelines (cheap western-boundary deflection).
+    for (size_t c = 0; c < N; ++c) {
+        if (height[c] >= sea_level) continue;
+        auto land = [&](int n){ return n >= 0 && height[n] >= sea_level; };
+        if (current[c].x > 0 && land(nE[c])) current[c].x = 0.0f;
+        if (current[c].x < 0 && land(nW[c])) current[c].x = 0.0f;
+        if (current[c].y > 0 && land(nN[c])) current[c].y = 0.0f;
+        if (current[c].y < 0 && land(nS[c])) current[c].y = 0.0f;
+    }
+    if (sst.size() != N) sst = sst_base;   // seed SST to the solar baseline
 }
 
 void LiveHydrology::add_water_deposit(glm::vec3 dir, float cos_radius, float amount)
@@ -364,6 +405,43 @@ void LiveHydrology::step()
         Wn[c] -= std::min(Wn[c], LIVE_SEEP);                     // gentle seepage settles transients
     }
     water.swap(Wn);
+}
+
+void LiveHydrology::step_climate()
+{
+    const size_t N = sst.size();
+    if (N == 0 || current.size() != N || nE.size() != N) return;
+    std::vector<float> Sn = sst;
+    for (size_t c = 0; c < N; ++c) {
+        if (height[c] < sea_level) {
+            // Ocean: upwind advection of SST along the current + slow solar relax.
+            float u = current[c].x, v = current[c].y;
+            float sc = sst[c];
+            float sW = (nW[c] >= 0) ? sst[nW[c]] : sc;
+            float sE = (nE[c] >= 0) ? sst[nE[c]] : sc;
+            float sS = (nS[c] >= 0) ? sst[nS[c]] : sc;
+            float sN = (nN[c] >= 0) ? sst[nN[c]] : sc;
+            float dTx = (u > 0.0f) ? (sc - sW) : (sE - sc);
+            float dTy = (v > 0.0f) ? (sc - sS) : (sN - sc);
+            float adv = u * dTx + v * dTy;
+            Sn[c] = sc - CLIMATE_ADVECT * adv + CLIMATE_RELAX * (sst_base[c] - sc);
+        } else {
+            Sn[c] = sst_base[c];   // land holds air-temp baseline
+        }
+    }
+    sst.swap(Sn);
+}
+
+void LiveHydrology::bake_climate(std::vector<glm::vec4>& out) const
+{
+    const size_t N = sst.size();
+    out.resize(N);
+    for (size_t c = 0; c < N; ++c) {
+        glm::vec2 cur = (current.size() == N) ? current[c] : glm::vec2(0.0f);
+        float spd = glm::length(cur);
+        float ang01 = (spd > 1e-5f) ? (std::atan2(cur.y, cur.x) / TWO_PI + 0.5f) : 0.5f;
+        out[c] = glm::vec4(sst[c], sst_base[c], ang01, std::clamp(spd, 0.0f, 1.0f));
+    }
 }
 
 void LiveHydrology::bake(std::vector<glm::vec4>& out) const

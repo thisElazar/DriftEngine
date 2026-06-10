@@ -56,9 +56,16 @@ std::vector<uint32_t> load_spirv(const char* path)
         std::abort();
     }
     auto size = static_cast<size_t>(file.tellg());
+    if (size == 0 || size % sizeof(uint32_t) != 0) {
+        std::fprintf(stderr, "SPIR-V file truncated or invalid (%zu bytes): %s\n", size, path);
+        std::abort();
+    }
     std::vector<uint32_t> buffer(size / sizeof(uint32_t));
     file.seekg(0);
-    file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(size));
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(size))) {
+        std::fprintf(stderr, "Failed to read SPIR-V file: %s\n", path);
+        std::abort();
+    }
     return buffer;
 }
 

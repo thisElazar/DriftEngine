@@ -3,6 +3,12 @@
 // along the per-cell flow direction (time-driven) so it reads as motion at any
 // planet scale, independent of the (too-slow) SWE timescale.
 
+[[vk::binding(0, 0)]] cbuffer Camera {
+    float4x4 view;
+    float4x4 proj;
+    float3 sun_dir;   float _pad0;
+    float3 sun_color; float _cam_time;   // (=time; FS uses RiverPC.time)
+};
 [[vk::binding(2, 0)]] Texture2DArray<float4> hydrology;  // .r=strength .g=moist .ba=flow
 [[vk::binding(3, 0)]] SamplerState samp;
 
@@ -23,6 +29,8 @@ struct PSInput {
     [[vk::location(0)]] float2 hyd_uv  : TEXCOORD0;
     [[vk::location(1)]] nointerpolation uint face_out : TEXCOORD1;
     [[vk::location(2)]] float2 tile_uv : TEXCOORD2;
+    [[vk::location(3)]] float3 world_pos : TEXCOORD3;   // camera-relative
+    [[vk::location(4)]] float3 normal    : TEXCOORD4;   // surface (radial) normal
 };
 
 float4 main(PSInput input) : SV_Target
@@ -69,6 +77,35 @@ float4 main(PSInput input) : SV_Target
     float3 base = lerp(shallow, deep, depth);
     float3 col  = lerp(base, crest, crest_amt * motion);
 
-    float alpha = saturate(present * 1.6) * (0.80 + 0.20 * motion);
-    return float4(col, alpha);
+    // --- Lighting parity with the ocean (terrain.fs) -------------------------
+    // Same fresnel + sky reflection + specular so a lake catches the sun exactly
+    // like the sea. The surface normal is perturbed slightly along the flow so the
+    // sun glints travel with the current (matching the ocean's swell glints).
+    float3 Ngeo = normalize(input.normal);
+    float3 up = (abs(Ngeo.y) < 0.99) ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+    float3 T  = normalize(cross(up, Ngeo));
+    float3 Bt = cross(Ngeo, T);
+    float  bump = (motion - 0.5) * (0.5 + flowv);          // wave-slope proxy
+    float3 Nw = normalize(Ngeo + 0.05 * bump * (flowdir.x * T + flowdir.y * Bt));
+
+    float3 V = normalize(-input.world_pos);
+    float3 L = normalize(sun_dir);
+    float  NdotV = saturate(dot(Nw, V));
+    float  fresnel = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);
+
+    float3 Rr = reflect(-V, Nw);
+    float  sky_t = saturate(Rr.y * 0.5 + 0.5);
+    float3 sky = lerp(float3(0.85, 0.88, 0.92), float3(0.30, 0.55, 0.85), sky_t);
+
+    float3 H = normalize(L + V);
+    float  spec = pow(saturate(dot(Nw, H)), 64.0);
+    float3 specular = sun_color * spec * 0.8;
+
+    float  NdotL = saturate(dot(Nw, L));
+    float3 lit = col * (0.4 + 0.6 * NdotL);
+    float3 outc = lerp(lit, sky, fresnel) + specular;
+
+    // Reflective water reads more opaque at grazing angles (like the sea).
+    float alpha = saturate(present * 1.6) * saturate(0.72 + 0.22 * motion + 0.28 * fresnel);
+    return float4(outc, alpha);
 }
