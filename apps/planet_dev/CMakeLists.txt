@@ -10,7 +10,7 @@ target_include_directories(planet_dev PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # the top-level / world_lab shader rules; only the tiled terrain shaders live
 # here.
 set(PD_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
-file(GLOB PD_HLSL_SHADERS ${PD_SHADER_DIR}/*.hlsl)
+file(GLOB PD_HLSL_SHADERS CONFIGURE_DEPENDS ${PD_SHADER_DIR}/*.hlsl)
 
 set(PD_SPV_OUTPUTS "")
 foreach(HLSL ${PD_HLSL_SHADERS})

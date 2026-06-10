@@ -162,7 +162,7 @@ set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
 set(SHADER_OUT_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 
-file(GLOB HLSL_SHADERS ${SHADER_DIR}/*.hlsl)
+file(GLOB HLSL_SHADERS CONFIGURE_DEPENDS ${SHADER_DIR}/*.hlsl)
 
 set(SPV_OUTPUTS "")
 foreach(HLSL ${HLSL_SHADERS})
@@ -199,7 +199,7 @@ add_dependencies(drift_engine shaders)
 # ---------------------------------------------------------------------------
 # Copy species files to build dir
 # ---------------------------------------------------------------------------
-file(GLOB SPECIES_FILES ${CMAKE_CURRENT_SOURCE_DIR}/species/*.toml)
+file(GLOB SPECIES_FILES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/species/*.toml)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/species)
 foreach(SF ${SPECIES_FILES})
     get_filename_component(SF_NAME ${SF} NAME)

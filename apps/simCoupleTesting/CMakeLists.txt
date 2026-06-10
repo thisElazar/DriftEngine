@@ -5,7 +5,7 @@ target_link_libraries(sim_couple_test PRIVATE drift_engine_core)
 
 # --- HLSL -> SPIR-V for local render shaders ---
 set(SCT_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
-file(GLOB SCT_HLSL_SHADERS ${SCT_SHADER_DIR}/*.hlsl)
+file(GLOB SCT_HLSL_SHADERS CONFIGURE_DEPENDS ${SCT_SHADER_DIR}/*.hlsl)
 
 set(SCT_SPV_OUTPUTS "")
 foreach(HLSL ${SCT_HLSL_SHADERS})
