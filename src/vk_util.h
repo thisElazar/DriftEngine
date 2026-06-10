@@ -49,7 +49,8 @@ void    oneshot_end(OneShot& s);
 void image_barrier(VkCommandBuffer cmd, VkImage img,
                    VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
                    VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access,
-                   VkImageLayout old_layout, VkImageLayout new_layout);
+                   VkImageLayout old_layout, VkImageLayout new_layout,
+                   uint32_t base_layer = 0, uint32_t layer_count = 1);
 
 void compute_memory_barrier(VkCommandBuffer cmd);
 
@@ -82,7 +83,7 @@ float half_to_float(uint16_t h);
 void update_r32_image(VkDevice device, VmaAllocator alloc,
                       VkQueue queue, uint32_t family,
                       VkImage img, const std::vector<float>& data,
-                      uint32_t w, uint32_t h);
+                      uint32_t w, uint32_t h, uint32_t layer = 0);
 
 // Upload a tightly-packed RGBA32F array image (all `layers` of a 2D array,
 // data laid out layer-contiguous: layer0 full w*h*4 floats, then layer1, ...).

@@ -133,7 +133,8 @@ void oneshot_end(OneShot& s)
 void image_barrier(VkCommandBuffer cmd, VkImage img,
                    VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
                    VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access,
-                   VkImageLayout old_layout, VkImageLayout new_layout)
+                   VkImageLayout old_layout, VkImageLayout new_layout,
+                   uint32_t base_layer, uint32_t layer_count)
 {
     VkImageMemoryBarrier2 b{};
     b.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -144,7 +145,7 @@ void image_barrier(VkCommandBuffer cmd, VkImage img,
     b.oldLayout     = old_layout;
     b.newLayout     = new_layout;
     b.image         = img;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, base_layer, layer_count};
 
     VkDependencyInfo di{};
     di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -265,7 +266,7 @@ float half_to_float(uint16_t h)
 void update_r32_image(VkDevice device, VmaAllocator alloc,
                       VkQueue queue, uint32_t family,
                       VkImage img, const std::vector<float>& data,
-                      uint32_t w, uint32_t h)
+                      uint32_t w, uint32_t h, uint32_t layer)
 {
     VkDeviceSize bytes = VkDeviceSize{w} * h * sizeof(float);
     VkBufferCreateInfo bci{};
@@ -294,14 +295,14 @@ void update_r32_image(VkDevice device, VmaAllocator alloc,
     b1.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
     b1.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b1.image         = img;
-    b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1};
     VkDependencyInfo d1{};
     d1.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     d1.imageMemoryBarrierCount = 1; d1.pImageMemoryBarriers = &b1;
     vkCmdPipelineBarrier2(os.cmd, &d1);
 
     VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
     copy.imageExtent = {w, h, 1};
     vkCmdCopyBufferToImage(os.cmd, staging, img,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);

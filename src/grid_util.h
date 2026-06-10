@@ -28,4 +28,5 @@ std::vector<float> build_moisture_grid(const std::vector<float>& water_depth,
 std::vector<float> readback_water_depth(VkDevice device, VmaAllocator alloc,
                                         VkQueue queue, uint32_t family,
                                         VkImage state_img,
-                                        uint32_t grid_w, uint32_t grid_h);
+                                        uint32_t grid_w, uint32_t grid_h,
+                                        uint32_t layer = 0);

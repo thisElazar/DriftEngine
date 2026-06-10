@@ -132,7 +132,8 @@ std::vector<float> build_moisture_grid(const std::vector<float>& water_depth,
 std::vector<float> readback_water_depth(VkDevice device, VmaAllocator alloc,
                                         VkQueue queue, uint32_t family,
                                         VkImage state_img,
-                                        uint32_t grid_w, uint32_t grid_h)
+                                        uint32_t grid_w, uint32_t grid_h,
+                                        uint32_t layer)
 {
     VkDeviceSize bytes = VkDeviceSize{grid_w} * grid_h * 8;
     GpuBuffer staging = create_readback_buffer(alloc, bytes);
@@ -145,10 +146,11 @@ std::vector<float> readback_water_depth(VkDevice device, VmaAllocator alloc,
                   VK_PIPELINE_STAGE_2_COPY_BIT,
                   VK_ACCESS_2_TRANSFER_READ_BIT,
                   VK_IMAGE_LAYOUT_GENERAL,
-                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  layer, 1);
 
     VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
     copy.imageExtent      = {grid_w, grid_h, 1};
     vkCmdCopyImageToBuffer(s.cmd, state_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            staging.buffer, 1, &copy);
@@ -160,7 +162,8 @@ std::vector<float> readback_water_depth(VkDevice device, VmaAllocator alloc,
                   VK_ACCESS_2_SHADER_STORAGE_READ_BIT
                     | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                  VK_IMAGE_LAYOUT_GENERAL);
+                  VK_IMAGE_LAYOUT_GENERAL,
+                  layer, 1);
 
     oneshot_end(s);
 
