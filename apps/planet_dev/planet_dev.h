@@ -1,11 +1,13 @@
 // planet_dev.h — PLANET (DEV): multi-tile world architecture sandbox.
 //
-// A 2x2 grid of World-Lab-scale tiles (256 m each) with water flowing across
-// tile seams and plants continuous across the world. This is the flat proving
-// ground for the planet's tile machinery: water uses the SAME compute shader
-// as the planet (shaders/planet_swe_step.cs.hlsl) — tile state in texture
-// array layers, neighbor-slot push constants, edge-flags readback — so what
-// works here is what runs on the sphere. Creatures land in a later increment.
+// An N x N world of World-Lab-scale tiles (256 m each) STREAMED through a
+// fixed pool of GPU slots: tiles activate by camera distance and by water
+// reaching a resident tile's edge (edge-flag auto-anchor), with water flowing
+// across tile seams and plants continuous across the world. This is the flat
+// proving ground for the planet's tile machinery: water uses the SAME compute
+// shader as the planet (shaders/planet_swe_step.cs.hlsl) — tile state in
+// texture array layers, neighbor-slot push constants, edge-flags readback —
+// so what works here is what runs on the sphere.
 //
 // Provides init/tick/render/shutdown so it can be driven by a standalone
 // executable or the unified launcher.
@@ -33,27 +35,38 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// World layout: 2x2 tiles, 256 m each, world spans [-256, +256]^2.
-// Tile index t = ty*2 + tx (t0 = -x/-z, t1 = +x/-z, t2 = -x/+z, t3 = +x/+z).
+// World layout: N x N tiles of 256 m, world spans +-(N/2 * 256) m. Tile index
+// t = ty*N + tx. Only a POOL of tiles is GPU-resident at a time: tile_slot[]
+// maps world tile -> pool slot (array layer), slot_tile[] maps back, and a
+// free list + cooldown recycle slots — the Globe's tile_slot_map pattern,
+// flat. Tiles stream in by camera distance and by edge-flag auto-anchoring
+// (water reaching the edge of a resident tile pulls its neighbor in).
 // ---------------------------------------------------------------------------
 constexpr uint32_t PD_GRID       = 256;     // cells per tile side
 constexpr float    PD_DX         = 1.0f;    // meters per cell
-constexpr uint32_t PD_TILES_X    = 2;
-constexpr uint32_t PD_TILES_Y    = 2;
-constexpr uint32_t PD_TILE_COUNT = PD_TILES_X * PD_TILES_Y;
-constexpr float    PD_TILE_SIZE  = PD_GRID * PD_DX;          // 256 m
-constexpr float    PD_WORLD_HALF = PD_TILE_SIZE;             // 2x2 -> +-256 m
+constexpr uint32_t PD_TILES_X    = 8;
+constexpr uint32_t PD_TILES_Y    = 8;
+constexpr uint32_t PD_TILE_TOTAL = PD_TILES_X * PD_TILES_Y;       // world tiles
+constexpr uint32_t PD_POOL       = 16;                            // resident GPU slots
+constexpr float    PD_TILE_SIZE  = PD_GRID * PD_DX;               // 256 m
+constexpr float    PD_WORLD_HALF = 0.5f * PD_TILES_X * PD_TILE_SIZE;  // +-1024 m
 
-constexpr uint32_t PD_NO_NEIGHBOR = 0xFFFFFFFFu;
+constexpr uint32_t PD_NO_NEIGHBOR = 0xFFFFFFFFu;   // SWE shader: reflective wall
+constexpr uint32_t PD_NO_SLOT     = 0xFFFFFFFFu;   // tile not GPU-resident
+constexpr uint32_t PD_NO_TILE     = 0xFFFFFFFFu;   // slot unassigned
 
-// Neighbor slot table per tile, in the SWE shader's L/R/D/U order (D/U follow
-// grid +y == world +z). Edges of the world stay PD_NO_NEIGHBOR = reflective.
-constexpr uint32_t PD_NEIGHBORS[PD_TILE_COUNT][4] = {
-    {PD_NO_NEIGHBOR, 1u,             PD_NO_NEIGHBOR, 2u            },  // t0
-    {0u,             PD_NO_NEIGHBOR, PD_NO_NEIGHBOR, 3u            },  // t1
-    {PD_NO_NEIGHBOR, 3u,             0u,             PD_NO_NEIGHBOR},  // t2
-    {2u,             PD_NO_NEIGHBOR, 1u,             PD_NO_NEIGHBOR},  // t3
-};
+// World-grid neighbor tile in the SWE shader's L/R/D/U order (D/U follow
+// grid +y == world +z); PD_NO_TILE at the world boundary.
+inline uint32_t pd_neighbor_tile(uint32_t t, int dir)
+{
+    uint32_t tx = t % PD_TILES_X, ty = t / PD_TILES_X;
+    switch (dir) {
+    case 0: return (tx > 0)               ? t - 1          : PD_NO_TILE;
+    case 1: return (tx + 1 < PD_TILES_X)  ? t + 1          : PD_NO_TILE;
+    case 2: return (ty > 0)               ? t - PD_TILES_X : PD_NO_TILE;
+    default:return (ty + 1 < PD_TILES_Y)  ? t + PD_TILES_X : PD_NO_TILE;
+    }
+}
 
 inline float pd_tile_origin_x(uint32_t t) { return -PD_WORLD_HALF + static_cast<float>(t % PD_TILES_X) * PD_TILE_SIZE; }
 inline float pd_tile_origin_z(uint32_t t) { return -PD_WORLD_HALF + static_cast<float>(t / PD_TILES_X) * PD_TILE_SIZE; }
@@ -107,7 +120,7 @@ enum class PD_BrushMode { Raise, Lower, Water };
 // ---------------------------------------------------------------------------
 // Module-local GPU helper types
 // ---------------------------------------------------------------------------
-struct PD_ArrayImage {              // 2D array image, PD_TILE_COUNT layers
+struct PD_ArrayImage {              // 2D array image, PD_POOL layers
     VkImage       image = VK_NULL_HANDLE;
     VmaAllocation alloc = VK_NULL_HANDLE;
     VkImageView   view  = VK_NULL_HANDLE;   // array view over all layers
@@ -148,19 +161,30 @@ struct PlanetDevState {
     PD_ArrayImage swe_output{};      // render-facing (r = depth, a = foam)
     PD_ArrayImage moisture_pool{};   // R32_SFLOAT
 
-    // --- Edge flags (one uint per tile, host-visible; debug readout only) ---
+    // --- Edge flags (one uint per pool slot, host-visible; drives streaming) ---
     VkBuffer          edge_flags_buf   = VK_NULL_HANDLE;
     VmaAllocation     edge_flags_alloc = VK_NULL_HANDLE;
     VmaAllocationInfo edge_flags_info{};
 
-    // --- CPU mirrors ---
-    std::vector<float> hm_cpu[PD_TILE_COUNT];
-    std::vector<float> moisture_cpu[PD_TILE_COUNT];   // GPU-upload slices of the world grid
-    // Seam-free WORLD grids (PD_GRID*2 squared): the per-tile water readbacks
-    // are stitched into one grid, the capillary blur runs globally (so moisture
-    // crosses seams exactly like the water does), then sliced back per tile.
+    // --- CPU mirrors (ALL world tiles, persistent across streaming) ---
+    std::vector<std::vector<float>> hm_cpu;   // heightmaps; brush edits survive stream-out
+    std::vector<float> moisture_slice;        // scratch: per-slot GPU upload slice
+    // Seam-free WORLD grids (PD_TILES_X*PD_GRID squared), persistent: resident
+    // tiles refresh their region from GPU readbacks; deactivating a tile saves
+    // its water depth here, activation restores it. The capillary blur runs
+    // over the resident tiles' bounding box so moisture crosses seams exactly
+    // like the water does.
     std::vector<float> water_world;
     std::vector<float> moisture_world;
+
+    // --- Tile streaming (Globe tile_slot_map pattern, flat) ---
+    uint32_t tile_slot[PD_TILE_TOTAL];   // world tile -> pool slot or PD_NO_SLOT
+    uint32_t slot_tile[PD_POOL];         // pool slot -> world tile or PD_NO_TILE
+    std::vector<uint32_t> free_slots;
+    // Freed slots wait FRAMES_IN_FLIGHT frames before reuse so no in-flight
+    // frame can sample a layer while its new tenant uploads.
+    std::vector<std::pair<uint32_t, uint64_t>> slot_cooldown;
+    float ui_stream_radius = 400.0f;     // activation distance from camera target
 
     // --- Sampler ---
     VkSampler sampler = VK_NULL_HANDLE;
@@ -244,7 +268,7 @@ struct PlanetDevState {
     bool  ui_show_moisture  = false;
     bool  ui_seam_highlight = true;
     int   replant_pending   = 0;
-    uint32_t edge_flags_ui[PD_TILE_COUNT]{};   // latched before the frame clears them
+    uint32_t edge_flags_ui[PD_POOL]{};   // per-SLOT, latched before the frame clears them
 
     // --- Deferred buffer destruction (Globe veg retire-queue pattern) ---
     // Buffers replaced mid-flight (creature mesh, plant instances) are parked

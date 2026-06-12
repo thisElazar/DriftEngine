@@ -1,8 +1,9 @@
 // planet_dev.cpp — PLANET (DEV) module implementation.
 //
-// 2x2 World-Lab-scale tiles with cross-tile water (the planet's own
-// planet_swe_step compute shader, flat) and a single world-spanning plant
-// population. See planet_dev.h for the architecture notes.
+// N x N World-Lab-scale tiles streamed through a fixed GPU slot pool, with
+// cross-tile water (the planet's own planet_swe_step compute shader, flat)
+// and a single world-spanning plant population. See planet_dev.h for the
+// architecture notes.
 
 #include "planet_dev.h"
 
@@ -44,8 +45,9 @@ static float pd_height(float wx, float wz)
 {
     float r = std::sqrt(wx * wx + wz * wz);
 
-    // World rim rises at the edges (one big bowl across all 4 tiles).
-    float h = -4.0f + 0.00008f * r * r;
+    // World rim rises at the edges (one big bowl across all tiles, ~+5 m at
+    // the world boundary regardless of world size).
+    float h = -4.0f + 5.24f * (r * r) / (PD_WORLD_HALF * PD_WORLD_HALF);
 
     // Ridge running NW-SE through the world, crossing both seams.
     float ridge_dist = std::abs(wx * 0.7f + wz * 0.7f);
@@ -81,7 +83,7 @@ static PD_ArrayImage create_array_image(VkDevice device, VmaAllocator alloc,
     ci.format = format;
     ci.extent = {PD_GRID, PD_GRID, 1};
     ci.mipLevels = 1;
-    ci.arrayLayers = PD_TILE_COUNT;
+    ci.arrayLayers = PD_POOL;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = usage;
@@ -99,7 +101,7 @@ static PD_ArrayImage create_array_image(VkDevice device, VmaAllocator alloc,
     vci.image = img.image;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     vci.format = format;
-    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PD_TILE_COUNT};
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PD_POOL};
     VK_CHECK(vkCreateImageView(device, &vci, nullptr, &img.view));
     return img;
 }
@@ -768,8 +770,10 @@ static void spawn_all_creatures(PlanetDevState& s)
         float w = archetype_weight(s.creature_profiles[i].archetype);
         int count = static_cast<int>(std::round(static_cast<float>(total) * w / wsum));
         if (count < 1) count = 1;
+        // Spawn on the initially-resident center tiles (they roam the whole
+        // world from there; CPU mirrors answer queries on streamed-out tiles).
         bestiary::spawn_creatures(s.agents, static_cast<uint16_t>(i), count,
-            s.persistent_env, PD_WORLD_HALF, PD_WORLD_HALF,
+            s.persistent_env, PD_TILE_SIZE, PD_TILE_SIZE,
             42u + static_cast<uint32_t>(i) * 101u);
     }
 }
@@ -834,11 +838,13 @@ static void upload_plant_instances(PlanetDevState& s, VmaAllocator alloc)
 }
 
 // ---------------------------------------------------------------------------
-// Environment refresh: stitch the per-tile water readbacks into ONE world
-// grid, blur globally (so moisture crosses tile seams exactly like the water
-// does), then slice back per tile for the GPU overlay.
+// Environment refresh: stitch the RESIDENT tiles' water readbacks into the
+// persistent world grid (non-resident regions keep their saved water), run
+// the capillary blur over the resident bounding box (so moisture crosses
+// seams exactly like the water does), then slice back per slot for the GPU
+// overlay.
 // ---------------------------------------------------------------------------
-constexpr uint32_t PD_WORLD_GRID = PD_GRID * PD_TILES_X;   // 512
+constexpr uint32_t PD_WORLD_GRID = PD_GRID * PD_TILES_X;
 
 static size_t pd_world_cell(float wx, float wz)
 {
@@ -852,31 +858,58 @@ static void refresh_env(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
 {
     VkImage fresh = (s.swe_ping_pong & 1) ? s.swe_state_b.image : s.swe_state_a.image;
 
-    s.water_world.assign(static_cast<size_t>(PD_WORLD_GRID) * PD_WORLD_GRID, 0.0f);
-    for (uint32_t t = 0; t < PD_TILE_COUNT; ++t) {
+    // Refresh resident regions of the world water grid; track their tile bbox.
+    uint32_t bb_min_x = PD_TILES_X, bb_max_x = 0, bb_min_y = PD_TILES_Y, bb_max_y = 0;
+    bool any_resident = false;
+    for (uint32_t slot = 0; slot < PD_POOL; ++slot) {
+        uint32_t t = s.slot_tile[slot];
+        if (t == PD_NO_TILE) continue;
+        any_resident = true;
         std::vector<float> tile = readback_water_depth(device, alloc, gqueue, gfamily,
-                                                       fresh, PD_GRID, PD_GRID, t);
-        size_t oxg = (t % PD_TILES_X) * PD_GRID;
-        size_t ozg = (t / PD_TILES_X) * PD_GRID;
+                                                       fresh, PD_GRID, PD_GRID, slot);
+        uint32_t tx = t % PD_TILES_X, ty = t / PD_TILES_X;
+        bb_min_x = std::min(bb_min_x, tx); bb_max_x = std::max(bb_max_x, tx);
+        bb_min_y = std::min(bb_min_y, ty); bb_max_y = std::max(bb_max_y, ty);
+        size_t oxg = static_cast<size_t>(tx) * PD_GRID;
+        size_t ozg = static_cast<size_t>(ty) * PD_GRID;
         for (uint32_t j = 0; j < PD_GRID; ++j)
             std::memcpy(&s.water_world[(ozg + j) * PD_WORLD_GRID + oxg],
                         &tile[static_cast<size_t>(j) * PD_GRID],
                         PD_GRID * sizeof(float));
     }
 
-    s.moisture_world = build_moisture_grid(s.water_world, PD_WORLD_GRID, PD_WORLD_GRID,
-                                           s.ui_capillary_depth, s.ui_capillary_blur);
+    // Capillary blur over the resident bounding box only — at this scale a
+    // whole-world blur would be a 16x hitch for tiles nobody is simulating.
+    if (any_resident) {
+        uint32_t cx0 = bb_min_x * PD_GRID, cy0 = bb_min_y * PD_GRID;
+        uint32_t bw = (bb_max_x - bb_min_x + 1) * PD_GRID;
+        uint32_t bh = (bb_max_y - bb_min_y + 1) * PD_GRID;
+        std::vector<float> sub(static_cast<size_t>(bw) * bh);
+        for (uint32_t j = 0; j < bh; ++j)
+            std::memcpy(&sub[static_cast<size_t>(j) * bw],
+                        &s.water_world[(cy0 + j) * PD_WORLD_GRID + cx0],
+                        bw * sizeof(float));
+        std::vector<float> sub_m = build_moisture_grid(sub, bw, bh,
+                                                       s.ui_capillary_depth, s.ui_capillary_blur);
+        for (uint32_t j = 0; j < bh; ++j)
+            std::memcpy(&s.moisture_world[(cy0 + j) * PD_WORLD_GRID + cx0],
+                        &sub_m[static_cast<size_t>(j) * bw],
+                        bw * sizeof(float));
+    }
 
-    for (uint32_t t = 0; t < PD_TILE_COUNT; ++t) {
-        size_t oxg = (t % PD_TILES_X) * PD_GRID;
-        size_t ozg = (t / PD_TILES_X) * PD_GRID;
-        s.moisture_cpu[t].resize(static_cast<size_t>(PD_GRID) * PD_GRID);
+    // Slice the moisture grid back per resident slot for the GPU overlay.
+    s.moisture_slice.resize(static_cast<size_t>(PD_GRID) * PD_GRID);
+    for (uint32_t slot = 0; slot < PD_POOL; ++slot) {
+        uint32_t t = s.slot_tile[slot];
+        if (t == PD_NO_TILE) continue;
+        size_t oxg = (t % PD_TILES_X) * static_cast<size_t>(PD_GRID);
+        size_t ozg = (t / PD_TILES_X) * static_cast<size_t>(PD_GRID);
         for (uint32_t j = 0; j < PD_GRID; ++j)
-            std::memcpy(&s.moisture_cpu[t][static_cast<size_t>(j) * PD_GRID],
+            std::memcpy(&s.moisture_slice[static_cast<size_t>(j) * PD_GRID],
                         &s.moisture_world[(ozg + j) * PD_WORLD_GRID + oxg],
                         PD_GRID * sizeof(float));
         update_r32_image(device, alloc, gqueue, gfamily,
-                         s.moisture_pool.image, s.moisture_cpu[t], PD_GRID, PD_GRID, t);
+                         s.moisture_pool.image, s.moisture_slice, PD_GRID, PD_GRID, slot);
     }
 
     // World-coordinate env field straight off the world grids.
@@ -905,22 +938,222 @@ static bestiary::EnvironmentField tile_env(const PlanetDevState& s, uint32_t t)
     return env;
 }
 
+// Deterministic per-tile plant placement (same seed -> same layout when a
+// tile streams back in; health history is lost, accepted for the sandbox).
+static void pd_place_tile_plants(PlanetDevState& s, uint32_t t)
+{
+    bestiary::EcosystemParams eco = s.eco_params;
+    eco.region_size = PD_TILE_SIZE;
+    eco.seed = s.eco_params.seed + t * 7919u;
+    auto placed = bestiary::place_ecosystem(s.plant_roster, eco, tile_env(s, t));
+    float cx = pd_tile_origin_x(t) + PD_TILE_SIZE * 0.5f;
+    float cz = pd_tile_origin_z(t) + PD_TILE_SIZE * 0.5f;
+    for (auto& p : placed) { p.x += cx; p.z += cz; }
+    s.plant_population.insert(s.plant_population.end(), placed.begin(), placed.end());
+}
+
+// ---------------------------------------------------------------------------
+// Tile streaming: activate = assign a pool slot, upload the CPU heightmap,
+// clear the slot's water state and restore any saved depth from the world
+// grid (velocity is dropped — pooled water is near-static), place plants.
+// Deactivate = save water depth to the world grid, drop the tile's plants,
+// free the slot (after a FRAMES_IN_FLIGHT cooldown).
+// ---------------------------------------------------------------------------
+
+// Minimal scalar float->half for the water-restore staging upload.
+static uint16_t pd_float_to_half(float f)
+{
+    uint32_t x = 0;
+    std::memcpy(&x, &f, sizeof(x));
+    uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t  exp  = static_cast<int32_t>((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFFu;
+    if (exp <= 0)  return static_cast<uint16_t>(sign);              // flush to zero
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7C00u);    // clamp to inf
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13));
+}
+
+static void pd_activate_tile(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
+                             VkQueue gqueue, uint32_t gfamily, uint32_t t)
+{
+    if (s.tile_slot[t] != PD_NO_SLOT || s.free_slots.empty()) return;
+    uint32_t slot = s.free_slots.back();
+    s.free_slots.pop_back();
+    s.tile_slot[t]    = slot;
+    s.slot_tile[slot] = t;
+    std::fprintf(stderr, "[planet_dev] tile (%u,%u) -> slot %u\n",
+                 t % PD_TILES_X, t / PD_TILES_X, slot);
+
+    update_r32_image(device, alloc, gqueue, gfamily,
+                     s.terrain_pool.image, s.hm_cpu[t], PD_GRID, PD_GRID, slot);
+
+    // Saved water depth for this tile's region (if the tile was flooded when
+    // it streamed out, or refresh_env last saw water here).
+    size_t oxg = (t % PD_TILES_X) * static_cast<size_t>(PD_GRID);
+    size_t ozg = (t / PD_TILES_X) * static_cast<size_t>(PD_GRID);
+    bool has_water = false;
+    for (uint32_t j = 0; j < PD_GRID && !has_water; ++j)
+        for (uint32_t i = 0; i < PD_GRID; ++i)
+            if (s.water_world[(ozg + j) * PD_WORLD_GRID + oxg + i] > 1e-4f) { has_water = true; break; }
+
+    GpuBuffer staging{};
+    if (has_water) {
+        VkDeviceSize bytes = VkDeviceSize{PD_GRID} * PD_GRID * 4 * sizeof(uint16_t);
+        staging = create_host_buffer(alloc, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        void* mapped = nullptr;
+        VK_CHECK(vmaMapMemory(alloc, staging.allocation, &mapped));
+        auto* hp = static_cast<uint16_t*>(mapped);
+        for (uint32_t j = 0; j < PD_GRID; ++j)
+            for (uint32_t i = 0; i < PD_GRID; ++i) {
+                size_t c = (static_cast<size_t>(j) * PD_GRID + i) * 4;
+                hp[c + 0] = pd_float_to_half(s.water_world[(ozg + j) * PD_WORLD_GRID + oxg + i]);
+                hp[c + 1] = 0; hp[c + 2] = 0; hp[c + 3] = 0;
+            }
+        vmaUnmapMemory(alloc, staging.allocation);
+    }
+
+    {
+        OneShot os = oneshot_begin(device, gqueue, gfamily);
+        VkImage imgs[] = {s.swe_state_a.image, s.swe_state_b.image, s.swe_output.image};
+        for (VkImage img : imgs)
+            image_barrier(os.cmd, img,
+                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                          VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                          VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                          VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          slot, 1);
+        VkClearColorValue clr{};
+        VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, slot, 1};
+        for (VkImage img : imgs)
+            vkCmdClearColorImage(os.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clr, 1, &rng);
+        if (has_water) {
+            // Restore depth into the current READ state (next substep reads it)
+            // and the render output (so it shows even while paused).
+            VkImage cur_read = (s.swe_ping_pong & 1) ? s.swe_state_b.image : s.swe_state_a.image;
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, slot, 1};
+            copy.imageExtent      = {PD_GRID, PD_GRID, 1};
+            vkCmdCopyBufferToImage(os.cmd, staging.buffer, cur_read,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            vkCmdCopyBufferToImage(os.cmd, staging.buffer, s.swe_output.image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        }
+        for (VkImage img : imgs)
+            image_barrier(os.cmd, img,
+                          VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                          VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                          slot, 1);
+        oneshot_end(os);
+    }
+    if (staging.buffer) destroy_buffer(alloc, staging);
+
+    // Moisture overlay slice for the slot (stale-or-zero until next refresh).
+    s.moisture_slice.resize(static_cast<size_t>(PD_GRID) * PD_GRID);
+    for (uint32_t j = 0; j < PD_GRID; ++j)
+        std::memcpy(&s.moisture_slice[static_cast<size_t>(j) * PD_GRID],
+                    &s.moisture_world[(ozg + j) * PD_WORLD_GRID + oxg],
+                    PD_GRID * sizeof(float));
+    update_r32_image(device, alloc, gqueue, gfamily,
+                     s.moisture_pool.image, s.moisture_slice, PD_GRID, PD_GRID, slot);
+
+    pd_place_tile_plants(s, t);
+}
+
+static void pd_deactivate_tile(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
+                               VkQueue gqueue, uint32_t gfamily, uint32_t t)
+{
+    uint32_t slot = s.tile_slot[t];
+    if (slot == PD_NO_SLOT) return;
+
+    // Save the slot's water depth into the persistent world grid.
+    VkImage fresh = (s.swe_ping_pong & 1) ? s.swe_state_b.image : s.swe_state_a.image;
+    std::vector<float> depth = readback_water_depth(device, alloc, gqueue, gfamily,
+                                                    fresh, PD_GRID, PD_GRID, slot);
+    size_t oxg = (t % PD_TILES_X) * static_cast<size_t>(PD_GRID);
+    size_t ozg = (t / PD_TILES_X) * static_cast<size_t>(PD_GRID);
+    for (uint32_t j = 0; j < PD_GRID; ++j)
+        std::memcpy(&s.water_world[(ozg + j) * PD_WORLD_GRID + oxg],
+                    &depth[static_cast<size_t>(j) * PD_GRID],
+                    PD_GRID * sizeof(float));
+
+    std::erase_if(s.plant_population, [&](const bestiary::PlantInstance& p) {
+        return pd_tile_of(p.x, p.z) == t;
+    });
+
+    s.tile_slot[t]    = PD_NO_SLOT;
+    s.slot_tile[slot] = PD_NO_TILE;
+    s.edge_flags_ui[slot] = 0;
+    s.slot_cooldown.emplace_back(slot, s.frame_counter);
+    std::fprintf(stderr, "[planet_dev] tile (%u,%u) freed slot %u\n",
+                 t % PD_TILES_X, t / PD_TILES_X, slot);
+}
+
+// Per-tick streaming policy: recycle cooled-down slots, drop far hydraulically
+// quiet tiles, auto-anchor neighbors of edge-flagged tiles (the Globe's
+// pattern — water pulls tiles in before it arrives), then fill remaining
+// slots by camera distance, nearest first.
+static void pd_update_streaming(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
+                                VkQueue gqueue, uint32_t gfamily)
+{
+    std::erase_if(s.slot_cooldown, [&](std::pair<uint32_t, uint64_t>& e) {
+        if (s.frame_counter <= e.second + FRAMES_IN_FLIGHT) return false;
+        s.free_slots.push_back(e.first);
+        return true;
+    });
+
+    auto tile_dist = [&](uint32_t t) {
+        float cx = pd_tile_origin_x(t) + 0.5f * PD_TILE_SIZE;
+        float cz = pd_tile_origin_z(t) + 0.5f * PD_TILE_SIZE;
+        float dx = cx - s.camera.target.x, dz = cz - s.camera.target.z;
+        return std::sqrt(dx * dx + dz * dz);
+    };
+
+    // 1. Deactivate: out of radius + one tile of hysteresis, and no water at
+    //    any edge this frame (water inside is saved/restored, so it may go).
+    for (uint32_t slot = 0; slot < PD_POOL; ++slot) {
+        uint32_t t = s.slot_tile[slot];
+        if (t == PD_NO_TILE || s.edge_flags_ui[slot] != 0) continue;
+        if (tile_dist(t) > s.ui_stream_radius + PD_TILE_SIZE)
+            pd_deactivate_tile(s, device, alloc, gqueue, gfamily, t);
+    }
+
+    // 2. Edge-flag auto-anchor.
+    for (uint32_t slot = 0; slot < PD_POOL; ++slot) {
+        uint32_t t = s.slot_tile[slot];
+        if (t == PD_NO_TILE || s.edge_flags_ui[slot] == 0) continue;
+        for (int dir = 0; dir < 4; ++dir) {
+            if (!(s.edge_flags_ui[slot] & (1u << dir))) continue;
+            uint32_t nb = pd_neighbor_tile(t, dir);
+            if (nb == PD_NO_TILE || s.tile_slot[nb] != PD_NO_SLOT) continue;
+            if (s.free_slots.empty()) return;
+            pd_activate_tile(s, device, alloc, gqueue, gfamily, nb);
+        }
+    }
+
+    // 3. Activate by camera distance, nearest first.
+    std::vector<std::pair<float, uint32_t>> wanted;
+    for (uint32_t t = 0; t < PD_TILE_TOTAL; ++t) {
+        if (s.tile_slot[t] != PD_NO_SLOT) continue;
+        float d = tile_dist(t);
+        if (d <= s.ui_stream_radius) wanted.emplace_back(d, t);
+    }
+    std::sort(wanted.begin(), wanted.end());
+    for (auto& [d, t] : wanted) {
+        if (s.free_slots.empty()) break;
+        pd_activate_tile(s, device, alloc, gqueue, gfamily, t);
+    }
+}
+
 static void run_replant(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
                         VkQueue gqueue, uint32_t gfamily)
 {
     refresh_env(s, device, alloc, gqueue, gfamily);
 
     s.plant_population.clear();
-    for (uint32_t t = 0; t < PD_TILE_COUNT; ++t) {
-        bestiary::EcosystemParams eco = s.eco_params;
-        eco.region_size = PD_TILE_SIZE;
-        eco.seed = s.eco_params.seed + t * 7919u;
-        auto placed = bestiary::place_ecosystem(s.plant_roster, eco, tile_env(s, t));
-        float cx = pd_tile_origin_x(t) + PD_TILE_SIZE * 0.5f;
-        float cz = pd_tile_origin_z(t) + PD_TILE_SIZE * 0.5f;
-        for (auto& p : placed) { p.x += cx; p.z += cz; }
-        s.plant_population.insert(s.plant_population.end(), placed.begin(), placed.end());
-    }
+    for (uint32_t t = 0; t < PD_TILE_TOTAL; ++t)
+        if (s.tile_slot[t] != PD_NO_SLOT) pd_place_tile_plants(s, t);
 
     upload_plant_instances(s, alloc);
     s.veg_rebuild_timer = 0.0f;
@@ -991,9 +1224,9 @@ void planet_dev_init(PlanetDevState& s, Renderer& r)
                           VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
                           VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                           VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                          0, PD_TILE_COUNT);
+                          0, PD_POOL);
         VkClearColorValue clr{};
-        VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PD_TILE_COUNT};
+        VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PD_POOL};
         for (VkImage img : clear_imgs)
             vkCmdClearColorImage(os.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clr, 1, &rng);
         for (VkImage img : clear_imgs)
@@ -1002,33 +1235,41 @@ void planet_dev_init(PlanetDevState& s, Renderer& r)
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                          0, PD_TILE_COUNT);
-        // Terrain pool straight to GENERAL; update_r32_image uploads per layer.
+                          0, PD_POOL);
+        // Terrain pool straight to GENERAL; tile activation uploads per layer.
         image_barrier(os.cmd, s.terrain_pool.image,
                       VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                       VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                      0, PD_TILE_COUNT);
+                      0, PD_POOL);
         oneshot_end(os);
     }
 
-    // ---- Heightmaps: one continuous analytic function, four tiles -----------
-    for (uint32_t t = 0; t < PD_TILE_COUNT; ++t) {
+    // ---- Heightmaps: one continuous analytic function, ALL world tiles ------
+    // (persistent CPU mirrors; the GPU pool only sees resident tiles' layers)
+    s.hm_cpu.assign(PD_TILE_TOTAL, {});
+    for (uint32_t t = 0; t < PD_TILE_TOTAL; ++t) {
         s.hm_cpu[t].assign(static_cast<size_t>(PD_GRID) * PD_GRID, 0.0f);
         float ox = pd_tile_origin_x(t), oz = pd_tile_origin_z(t);
         for (uint32_t gy = 0; gy < PD_GRID; ++gy)
             for (uint32_t gx = 0; gx < PD_GRID; ++gx)
                 s.hm_cpu[t][static_cast<size_t>(gy) * PD_GRID + gx] =
                     pd_height(ox + (gx + 0.5f) * PD_DX, oz + (gy + 0.5f) * PD_DX);
-        update_r32_image(device, alloc, gqueue, gfamily,
-                         s.terrain_pool.image, s.hm_cpu[t], PD_GRID, PD_GRID, t);
     }
 
-    // ---- Edge flags buffer (debug readout) ----------------------------------
+    // ---- Persistent world grids + streaming maps ------------------------------
+    s.water_world.assign(static_cast<size_t>(PD_WORLD_GRID) * PD_WORLD_GRID, 0.0f);
+    s.moisture_world.assign(static_cast<size_t>(PD_WORLD_GRID) * PD_WORLD_GRID, 0.0f);
+    for (uint32_t t = 0; t < PD_TILE_TOTAL; ++t) s.tile_slot[t] = PD_NO_SLOT;
+    for (uint32_t sl = 0; sl < PD_POOL; ++sl)    s.slot_tile[sl] = PD_NO_TILE;
+    s.free_slots.clear();
+    for (uint32_t sl = PD_POOL; sl > 0; --sl)    s.free_slots.push_back(sl - 1);
+
+    // ---- Edge flags buffer (one uint per pool slot; drives streaming) -------
     {
         VkBufferCreateInfo bci{};
         bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bci.size  = PD_TILE_COUNT * sizeof(uint32_t);
+        bci.size  = PD_POOL * sizeof(uint32_t);
         bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         VmaAllocationCreateInfo ai{};
         ai.usage = VMA_MEMORY_USAGE_AUTO;
@@ -1093,7 +1334,7 @@ void planet_dev_init(PlanetDevState& s, Renderer& r)
         write_image(device, s.ds_step[i], 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, in_view,  VK_NULL_HANDLE);
         write_image(device, s.ds_step[i], 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, out_view, VK_NULL_HANDLE);
         write_image(device, s.ds_step[i], 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, s.swe_output.view, VK_NULL_HANDLE);
-        write_buffer(device, s.ds_step[i], 4, s.edge_flags_buf, PD_TILE_COUNT * sizeof(uint32_t));
+        write_buffer(device, s.ds_step[i], 4, s.edge_flags_buf, PD_POOL * sizeof(uint32_t));
     }
 
     // ---- Graphics -------------------------------------------------------------
@@ -1112,6 +1353,16 @@ void planet_dev_init(PlanetDevState& s, Renderer& r)
     load_plant_profiles(s);
     build_plant_roster(s);
     build_canonical_meshes(s, alloc);
+
+    // ---- Initial tile activation around the camera target, then plant it ----
+    // Default env BEFORE the first activation: the unset-field fallback is
+    // moisture 0.5 EVERYWHERE, which makes place_ecosystem's poisson fill
+    // pathologically dense (~10 s per tile). Dry-by-default matches the real
+    // post-refresh field (water starts at zero) and keeps activation cheap.
+    s.persistent_env.sample = [](float, float) -> bestiary::EnvironmentSample {
+        return {0.0f, 0.5f};
+    };
+    pd_update_streaming(s, device, alloc, gqueue, gfamily);
     run_replant(s, device, alloc, gqueue, gfamily);
 
     // ---- Creatures ---------------------------------------------------------------
@@ -1190,9 +1441,12 @@ bool planet_dev_tick(PlanetDevState& s, Renderer& r, const InputFrame& in, float
     // ---- Latch edge flags (the frame about to record will clear them) -------
     {
         const uint32_t* flags = static_cast<const uint32_t*>(s.edge_flags_info.pMappedData);
-        for (uint32_t t = 0; t < PD_TILE_COUNT; ++t)
-            s.edge_flags_ui[t] = flags[t];
+        for (uint32_t sl = 0; sl < PD_POOL; ++sl)
+            s.edge_flags_ui[sl] = flags[sl];
     }
+
+    // ---- Tile streaming: camera-distance activation + edge-flag anchoring ---
+    pd_update_streaming(s, device, alloc, gqueue, gfamily);
 
     // ---- Ecosystem cadence (the World Lab loop, on world coords) ------------
     if (sim_dt > 0.0f && !s.plant_roster.empty()) {
@@ -1210,7 +1464,8 @@ bool planet_dev_tick(PlanetDevState& s, Renderer& r, const InputFrame& in, float
         if (s.auto_replant_timer >= 8.0f) {
             s.auto_replant_timer = 0.0f;
             refresh_env(s, device, alloc, gqueue, gfamily);
-            for (uint32_t t = 0; t < PD_TILE_COUNT; ++t) {
+            for (uint32_t t = 0; t < PD_TILE_TOTAL; ++t) {
+                if (s.tile_slot[t] == PD_NO_SLOT) continue;
                 bestiary::EcosystemParams eco = s.eco_params;
                 eco.region_size = PD_TILE_SIZE;
                 size_t before = s.plant_population.size();
@@ -1320,16 +1575,26 @@ bool planet_dev_tick(PlanetDevState& s, Renderer& r, const InputFrame& in, float
         if (ImGui::Button("Respawn")) s.respawn_pending = 1;
     }
 
-    if (ImGui::CollapsingHeader("Tiles (debug)", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Streaming (debug)", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("Seam highlight", &s.ui_seam_highlight);
+        ImGui::SliderFloat("Stream radius (m)", &s.ui_stream_radius, 128.0f, 512.0f);
+        uint32_t resident = 0;
+        for (uint32_t sl = 0; sl < PD_POOL; ++sl)
+            if (s.slot_tile[sl] != PD_NO_TILE) ++resident;
+        ImGui::Text("World %ux%u tiles | resident %u / pool %u (%zu cooling)",
+                    PD_TILES_X, PD_TILES_Y, resident, PD_POOL, s.slot_cooldown.size());
         if (s.cursor_valid)
-            ImGui::Text("Cursor: (%.0f, %.0f) -> tile %u cell (%.0f, %.0f)",
-                        s.cursor_wx, s.cursor_wz, s.cursor_tile, s.cursor_gx, s.cursor_gy);
+            ImGui::Text("Cursor: (%.0f, %.0f) -> tile %u cell (%.0f, %.0f)%s",
+                        s.cursor_wx, s.cursor_wz, s.cursor_tile, s.cursor_gx, s.cursor_gy,
+                        (s.tile_slot[s.cursor_tile] == PD_NO_SLOT) ? " [not resident]" : "");
         else
             ImGui::TextDisabled("Cursor off-world");
-        for (uint32_t t = 0; t < PD_TILE_COUNT; ++t) {
-            uint32_t f = s.edge_flags_ui[t];
-            ImGui::Text("Tile %u edges: %s%s%s%s", t,
+        for (uint32_t sl = 0; sl < PD_POOL; ++sl) {
+            uint32_t t = s.slot_tile[sl];
+            if (t == PD_NO_TILE) continue;
+            uint32_t f = s.edge_flags_ui[sl];
+            ImGui::Text("Slot %2u -> tile (%u,%u) edges: %s%s%s%s", sl,
+                        t % PD_TILES_X, t / PD_TILES_X,
                         (f & 1u) ? "L " : "- ", (f & 2u) ? "R " : "- ",
                         (f & 4u) ? "D " : "- ", (f & 8u) ? "U" : "-");
         }
@@ -1363,25 +1628,38 @@ void planet_dev_render(PlanetDevState& s, Renderer& r,
     if (terrain_brushing) {
         float sign = (s.brush_mode == PD_BrushMode::Raise) ? 1.0f : -1.0f;
         float amount = sign * s.ui_terrain_strength * std::min(s.last_dt, 0.033f);
+        float radius_w = static_cast<float>(s.ui_brush_radius) * PD_DX + PD_DX;
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipe_brush.pipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 s.pipe_brush.layout, 0, 1, &s.ds_brush, 0, nullptr);
-        for (uint32_t t = 0; t < PD_TILE_COUNT; ++t) {
+        for (uint32_t t = 0; t < PD_TILE_TOTAL; ++t) {
+            // Tile rect vs brush circle: skip tiles the falloff cannot touch.
+            float ox = pd_tile_origin_x(t), oz = pd_tile_origin_z(t);
+            float nx = std::clamp(s.cursor_wx, ox, ox + PD_TILE_SIZE);
+            float nz = std::clamp(s.cursor_wz, oz, oz + PD_TILE_SIZE);
+            float ddx = s.cursor_wx - nx, ddz = s.cursor_wz - nz;
+            if (ddx * ddx + ddz * ddz > radius_w * radius_w) continue;
+
             PD_BrushPC bpc{};
-            bpc.brush_x      = (s.cursor_wx - pd_tile_origin_x(t)) / PD_DX;
-            bpc.brush_y      = (s.cursor_wz - pd_tile_origin_z(t)) / PD_DX;
+            bpc.brush_x      = (s.cursor_wx - ox) / PD_DX;
+            bpc.brush_y      = (s.cursor_wz - oz) / PD_DX;
             bpc.brush_radius = static_cast<float>(s.ui_brush_radius);
             bpc.brush_amount = amount;
             bpc.grid_w       = PD_GRID;
             bpc.grid_h       = PD_GRID;
-            bpc.layer        = t;
+
+            // CPU mirror for EVERY touched world tile (edits to streamed-out
+            // neighbors persist and upload when the tile activates) ...
+            cpu_apply_brush(s.hm_cpu[t], PD_GRID, PD_GRID,
+                            bpc.brush_x, bpc.brush_y, bpc.brush_radius, bpc.brush_amount);
+
+            // ... GPU dispatch only where a slot is resident.
+            if (s.tile_slot[t] == PD_NO_SLOT) continue;
+            bpc.layer = s.tile_slot[t];
             vkCmdPushConstants(cmd, s.pipe_brush.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(bpc), &bpc);
             vkCmdDispatch(cmd, (PD_GRID + 15) / 16, (PD_GRID + 15) / 16, 1);
-
-            cpu_apply_brush(s.hm_cpu[t], PD_GRID, PD_GRID,
-                            bpc.brush_x, bpc.brush_y, bpc.brush_radius, bpc.brush_amount);
         }
         compute_memory_barrier(cmd);
     }
@@ -1411,9 +1689,11 @@ void planet_dev_render(PlanetDevState& s, Renderer& r,
                                     s.pipe_swe_step.layout, 0, 1, &s.ds_step[cur], 0, nullptr);
 
             // Tiles within a substep are independent (they read the previous
-            // substep's state, including neighbors'), so: dispatch all 4, then
-            // one barrier before the next substep.
-            for (uint32_t t = 0; t < PD_TILE_COUNT; ++t) {
+            // substep's state, including neighbors'), so: dispatch every
+            // resident slot, then one barrier before the next substep.
+            for (uint32_t slot = 0; slot < PD_POOL; ++slot) {
+                uint32_t t = s.slot_tile[slot];
+                if (t == PD_NO_TILE) continue;
                 PlanetSweStepPC pc{};
                 pc.time       = s.accumulated_time;
                 pc.dt         = s.ui_swe_dt;
@@ -1422,7 +1702,7 @@ void planet_dev_render(PlanetDevState& s, Renderer& r,
                 pc.dx         = PD_DX;
                 pc.sea_level  = -10000.0f;     // static water off (world_lab convention)
                 pc.damping    = s.ui_damping;
-                pc.pool_index = t;
+                pc.pool_index = slot;
                 pc.grid_w     = PD_GRID;
                 pc.grid_h     = PD_GRID;
                 // Water brush: same world-space treatment as the terrain brush
@@ -1434,10 +1714,19 @@ void planet_dev_render(PlanetDevState& s, Renderer& r,
                     pc.pulse_radius = static_cast<float>(s.ui_brush_radius);
                     pc.pulse_amount = s.ui_brush_strength * s.ui_swe_dt;
                 }
-                pc.neighbor_left  = PD_NEIGHBORS[t][0];
-                pc.neighbor_right = PD_NEIGHBORS[t][1];
-                pc.neighbor_down  = PD_NEIGHBORS[t][2];
-                pc.neighbor_up    = PD_NEIGHBORS[t][3];
+                // Neighbor slots resolved through the streaming map; a
+                // non-resident neighbor is a reflective wall — its edge flag
+                // fires and pd_update_streaming anchors it next frame.
+                auto nb_slot = [&](int dir) -> uint32_t {
+                    uint32_t nb = pd_neighbor_tile(t, dir);
+                    if (nb == PD_NO_TILE) return PD_NO_NEIGHBOR;
+                    uint32_t ns = s.tile_slot[nb];
+                    return (ns == PD_NO_SLOT) ? PD_NO_NEIGHBOR : ns;
+                };
+                pc.neighbor_left  = nb_slot(0);
+                pc.neighbor_right = nb_slot(1);
+                pc.neighbor_down  = nb_slot(2);
+                pc.neighbor_up    = nb_slot(3);
 
                 vkCmdPushConstants(cmd, s.pipe_swe_step.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                    0, sizeof(pc), &pc);
@@ -1528,7 +1817,9 @@ void planet_dev_render(PlanetDevState& s, Renderer& r,
     vkCmdBindVertexBuffers(cmd, 0, 1, &s.terrain_mesh.vbo.buffer, &zero);
     vkCmdBindIndexBuffer(cmd, s.terrain_mesh.ibo.buffer, 0, VK_INDEX_TYPE_UINT32);
 
-    for (uint32_t t = 0; t < PD_TILE_COUNT; ++t) {
+    for (uint32_t slot = 0; slot < PD_POOL; ++slot) {
+        uint32_t t = s.slot_tile[slot];
+        if (t == PD_NO_TILE) continue;
         PlanetDevTerrainPC tpc{};
         tpc.mvp           = mvp;
         tpc.grid_w_f      = static_cast<float>(PD_GRID);
@@ -1542,7 +1833,7 @@ void planet_dev_render(PlanetDevState& s, Renderer& r,
         tpc.moisture_overlay = s.ui_show_moisture ? 1.0f : 0.0f;
         tpc.tile_origin_x = pd_tile_origin_x(t);
         tpc.tile_origin_z = pd_tile_origin_z(t);
-        tpc.layer         = static_cast<float>(t);
+        tpc.layer         = static_cast<float>(slot);
         tpc.seam_highlight = s.ui_seam_highlight ? 1.0f : 0.0f;
         vkCmdPushConstants(cmd, s.pipe_terrain.layout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
