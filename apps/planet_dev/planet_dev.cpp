@@ -679,6 +679,21 @@ static void destroy_pd_plant_mesh(VmaAllocator alloc, PD_PlantMesh& m)
     m = {};
 }
 
+// Deferred destruction: park a live buffer until no in-flight frame can still
+// reference it (drained in planet_dev_tick / planet_dev_shutdown).
+static void pd_retire_buffer(PlanetDevState& s, GpuBuffer& b)
+{
+    if (b.buffer) s.retire.emplace_back(b, s.frame_counter);
+    b = {};
+}
+
+static void pd_retire_mesh(PlanetDevState& s, PD_PlantMesh& m)
+{
+    pd_retire_buffer(s, m.vbo);
+    pd_retire_buffer(s, m.ibo);
+    m = {};
+}
+
 static void upload_pd_mesh(VmaAllocator alloc, PD_PlantMesh& dst,
                            const bestiary::VegetationMesh& src)
 {
@@ -788,13 +803,12 @@ static void build_canonical_meshes(PlanetDevState& s, VmaAllocator alloc)
 // ---------------------------------------------------------------------------
 // Plant instance upload (world coords; terrain height routed by tile)
 // ---------------------------------------------------------------------------
-static void upload_plant_instances(PlanetDevState& s, VkDevice device, VmaAllocator alloc)
+static void upload_plant_instances(PlanetDevState& s, VmaAllocator alloc)
 {
     constexpr float plant_lift = 0.01f;
     std::vector<bestiary::PlantGPUInstance> buf;
-    vkDeviceWaitIdle(device);   // world_lab wart, inherited knowingly (0.5 s cadence)
 
-    for (auto& b : s.plant_inst) destroy_buffer(alloc, b);
+    for (auto& b : s.plant_inst) pd_retire_buffer(s, b);
     s.plant_inst.assign(s.plant_roster.size(), GpuBuffer{});
     s.plant_inst_count.assign(s.plant_roster.size(), 0u);
 
@@ -908,7 +922,7 @@ static void run_replant(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
         s.plant_population.insert(s.plant_population.end(), placed.begin(), placed.end());
     }
 
-    upload_plant_instances(s, device, alloc);
+    upload_plant_instances(s, alloc);
     s.veg_rebuild_timer = 0.0f;
 }
 
@@ -1122,6 +1136,14 @@ bool planet_dev_tick(PlanetDevState& s, Renderer& r, const InputFrame& in, float
     float sim_dt = s.ui_paused ? 0.0f : dt;
     s.accumulated_time += sim_dt;
 
+    // ---- Drain the retire queue (buffers no in-flight frame can reference) --
+    ++s.frame_counter;
+    std::erase_if(s.retire, [&](std::pair<GpuBuffer, uint64_t>& e) {
+        if (s.frame_counter <= e.second + FRAMES_IN_FLIGHT) return false;
+        destroy_buffer(alloc, e.first);
+        return true;
+    });
+
     // ---- Camera: orbit + WASD pans the target across the world --------------
     update_orbit(s.camera, in, 900.0f);
     s.camera.distance = std::max(s.camera.distance, 20.0f);
@@ -1181,7 +1203,7 @@ bool planet_dev_tick(PlanetDevState& s, Renderer& r, const InputFrame& in, float
         s.veg_rebuild_timer += sim_dt;
         if (s.veg_rebuild_timer >= 0.5f) {
             s.veg_rebuild_timer = 0.0f;
-            upload_plant_instances(s, device, alloc);
+            upload_plant_instances(s, alloc);
         }
 
         s.auto_replant_timer += sim_dt;
@@ -1241,8 +1263,7 @@ bool planet_dev_tick(PlanetDevState& s, Renderer& r, const InputFrame& in, float
             s.agents, s.creature_profiles,
             [&s](float x, float z) { return pd_terrain_height_world(s, x, z); }, dt);
 
-        vkDeviceWaitIdle(device);   // world_lab wart, inherited knowingly
-        destroy_pd_plant_mesh(alloc, s.creature_mesh_gpu);
+        pd_retire_mesh(s, s.creature_mesh_gpu);
         if (!cm.vertices.empty())
             upload_pd_mesh(alloc, s.creature_mesh_gpu, cm);
     }
@@ -1595,6 +1616,8 @@ void planet_dev_shutdown(PlanetDevState& s, Renderer& r)
 
     vkDeviceWaitIdle(device);
 
+    for (auto& [b, f] : s.retire) destroy_buffer(alloc, b);
+    s.retire.clear();
     for (auto& m : s.plant_canonical) destroy_pd_plant_mesh(alloc, m);
     for (auto& b : s.plant_inst)      destroy_buffer(alloc, b);
     s.plant_canonical.clear();

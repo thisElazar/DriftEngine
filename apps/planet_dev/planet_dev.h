@@ -29,6 +29,9 @@
 #include "creature/creature_profile.h"
 #include "creature/creature_mesh.h"
 
+#include <utility>
+#include <vector>
+
 // ---------------------------------------------------------------------------
 // World layout: 2x2 tiles, 256 m each, world spans [-256, +256]^2.
 // Tile index t = ty*2 + tx (t0 = -x/-z, t1 = +x/-z, t2 = -x/+z, t3 = +x/+z).
@@ -242,6 +245,13 @@ struct PlanetDevState {
     bool  ui_seam_highlight = true;
     int   replant_pending   = 0;
     uint32_t edge_flags_ui[PD_TILE_COUNT]{};   // latched before the frame clears them
+
+    // --- Deferred buffer destruction (Globe veg retire-queue pattern) ---
+    // Buffers replaced mid-flight (creature mesh, plant instances) are parked
+    // here with the frame they were retired on and destroyed once no in-flight
+    // frame can still reference them — no vkDeviceWaitIdle needed.
+    std::vector<std::pair<GpuBuffer, uint64_t>> retire;
+    uint64_t frame_counter = 0;
 
     // --- Frame state ---
     int   swe_ping_pong       = 0;
