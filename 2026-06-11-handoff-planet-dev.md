@@ -1,9 +1,10 @@
 # Handoff: PLANET (DEV) — multi-tile world sandbox
 
-Status as of 2026-06-11 (evening), branch `globe-water-field`, HEAD `e999761`.
+Status as of 2026-06-11 (night), branch `globe-water-field`, HEAD `5b92efb`.
 Commits: `dbfaf34` (module) → `3b3a4dd` (creatures + moisture) → `6861a46`
 (brush modes) → `5486c1e` (CONFIGURE_DEPENDS build fix) → `eccfb68` (retire
-queue kills per-frame waitIdle) → `e999761` (8x8 world, 16-slot streaming).
+queue kills per-frame waitIdle) → `e999761` (8x8 world, 16-slot streaming)
+→ `5b92efb` (hitch-free streaming + far-field backdrop).
 
 ## What this module is, and why it exists
 
@@ -37,6 +38,22 @@ streamed-out tiles upload on activation) and water depth saves to the
 persistent `water_world` grid on deactivate / restores on activate
 (velocity dropped — pooled water is near-static). Edge-flagged tiles never
 deactivate, so flowing water pins its tiles.
+
+**Streaming is hitch-free and the world never visually disappears
+(`5b92efb`).** Activation GPU work is staged into `s.pending_uploads` and
+recorded into the FRAME command buffer (planet_dev_render, top) — zero
+oneshot fence waits; staging buffers ride the retire queue. Plant placement
+(~350-390 ms of poisson fill per tile, the dominant cost) runs on worker
+threads (`pd_queue_tile_plants` / `pd_poll_placement_jobs`) against
+snapshots of the tile's moisture + heights; jobs whose tile streamed back
+out are dropped. Distance activations are capped at 1/tick. refresh_env's
+readbacks are batched into ONE submit (`pd_readback_depths`). And the
+**far field**: array layer `PD_FAR_LAYER` holds an 8 m/cell heightmap of
+the whole world, rebuilt from the CPU mirrors when stale (brush beyond the
+frontier, deactivations); every non-resident tile draws a 32-cell mesh
+sampling its sub-rect via the `uv_off/uv_scale` push constants. Beyond the
+simulation frontier the world keeps its terrain and just loses water /
+plants / detail — the same shape the sphere's LOD stream takes.
 
 ## The architectural core (read this before changing anything)
 
@@ -104,22 +121,21 @@ moisture overlay continuity.
 1. ~~Per-frame `vkDeviceWaitIdle`~~ FIXED (`eccfb68`): retire queue
    (`s.retire` + `frame_counter`), drained in tick, destroys buffers
    FRAMES_IN_FLIGHT frames after replacement.
-2. **Blocking readbacks**: `refresh_env` does one oneshot
-   `readback_water_depth` PER RESIDENT SLOT every 8 s (now up to 16, was
-   4 — the hitch grew). Batch into one oneshot over all resident layers,
-   or go async: copy-to-buffer in the frame command buffer +
-   fence-deferred CPU read. Deactivation also does one blocking readback
-   (rare, fine).
+2. **Blocking readbacks**: mostly fixed (`5b92efb`) — refresh_env now does
+   ONE batched submit for all resident layers (`pd_readback_depths`)
+   every 8 s, and moisture re-upload rides the frame command buffer.
+   Still blocking: that one submit + the bbox moisture blur (~tens of
+   ms), and deactivation's single-tile readback. Fully-async candidate:
+   copy-to-buffer in the frame command buffer + fence-deferred CPU read.
 3. **Half-texel height step at seam lines** (per-tile edge texels under
    linear clamp). Cosmetic; visible only with seam highlight off and low
    sun. Fix: 1-texel border duplication or shared edge rows.
 4. **Brush pulse vs. solver**: water brush amount is per-substep
    (`strength × swe_dt`), so perceived pour rate scales with substeps.
-5. **Activation hitch** (new): `pd_activate_tile` is synchronous —
-   2–3 oneshot uploads + poisson plant placement on the tick. Small for
-   dry tiles; moist tiles cost more (placement density scales with
-   moisture). If it bothers, stage activations over frames or move
-   placement off-thread.
+5. ~~Activation hitch~~ FIXED (`5b92efb`): GPU work staged into the frame
+   command buffer (~1 ms), plant placement async on worker threads.
+   Remaining blocking work: deactivation's single-tile readback (~ms,
+   rare) and refresh_env's one batched readback + bbox blur every 8 s.
 6. **Plant health resets on stream-out** (new, deliberate): placement is
    deterministic per tile (seed = eco.seed + t*7919) so the layout
    returns, but growth/decay history doesn't. Creatures roam the whole
