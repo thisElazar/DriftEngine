@@ -96,7 +96,10 @@ field, plus an inner ring that is actually alive."
 
 ## Status
 
-- [ ] M1a biome terrain (in progress, started 2026-06-12)
+- [x] M1a biome terrain (`a3a3a79`, 2026-06-12) — shared climate fn
+      (planet_climate.hlsli) drives both generator character and surface
+      palette; needs a visual pass from low orbit / ground
+- [ ] M1a follow-ups: mesa/badlands terracing, palette tuning per seed
 - [ ] M1b atmosphere/tonemap
 - [ ] M1c palettes
 - [ ] M1d impostors
