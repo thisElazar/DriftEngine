@@ -31,6 +31,7 @@
 #include "creature/creature_profile.h"
 #include "creature/creature_mesh.h"
 
+#include <future>
 #include <utility>
 #include <vector>
 
@@ -50,6 +51,17 @@ constexpr uint32_t PD_TILE_TOTAL = PD_TILES_X * PD_TILES_Y;       // world tiles
 constexpr uint32_t PD_POOL       = 16;                            // resident GPU slots
 constexpr float    PD_TILE_SIZE  = PD_GRID * PD_DX;               // 256 m
 constexpr float    PD_WORLD_HALF = 0.5f * PD_TILES_X * PD_TILE_SIZE;  // +-1024 m
+
+// The far field: one extra array layer holding a low-res heightmap of the
+// WHOLE world, drawn for every non-resident tile so terrain never visually
+// disappears — beyond the simulation frontier the world just loses water /
+// plants / detail (the open-world model; on the sphere this is the LOD
+// stream). 256 texels over 2048 m = 8 m cells; a far tile draw is a 32-cell
+// mesh sampling its 1/8 x 1/8 sub-rect of the far layer.
+constexpr uint32_t PD_LAYERS        = PD_POOL + 1;   // pool slots + far layer
+constexpr uint32_t PD_FAR_LAYER     = PD_POOL;
+constexpr float    PD_FAR_CELL      = PD_TILE_SIZE * PD_TILES_X / PD_GRID;  // 8 m
+constexpr uint32_t PD_FAR_TILE_GRID = PD_GRID / 8;   // far mesh cells per tile
 
 constexpr uint32_t PD_NO_NEIGHBOR = 0xFFFFFFFFu;   // SWE shader: reflective wall
 constexpr uint32_t PD_NO_SLOT     = 0xFFFFFFFFu;   // tile not GPU-resident
@@ -97,9 +109,11 @@ struct PlanetDevTerrainPC {
     float     moisture_overlay;
     float     tile_origin_x;    // world-space tile corner
     float     tile_origin_z;
-    float     layer;            // texture array layer (= tile index)
+    float     layer;            // texture array layer (pool slot or far layer)
     float     seam_highlight;
-    float     _pad0, _pad1, _pad2;
+    float     uv_off_x;         // sub-rect of the layer this draw samples:
+    float     uv_off_y;         //   uv' = mesh_uv * uv_scale + uv_off
+    float     uv_scale;         // 1/offset 0 for pool slots; 1/8 for far tiles
 };
 static_assert(sizeof(PlanetDevTerrainPC) == 128, "terrain PC must fit min push range");
 
@@ -147,6 +161,18 @@ struct PD_PlantMesh {
     uint32_t  index_count = 0;
 };
 
+// Streaming GPU work staged by tick, recorded into the FRAME command buffer
+// by render (no oneshot fence waits — staging buffers ride the retire queue).
+// `layer` is the array layer (a pool slot, or PD_FAR_LAYER for terrain-only
+// far-field rebuilds). Any null buffer is skipped.
+struct PD_PendingUpload {
+    uint32_t  layer = 0;
+    bool      clear_state = false;   // clear SWE A/B/output layers (activation)
+    GpuBuffer terrain{};             // R32F heightmap
+    GpuBuffer water{};               // RGBA16F depth restore (h in r, rest 0)
+    GpuBuffer moisture{};            // R32F moisture slice
+};
+
 // ---------------------------------------------------------------------------
 // All module state
 // ---------------------------------------------------------------------------
@@ -185,6 +211,20 @@ struct PlanetDevState {
     // frame can sample a layer while its new tenant uploads.
     std::vector<std::pair<uint32_t, uint64_t>> slot_cooldown;
     float ui_stream_radius = 400.0f;     // activation distance from camera target
+    std::vector<PD_PendingUpload> pending_uploads;
+    bool  far_dirty = false;             // far layer stale (brush/deactivation)
+    float far_rebuild_timer = 0.0f;
+
+    // Plant placement runs on worker threads against a SNAPSHOT of the tile's
+    // environment (placement is ~350 ms of poisson fill — way too slow for the
+    // frame loop). Results land in the population when the future completes;
+    // a job whose tile streamed back out is dropped.
+    struct PlacementJob {
+        uint32_t tile;
+        double   queued_at;
+        std::future<std::vector<bestiary::PlantInstance>> fut;
+    };
+    std::vector<PlacementJob> placement_jobs;
 
     // --- Sampler ---
     VkSampler sampler = VK_NULL_HANDLE;
@@ -201,8 +241,9 @@ struct PlanetDevState {
     VkDescriptorSet  ds_brush = VK_NULL_HANDLE;
     VkDescriptorSet  ds_terrain = VK_NULL_HANDLE;
 
-    // --- Terrain mesh (shared by all 4 tile draws) ---
+    // --- Terrain meshes (full-res shared by resident draws; low-res far) ---
     StaticGridMesh terrain_mesh{};
+    StaticGridMesh far_mesh{};
 
     // --- Camera ---
     OrbitCamera camera{};

@@ -22,6 +22,7 @@
 #include "species_file.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -83,7 +84,7 @@ static PD_ArrayImage create_array_image(VkDevice device, VmaAllocator alloc,
     ci.format = format;
     ci.extent = {PD_GRID, PD_GRID, 1};
     ci.mipLevels = 1;
-    ci.arrayLayers = PD_POOL;
+    ci.arrayLayers = PD_LAYERS;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = usage;
@@ -101,7 +102,7 @@ static PD_ArrayImage create_array_image(VkDevice device, VmaAllocator alloc,
     vci.image = img.image;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     vci.format = format;
-    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PD_POOL};
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PD_LAYERS};
     VK_CHECK(vkCreateImageView(device, &vci, nullptr, &img.view));
     return img;
 }
@@ -156,6 +157,17 @@ static void write_buffer(VkDevice device, VkDescriptorSet set, uint32_t binding,
     w.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     w.pBufferInfo     = &info;
     vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
+}
+
+// Fill a TRANSFER_SRC host buffer (the pending-upload staging path).
+static GpuBuffer pd_make_staging(VmaAllocator alloc, const void* data, VkDeviceSize bytes)
+{
+    GpuBuffer b = create_host_buffer(alloc, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    void* mapped = nullptr;
+    VK_CHECK(vmaMapMemory(alloc, b.allocation, &mapped));
+    std::memcpy(mapped, data, bytes);
+    vmaUnmapMemory(alloc, b.allocation);
+    return b;
 }
 
 static void compute_to_graphics_barrier(VkCommandBuffer cmd)
@@ -853,6 +865,51 @@ static size_t pd_world_cell(float wx, float wz)
     return static_cast<size_t>(wj) * PD_WORLD_GRID + wi;
 }
 
+// Read back the depth (r channel) of MANY state layers in one submit — the
+// per-slot oneshot loop was one fence wait per resident tile, every 8 s.
+static std::vector<float> pd_readback_depths(VkDevice device, VmaAllocator alloc,
+                                             VkQueue queue, uint32_t family,
+                                             VkImage state_img,
+                                             const std::vector<uint32_t>& layers)
+{
+    VkDeviceSize per = VkDeviceSize{PD_GRID} * PD_GRID * 8;   // RGBA16F
+    GpuBuffer staging = create_readback_buffer(alloc, per * layers.size());
+
+    OneShot os = oneshot_begin(device, queue, family);
+    image_barrier(os.cmd, state_img,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                  VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  0, PD_LAYERS);
+    for (size_t i = 0; i < layers.size(); ++i) {
+        VkBufferImageCopy copy{};
+        copy.bufferOffset     = per * i;
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layers[i], 1};
+        copy.imageExtent      = {PD_GRID, PD_GRID, 1};
+        vkCmdCopyImageToBuffer(os.cmd, state_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               staging.buffer, 1, &copy);
+    }
+    image_barrier(os.cmd, state_img,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                  0, PD_LAYERS);
+    oneshot_end(os);
+
+    VmaAllocationInfo ai{};
+    vmaGetAllocationInfo(alloc, staging.allocation, &ai);
+    auto* hp = static_cast<const uint16_t*>(ai.pMappedData);
+
+    std::vector<float> depths(static_cast<size_t>(PD_GRID) * PD_GRID * layers.size());
+    for (size_t i = 0; i < depths.size(); ++i)
+        depths[i] = half_to_float(hp[i * 4 + 0]);
+
+    destroy_buffer(alloc, staging);
+    return depths;
+}
+
 static void refresh_env(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
                         VkQueue gqueue, uint32_t gfamily)
 {
@@ -860,22 +917,27 @@ static void refresh_env(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
 
     // Refresh resident regions of the world water grid; track their tile bbox.
     uint32_t bb_min_x = PD_TILES_X, bb_max_x = 0, bb_min_y = PD_TILES_Y, bb_max_y = 0;
-    bool any_resident = false;
-    for (uint32_t slot = 0; slot < PD_POOL; ++slot) {
-        uint32_t t = s.slot_tile[slot];
-        if (t == PD_NO_TILE) continue;
-        any_resident = true;
-        std::vector<float> tile = readback_water_depth(device, alloc, gqueue, gfamily,
-                                                       fresh, PD_GRID, PD_GRID, slot);
-        uint32_t tx = t % PD_TILES_X, ty = t / PD_TILES_X;
-        bb_min_x = std::min(bb_min_x, tx); bb_max_x = std::max(bb_max_x, tx);
-        bb_min_y = std::min(bb_min_y, ty); bb_max_y = std::max(bb_max_y, ty);
-        size_t oxg = static_cast<size_t>(tx) * PD_GRID;
-        size_t ozg = static_cast<size_t>(ty) * PD_GRID;
-        for (uint32_t j = 0; j < PD_GRID; ++j)
-            std::memcpy(&s.water_world[(ozg + j) * PD_WORLD_GRID + oxg],
-                        &tile[static_cast<size_t>(j) * PD_GRID],
-                        PD_GRID * sizeof(float));
+    std::vector<uint32_t> res_slots;
+    for (uint32_t slot = 0; slot < PD_POOL; ++slot)
+        if (s.slot_tile[slot] != PD_NO_TILE) res_slots.push_back(slot);
+    bool any_resident = !res_slots.empty();
+
+    if (any_resident) {
+        std::vector<float> depths = pd_readback_depths(device, alloc, gqueue, gfamily,
+                                                       fresh, res_slots);
+        for (size_t i = 0; i < res_slots.size(); ++i) {
+            uint32_t t = s.slot_tile[res_slots[i]];
+            uint32_t tx = t % PD_TILES_X, ty = t / PD_TILES_X;
+            bb_min_x = std::min(bb_min_x, tx); bb_max_x = std::max(bb_max_x, tx);
+            bb_min_y = std::min(bb_min_y, ty); bb_max_y = std::max(bb_max_y, ty);
+            size_t oxg = static_cast<size_t>(tx) * PD_GRID;
+            size_t ozg = static_cast<size_t>(ty) * PD_GRID;
+            const float* tile = &depths[static_cast<size_t>(i) * PD_GRID * PD_GRID];
+            for (uint32_t j = 0; j < PD_GRID; ++j)
+                std::memcpy(&s.water_world[(ozg + j) * PD_WORLD_GRID + oxg],
+                            &tile[static_cast<size_t>(j) * PD_GRID],
+                            PD_GRID * sizeof(float));
+        }
     }
 
     // Capillary blur over the resident bounding box only — at this scale a
@@ -897,7 +959,8 @@ static void refresh_env(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
                         bw * sizeof(float));
     }
 
-    // Slice the moisture grid back per resident slot for the GPU overlay.
+    // Slice the moisture grid back per resident slot for the GPU overlay,
+    // staged into the frame command buffer (was one oneshot per slot).
     s.moisture_slice.resize(static_cast<size_t>(PD_GRID) * PD_GRID);
     for (uint32_t slot = 0; slot < PD_POOL; ++slot) {
         uint32_t t = s.slot_tile[slot];
@@ -908,8 +971,11 @@ static void refresh_env(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
             std::memcpy(&s.moisture_slice[static_cast<size_t>(j) * PD_GRID],
                         &s.moisture_world[(ozg + j) * PD_WORLD_GRID + oxg],
                         PD_GRID * sizeof(float));
-        update_r32_image(device, alloc, gqueue, gfamily,
-                         s.moisture_pool.image, s.moisture_slice, PD_GRID, PD_GRID, slot);
+        PD_PendingUpload up{};
+        up.layer    = slot;
+        up.moisture = pd_make_staging(alloc, s.moisture_slice.data(),
+                                      s.moisture_slice.size() * sizeof(float));
+        s.pending_uploads.push_back(up);
     }
 
     // World-coordinate env field straight off the world grids.
@@ -940,16 +1006,65 @@ static bestiary::EnvironmentField tile_env(const PlanetDevState& s, uint32_t t)
 
 // Deterministic per-tile plant placement (same seed -> same layout when a
 // tile streams back in; health history is lost, accepted for the sandbox).
-static void pd_place_tile_plants(PlanetDevState& s, uint32_t t)
+// Placement is a ~350 ms poisson fill, so it runs on a worker thread against
+// SNAPSHOTS of the tile's moisture and heights (the live grids are mutated by
+// refresh_env / the brush on the main thread). Coordinates stay tile-local
+// centered (place_ecosystem's convention); tick adds the tile center back
+// when the job completes.
+static void pd_queue_tile_plants(PlanetDevState& s, uint32_t t)
 {
+    for (const auto& j : s.placement_jobs)
+        if (j.tile == t) return;   // already in flight (same seed, same result)
+
     bestiary::EcosystemParams eco = s.eco_params;
     eco.region_size = PD_TILE_SIZE;
     eco.seed = s.eco_params.seed + t * 7919u;
-    auto placed = bestiary::place_ecosystem(s.plant_roster, eco, tile_env(s, t));
-    float cx = pd_tile_origin_x(t) + PD_TILE_SIZE * 0.5f;
-    float cz = pd_tile_origin_z(t) + PD_TILE_SIZE * 0.5f;
-    for (auto& p : placed) { p.x += cx; p.z += cz; }
-    s.plant_population.insert(s.plant_population.end(), placed.begin(), placed.end());
+
+    size_t oxg = (t % PD_TILES_X) * static_cast<size_t>(PD_GRID);
+    size_t ozg = (t / PD_TILES_X) * static_cast<size_t>(PD_GRID);
+    auto moisture = std::make_shared<std::vector<float>>(static_cast<size_t>(PD_GRID) * PD_GRID);
+    for (uint32_t j = 0; j < PD_GRID; ++j)
+        std::memcpy(&(*moisture)[static_cast<size_t>(j) * PD_GRID],
+                    &s.moisture_world[(ozg + j) * PD_WORLD_GRID + oxg],
+                    PD_GRID * sizeof(float));
+    auto heights = std::make_shared<std::vector<float>>(s.hm_cpu[t]);
+    auto roster  = std::make_shared<std::vector<bestiary::PlantSpecies>>(s.plant_roster);
+
+    PlanetDevState::PlacementJob job;
+    job.tile      = t;
+    job.queued_at = glfwGetTime();
+    job.fut = std::async(std::launch::async, [eco, moisture, heights, roster]() {
+        bestiary::EnvironmentField env;
+        env.sample = [&moisture, &heights](float x, float z) -> bestiary::EnvironmentSample {
+            int ix = std::clamp(static_cast<int>(x + PD_TILE_SIZE * 0.5f), 0, static_cast<int>(PD_GRID) - 1);
+            int iz = std::clamp(static_cast<int>(z + PD_TILE_SIZE * 0.5f), 0, static_cast<int>(PD_GRID) - 1);
+            size_t c = static_cast<size_t>(iz) * PD_GRID + ix;
+            float h = (*heights)[c];
+            return {(*moisture)[c], std::clamp(0.5f + 0.05f * h, 0.0f, 1.0f)};
+        };
+        return bestiary::place_ecosystem(*roster, eco, env);
+    });
+    s.placement_jobs.push_back(std::move(job));
+}
+
+// Consume completed placement jobs (called once per tick).
+static void pd_poll_placement_jobs(PlanetDevState& s)
+{
+    std::erase_if(s.placement_jobs, [&](PlanetDevState::PlacementJob& j) {
+        if (j.fut.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+            return false;
+        std::vector<bestiary::PlantInstance> placed = j.fut.get();
+        if (s.tile_slot[j.tile] != PD_NO_SLOT) {   // dropped if streamed back out
+            float cx = pd_tile_origin_x(j.tile) + PD_TILE_SIZE * 0.5f;
+            float cz = pd_tile_origin_z(j.tile) + PD_TILE_SIZE * 0.5f;
+            for (auto& p : placed) { p.x += cx; p.z += cz; }
+            s.plant_population.insert(s.plant_population.end(), placed.begin(), placed.end());
+            std::fprintf(stderr, "[planet_dev] tile (%u,%u) plants ready: %zu in %.0f ms\n",
+                         j.tile % PD_TILES_X, j.tile / PD_TILES_X, placed.size(),
+                         (glfwGetTime() - j.queued_at) * 1000.0);
+        }
+        return true;
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -973,19 +1088,23 @@ static uint16_t pd_float_to_half(float f)
     return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | (mant >> 13));
 }
 
-static void pd_activate_tile(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
-                             VkQueue gqueue, uint32_t gfamily, uint32_t t)
+// All GPU work is STAGED into s.pending_uploads and recorded into the frame
+// command buffer by render — no oneshot fence waits. The remaining
+// synchronous cost is plant placement, logged per activation.
+static void pd_activate_tile(PlanetDevState& s, VmaAllocator alloc, uint32_t t)
 {
     if (s.tile_slot[t] != PD_NO_SLOT || s.free_slots.empty()) return;
+    double t0 = glfwGetTime();
     uint32_t slot = s.free_slots.back();
     s.free_slots.pop_back();
     s.tile_slot[t]    = slot;
     s.slot_tile[slot] = t;
-    std::fprintf(stderr, "[planet_dev] tile (%u,%u) -> slot %u\n",
-                 t % PD_TILES_X, t / PD_TILES_X, slot);
 
-    update_r32_image(device, alloc, gqueue, gfamily,
-                     s.terrain_pool.image, s.hm_cpu[t], PD_GRID, PD_GRID, slot);
+    PD_PendingUpload up{};
+    up.layer       = slot;
+    up.clear_state = true;
+    up.terrain = pd_make_staging(alloc, s.hm_cpu[t].data(),
+                                 VkDeviceSize{PD_GRID} * PD_GRID * sizeof(float));
 
     // Saved water depth for this tile's region (if the tile was flooded when
     // it streamed out, or refresh_env last saw water here).
@@ -996,58 +1115,14 @@ static void pd_activate_tile(PlanetDevState& s, VkDevice device, VmaAllocator al
         for (uint32_t i = 0; i < PD_GRID; ++i)
             if (s.water_world[(ozg + j) * PD_WORLD_GRID + oxg + i] > 1e-4f) { has_water = true; break; }
 
-    GpuBuffer staging{};
     if (has_water) {
-        VkDeviceSize bytes = VkDeviceSize{PD_GRID} * PD_GRID * 4 * sizeof(uint16_t);
-        staging = create_host_buffer(alloc, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        void* mapped = nullptr;
-        VK_CHECK(vmaMapMemory(alloc, staging.allocation, &mapped));
-        auto* hp = static_cast<uint16_t*>(mapped);
+        std::vector<uint16_t> halves(static_cast<size_t>(PD_GRID) * PD_GRID * 4, 0);
         for (uint32_t j = 0; j < PD_GRID; ++j)
-            for (uint32_t i = 0; i < PD_GRID; ++i) {
-                size_t c = (static_cast<size_t>(j) * PD_GRID + i) * 4;
-                hp[c + 0] = pd_float_to_half(s.water_world[(ozg + j) * PD_WORLD_GRID + oxg + i]);
-                hp[c + 1] = 0; hp[c + 2] = 0; hp[c + 3] = 0;
-            }
-        vmaUnmapMemory(alloc, staging.allocation);
+            for (uint32_t i = 0; i < PD_GRID; ++i)
+                halves[(static_cast<size_t>(j) * PD_GRID + i) * 4] =
+                    pd_float_to_half(s.water_world[(ozg + j) * PD_WORLD_GRID + oxg + i]);
+        up.water = pd_make_staging(alloc, halves.data(), halves.size() * sizeof(uint16_t));
     }
-
-    {
-        OneShot os = oneshot_begin(device, gqueue, gfamily);
-        VkImage imgs[] = {s.swe_state_a.image, s.swe_state_b.image, s.swe_output.image};
-        for (VkImage img : imgs)
-            image_barrier(os.cmd, img,
-                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                          VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-                          VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                          VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                          slot, 1);
-        VkClearColorValue clr{};
-        VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, slot, 1};
-        for (VkImage img : imgs)
-            vkCmdClearColorImage(os.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clr, 1, &rng);
-        if (has_water) {
-            // Restore depth into the current READ state (next substep reads it)
-            // and the render output (so it shows even while paused).
-            VkImage cur_read = (s.swe_ping_pong & 1) ? s.swe_state_b.image : s.swe_state_a.image;
-            VkBufferImageCopy copy{};
-            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, slot, 1};
-            copy.imageExtent      = {PD_GRID, PD_GRID, 1};
-            vkCmdCopyBufferToImage(os.cmd, staging.buffer, cur_read,
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-            vkCmdCopyBufferToImage(os.cmd, staging.buffer, s.swe_output.image,
-                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        }
-        for (VkImage img : imgs)
-            image_barrier(os.cmd, img,
-                          VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                          VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                          slot, 1);
-        oneshot_end(os);
-    }
-    if (staging.buffer) destroy_buffer(alloc, staging);
 
     // Moisture overlay slice for the slot (stale-or-zero until next refresh).
     s.moisture_slice.resize(static_cast<size_t>(PD_GRID) * PD_GRID);
@@ -1055,10 +1130,13 @@ static void pd_activate_tile(PlanetDevState& s, VkDevice device, VmaAllocator al
         std::memcpy(&s.moisture_slice[static_cast<size_t>(j) * PD_GRID],
                     &s.moisture_world[(ozg + j) * PD_WORLD_GRID + oxg],
                     PD_GRID * sizeof(float));
-    update_r32_image(device, alloc, gqueue, gfamily,
-                     s.moisture_pool.image, s.moisture_slice, PD_GRID, PD_GRID, slot);
+    up.moisture = pd_make_staging(alloc, s.moisture_slice.data(),
+                                  s.moisture_slice.size() * sizeof(float));
+    s.pending_uploads.push_back(up);
 
-    pd_place_tile_plants(s, t);
+    pd_queue_tile_plants(s, t);
+    std::fprintf(stderr, "[planet_dev] tile (%u,%u) -> slot %u (staged %.1f ms)\n",
+                 t % PD_TILES_X, t / PD_TILES_X, slot, (glfwGetTime() - t0) * 1000.0);
 }
 
 static void pd_deactivate_tile(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
@@ -1086,8 +1164,31 @@ static void pd_deactivate_tile(PlanetDevState& s, VkDevice device, VmaAllocator 
     s.slot_tile[slot] = PD_NO_TILE;
     s.edge_flags_ui[slot] = 0;
     s.slot_cooldown.emplace_back(slot, s.frame_counter);
+    s.far_dirty = true;   // far field shows this tile again; pick up its edits
     std::fprintf(stderr, "[planet_dev] tile (%u,%u) freed slot %u\n",
                  t % PD_TILES_X, t / PD_TILES_X, slot);
+}
+
+// Rebuild the whole-world low-res far layer from the CPU heightmaps and
+// stage it for upload (64 tiles x 32x32 samples — fast).
+static void pd_rebuild_far_field(PlanetDevState& s, VmaAllocator alloc)
+{
+    std::vector<float> far_hm(static_cast<size_t>(PD_GRID) * PD_GRID);
+    for (uint32_t j = 0; j < PD_GRID; ++j)
+        for (uint32_t i = 0; i < PD_GRID; ++i) {
+            float wx = -PD_WORLD_HALF + (i + 0.5f) * PD_FAR_CELL;
+            float wz = -PD_WORLD_HALF + (j + 0.5f) * PD_FAR_CELL;
+            uint32_t t = pd_tile_of(wx, wz);
+            far_hm[static_cast<size_t>(j) * PD_GRID + i] =
+                sample_hm_bilinear(s.hm_cpu[t], PD_GRID, PD_GRID,
+                                   pd_world_to_local_gx(wx, t),
+                                   pd_world_to_local_gy(wz, t));
+        }
+    PD_PendingUpload up{};
+    up.layer   = PD_FAR_LAYER;
+    up.terrain = pd_make_staging(alloc, far_hm.data(), far_hm.size() * sizeof(float));
+    s.pending_uploads.push_back(up);
+    s.far_dirty = false;
 }
 
 // Per-tick streaming policy: recycle cooled-down slots, drop far hydraulically
@@ -1119,7 +1220,7 @@ static void pd_update_streaming(PlanetDevState& s, VkDevice device, VmaAllocator
             pd_deactivate_tile(s, device, alloc, gqueue, gfamily, t);
     }
 
-    // 2. Edge-flag auto-anchor.
+    // 2. Edge-flag auto-anchor (uncapped — water correctness comes first).
     for (uint32_t slot = 0; slot < PD_POOL; ++slot) {
         uint32_t t = s.slot_tile[slot];
         if (t == PD_NO_TILE || s.edge_flags_ui[slot] == 0) continue;
@@ -1128,22 +1229,21 @@ static void pd_update_streaming(PlanetDevState& s, VkDevice device, VmaAllocator
             uint32_t nb = pd_neighbor_tile(t, dir);
             if (nb == PD_NO_TILE || s.tile_slot[nb] != PD_NO_SLOT) continue;
             if (s.free_slots.empty()) return;
-            pd_activate_tile(s, device, alloc, gqueue, gfamily, nb);
+            pd_activate_tile(s, alloc, nb);
         }
     }
 
-    // 3. Activate by camera distance, nearest first.
-    std::vector<std::pair<float, uint32_t>> wanted;
+    // 3. Activate by camera distance, nearest first — at most ONE per tick so
+    //    panning amortizes plant placement instead of hitching on a batch.
+    uint32_t best = PD_NO_TILE;
+    float best_d = 1e9f;
     for (uint32_t t = 0; t < PD_TILE_TOTAL; ++t) {
         if (s.tile_slot[t] != PD_NO_SLOT) continue;
         float d = tile_dist(t);
-        if (d <= s.ui_stream_radius) wanted.emplace_back(d, t);
+        if (d <= s.ui_stream_radius && d < best_d) { best_d = d; best = t; }
     }
-    std::sort(wanted.begin(), wanted.end());
-    for (auto& [d, t] : wanted) {
-        if (s.free_slots.empty()) break;
-        pd_activate_tile(s, device, alloc, gqueue, gfamily, t);
-    }
+    if (best != PD_NO_TILE && !s.free_slots.empty())
+        pd_activate_tile(s, alloc, best);
 }
 
 static void run_replant(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
@@ -1153,7 +1253,7 @@ static void run_replant(PlanetDevState& s, VkDevice device, VmaAllocator alloc,
 
     s.plant_population.clear();
     for (uint32_t t = 0; t < PD_TILE_TOTAL; ++t)
-        if (s.tile_slot[t] != PD_NO_SLOT) pd_place_tile_plants(s, t);
+        if (s.tile_slot[t] != PD_NO_SLOT) pd_queue_tile_plants(s, t);
 
     upload_plant_instances(s, alloc);
     s.veg_rebuild_timer = 0.0f;
@@ -1224,9 +1324,9 @@ void planet_dev_init(PlanetDevState& s, Renderer& r)
                           VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
                           VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                           VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                          0, PD_POOL);
+                          0, PD_LAYERS);
         VkClearColorValue clr{};
-        VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PD_POOL};
+        VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, PD_LAYERS};
         for (VkImage img : clear_imgs)
             vkCmdClearColorImage(os.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clr, 1, &rng);
         for (VkImage img : clear_imgs)
@@ -1235,13 +1335,13 @@ void planet_dev_init(PlanetDevState& s, Renderer& r)
                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                           VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-                          0, PD_POOL);
+                          0, PD_LAYERS);
         // Terrain pool straight to GENERAL; tile activation uploads per layer.
         image_barrier(os.cmd, s.terrain_pool.image,
                       VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                       VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                      0, PD_POOL);
+                      0, PD_LAYERS);
         oneshot_end(os);
     }
 
@@ -1347,6 +1447,8 @@ void planet_dev_init(PlanetDevState& s, Renderer& r)
     write_image(device, s.ds_terrain, 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, s.moisture_pool.view, s.sampler);
 
     s.terrain_mesh = build_grid_mesh(alloc, PD_GRID, PD_GRID);
+    s.far_mesh     = build_grid_mesh(alloc, PD_FAR_TILE_GRID, PD_FAR_TILE_GRID);
+    pd_rebuild_far_field(s, alloc);   // staged; first frame records the upload
 
     // ---- Plants ----------------------------------------------------------------
     s.eco_params.region_size = PD_TILE_SIZE;
@@ -1447,6 +1549,16 @@ bool planet_dev_tick(PlanetDevState& s, Renderer& r, const InputFrame& in, float
 
     // ---- Tile streaming: camera-distance activation + edge-flag anchoring ---
     pd_update_streaming(s, device, alloc, gqueue, gfamily);
+
+    // ---- Far-field rebuild (brush edits beyond the frontier, deactivations) -
+    s.far_rebuild_timer += dt;
+    if (s.far_dirty && !s.brushing && s.far_rebuild_timer >= 0.5f) {
+        s.far_rebuild_timer = 0.0f;
+        pd_rebuild_far_field(s, alloc);
+    }
+
+    // ---- Land completed async plant placements -------------------------------
+    pd_poll_placement_jobs(s);
 
     // ---- Ecosystem cadence (the World Lab loop, on world coords) ------------
     if (sim_dt > 0.0f && !s.plant_roster.empty()) {
@@ -1620,6 +1732,71 @@ void planet_dev_render(PlanetDevState& s, Renderer& r,
     glm::mat4 view = orbit_view(s.camera);
     glm::mat4 mvp = proj * view;
 
+    // ---- Streaming uploads, recorded into THIS frame (no oneshot waits) -----
+    // Terrain copies, state clears + water restores, moisture slices — staged
+    // by tick (activation / refresh_env / far rebuild). Staging buffers go to
+    // the retire queue; freed-slot cooldown guarantees no in-flight reader.
+    if (!s.pending_uploads.empty()) {
+        auto layer_to_transfer = [&](VkImage img, uint32_t layer) {
+            image_barrier(cmd, img,
+                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                          VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                          VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                          VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                          layer, 1);
+        };
+        auto layer_to_general = [&](VkImage img, uint32_t layer) {
+            image_barrier(cmd, img,
+                          VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                          VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                          layer, 1);
+        };
+        VkBufferImageCopy copy{};
+        copy.imageExtent = {PD_GRID, PD_GRID, 1};
+
+        for (PD_PendingUpload& up : s.pending_uploads) {
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, up.layer, 1};
+            if (up.terrain.buffer) {
+                layer_to_transfer(s.terrain_pool.image, up.layer);
+                vkCmdCopyBufferToImage(cmd, up.terrain.buffer, s.terrain_pool.image,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                layer_to_general(s.terrain_pool.image, up.layer);
+            }
+            if (up.clear_state) {
+                VkImage imgs[] = {s.swe_state_a.image, s.swe_state_b.image, s.swe_output.image};
+                VkClearColorValue clr{};
+                VkImageSubresourceRange rng{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, up.layer, 1};
+                for (VkImage img : imgs) layer_to_transfer(img, up.layer);
+                for (VkImage img : imgs)
+                    vkCmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clr, 1, &rng);
+                if (up.water.buffer) {
+                    // Restore depth into the current READ state (the first
+                    // substep below reads it) and the render output (so it
+                    // shows even while paused).
+                    VkImage cur_read = (s.swe_ping_pong & 1) ? s.swe_state_b.image
+                                                             : s.swe_state_a.image;
+                    vkCmdCopyBufferToImage(cmd, up.water.buffer, cur_read,
+                                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                    vkCmdCopyBufferToImage(cmd, up.water.buffer, s.swe_output.image,
+                                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                }
+                for (VkImage img : imgs) layer_to_general(img, up.layer);
+            }
+            if (up.moisture.buffer) {
+                layer_to_transfer(s.moisture_pool.image, up.layer);
+                vkCmdCopyBufferToImage(cmd, up.moisture.buffer, s.moisture_pool.image,
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                layer_to_general(s.moisture_pool.image, up.layer);
+            }
+            pd_retire_buffer(s, up.terrain);
+            pd_retire_buffer(s, up.water);
+            pd_retire_buffer(s, up.moisture);
+        }
+        s.pending_uploads.clear();
+    }
+
     // ---- Terrain brush (raise/lower): world-space, applied to EVERY tile ----
     // with the brush expressed in tile-local coords; tiles the falloff misses
     // do no work, and edits straddling a seam stay seamless. CPU heightmaps
@@ -1654,8 +1831,9 @@ void planet_dev_render(PlanetDevState& s, Renderer& r,
             cpu_apply_brush(s.hm_cpu[t], PD_GRID, PD_GRID,
                             bpc.brush_x, bpc.brush_y, bpc.brush_radius, bpc.brush_amount);
 
-            // ... GPU dispatch only where a slot is resident.
-            if (s.tile_slot[t] == PD_NO_SLOT) continue;
+            // ... GPU dispatch only where a slot is resident; the far field
+            // covers everything else, so flag it for a rebuild.
+            if (s.tile_slot[t] == PD_NO_SLOT) { s.far_dirty = true; continue; }
             bpc.layer = s.tile_slot[t];
             vkCmdPushConstants(cmd, s.pipe_brush.layout, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(bpc), &bpc);
@@ -1835,10 +2013,36 @@ void planet_dev_render(PlanetDevState& s, Renderer& r,
         tpc.tile_origin_z = pd_tile_origin_z(t);
         tpc.layer         = static_cast<float>(slot);
         tpc.seam_highlight = s.ui_seam_highlight ? 1.0f : 0.0f;
+        tpc.uv_scale      = 1.0f;
         vkCmdPushConstants(cmd, s.pipe_terrain.layout,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                            0, sizeof(tpc), &tpc);
         vkCmdDrawIndexed(cmd, s.terrain_mesh.index_count, 1, 0, 0, 0);
+    }
+
+    // Far field: every NON-resident tile draws a low-res sub-rect of the
+    // whole-world far layer — the world never visually disappears, it just
+    // loses water/plants/detail beyond the simulation frontier.
+    vkCmdBindVertexBuffers(cmd, 0, 1, &s.far_mesh.vbo.buffer, &zero);
+    vkCmdBindIndexBuffer(cmd, s.far_mesh.ibo.buffer, 0, VK_INDEX_TYPE_UINT32);
+    for (uint32_t t = 0; t < PD_TILE_TOTAL; ++t) {
+        if (s.tile_slot[t] != PD_NO_SLOT) continue;
+        PlanetDevTerrainPC tpc{};
+        tpc.mvp           = mvp;
+        tpc.grid_w_f      = static_cast<float>(PD_FAR_TILE_GRID);
+        tpc.grid_h_f      = static_cast<float>(PD_FAR_TILE_GRID);
+        tpc.cell_size     = PD_TILE_SIZE / PD_FAR_TILE_GRID;
+        tpc.sea_level     = -10000.0f;
+        tpc.tile_origin_x = pd_tile_origin_x(t);
+        tpc.tile_origin_z = pd_tile_origin_z(t);
+        tpc.layer         = static_cast<float>(PD_FAR_LAYER);
+        tpc.uv_off_x      = static_cast<float>(t % PD_TILES_X) / PD_TILES_X;
+        tpc.uv_off_y      = static_cast<float>(t / PD_TILES_X) / PD_TILES_Y;
+        tpc.uv_scale      = 1.0f / PD_TILES_X;
+        vkCmdPushConstants(cmd, s.pipe_terrain.layout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(tpc), &tpc);
+        vkCmdDrawIndexed(cmd, s.far_mesh.index_count, 1, 0, 0, 0);
     }
 
     // Plants (instanced, world coords — continuous across seams by construction)
@@ -1905,10 +2109,17 @@ void planet_dev_shutdown(PlanetDevState& s, Renderer& r)
     VkDevice device    = r.device;
     VmaAllocator alloc = r.allocator;
 
+    s.placement_jobs.clear();   // blocks on in-flight workers (snapshots are self-contained)
     vkDeviceWaitIdle(device);
 
     for (auto& [b, f] : s.retire) destroy_buffer(alloc, b);
     s.retire.clear();
+    for (auto& up : s.pending_uploads) {
+        destroy_buffer(alloc, up.terrain);
+        destroy_buffer(alloc, up.water);
+        destroy_buffer(alloc, up.moisture);
+    }
+    s.pending_uploads.clear();
     for (auto& m : s.plant_canonical) destroy_pd_plant_mesh(alloc, m);
     for (auto& b : s.plant_inst)      destroy_buffer(alloc, b);
     s.plant_canonical.clear();
@@ -1917,6 +2128,8 @@ void planet_dev_shutdown(PlanetDevState& s, Renderer& r)
     destroy_pd_plant_mesh(alloc, s.creature_mesh_gpu);
     destroy_buffer(alloc, s.terrain_mesh.vbo);
     destroy_buffer(alloc, s.terrain_mesh.ibo);
+    destroy_buffer(alloc, s.far_mesh.vbo);
+    destroy_buffer(alloc, s.far_mesh.ibo);
 
     destroy_pd_clump_pipeline(device, s.pipe_creature);
     destroy_pd_clump_pipeline(device, s.pipe_clump);

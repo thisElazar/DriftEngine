@@ -33,9 +33,9 @@ cbuffer PlanetDevTerrainPC {
     float    tile_origin_z;
     float    layer;
     float    seam_highlight;
-    float    _pad0;
-    float    _pad1;
-    float    _pad2;
+    float    uv_off_x;       // sub-rect of the layer this draw samples:
+    float    uv_off_y;       //   suv = uv * uv_scale + uv_off
+    float    uv_scale;       // 1 for pool slots; 1/8 for far-field tiles
 };
 
 struct VSInput {
@@ -54,7 +54,11 @@ struct VSOutput {
 VSOutput main(VSInput input)
 {
     float2 uv = input.grid_pos / float2(grid_w_f, grid_h_f);
-    float3 uvl = float3(uv, layer);
+    // Far-field draws sample a sub-rect of the whole-world far layer; pool
+    // draws use the identity transform. grid_uv (seam/brush overlays) stays
+    // mesh-local.
+    float2 suv = uv * uv_scale + float2(uv_off_x, uv_off_y);
+    float3 uvl = float3(suv, layer);
 
     float h  = heightmap.SampleLevel(heightmap_sampler, uvl, 0);
     float4 w = water_out.SampleLevel(water_sampler, uvl, 0);
@@ -63,12 +67,12 @@ VSOutput main(VSInput input)
     float depth = max(w.r, 0.0);
 
     // Sample neighbors for normal
-    float2 du = float2(1.0 / grid_w_f, 0.0);
-    float2 dv = float2(0.0, 1.0 / grid_h_f);
-    float hL = heightmap.SampleLevel(heightmap_sampler, float3(uv - du, layer), 0);
-    float hR = heightmap.SampleLevel(heightmap_sampler, float3(uv + du, layer), 0);
-    float hD = heightmap.SampleLevel(heightmap_sampler, float3(uv - dv, layer), 0);
-    float hU = heightmap.SampleLevel(heightmap_sampler, float3(uv + dv, layer), 0);
+    float2 du = float2(uv_scale / grid_w_f, 0.0);
+    float2 dv = float2(0.0, uv_scale / grid_h_f);
+    float hL = heightmap.SampleLevel(heightmap_sampler, float3(suv - du, layer), 0);
+    float hR = heightmap.SampleLevel(heightmap_sampler, float3(suv + du, layer), 0);
+    float hD = heightmap.SampleLevel(heightmap_sampler, float3(suv - dv, layer), 0);
+    float hU = heightmap.SampleLevel(heightmap_sampler, float3(suv + dv, layer), 0);
 
     float dx = (hR - hL) / (2.0 * cell_size);
     float dz = (hU - hD) / (2.0 * cell_size);

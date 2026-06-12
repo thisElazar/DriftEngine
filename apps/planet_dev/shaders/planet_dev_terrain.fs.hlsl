@@ -17,9 +17,9 @@ cbuffer PlanetDevTerrainPC {
     float    tile_origin_z;
     float    layer;
     float    seam_highlight;
-    float    _pad0;
-    float    _pad1;
-    float    _pad2;
+    float    uv_off_x;
+    float    uv_off_y;
+    float    uv_scale;
 };
 
 struct PSInput {
