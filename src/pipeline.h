@@ -185,6 +185,7 @@ struct PlanetTilePC {
     float    heightmap_texel;
     float    cloud_opacity;
     float    sea_level;
+    float    seed_f;        // planet seed, for the shaders' climate/biome functions
 };
 
 // River overlay: a subset of PlanetTilePC (the fields the overlay VS needs to

@@ -38,6 +38,7 @@ static constexpr uint32_t PLANET_TILE_RES = GLOBE_TILE_RES;
 static constexpr uint32_t PLANET_TILE_POOL = GLOBE_TILE_POOL;
 static constexpr uint32_t PLANET_MAX_LEVEL = GLOBE_MAX_LEVEL;
 static constexpr float    PLANET_RADIUS = GLOBE_PLANET_RADIUS;
+static constexpr uint32_t PLANET_SEED = 42;   // one seed -> one planet (M3: many)
 static constexpr float    PLANET_MAX_ELEVATION = GLOBE_MAX_ELEVATION;
 static constexpr float    TILE_SUBDIVIDE_PX = GLOBE_TILE_SUBDIVIDE_PX;
 
@@ -3044,7 +3045,7 @@ void globe_render(GlobeState& s, Renderer& r,
                     gen_pc.face = tile.face;
                     gen_pc.pool_index = slot;
                     gen_pc.tex_res = PLANET_TILE_RES;
-                    gen_pc.seed = 42;
+                    gen_pc.seed = PLANET_SEED;
                     gen_pc.stamp_count = static_cast<uint32_t>(s.stamps.size());
 
                     vkCmdPushConstants(frame.cmd, s.pipelines.terrain_gen_pipeline_layout,
@@ -3713,6 +3714,7 @@ void globe_render(GlobeState& s, Renderer& r,
                 tpc.heightmap_texel = 1.0f / static_cast<float>(PLANET_TILE_RES);
                 tpc.cloud_opacity = 0.0f;
                 tpc.sea_level = s.ui.ocean_enabled ? s.ui.sea_level : -1.0f;
+                tpc.seed_f = static_cast<float>(PLANET_SEED);
 
                 vkCmdPushConstants(frame.cmd, s.pipelines.clipmap_gfx_pipeline_layout,
                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,

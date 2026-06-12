@@ -163,6 +163,9 @@ set(SHADER_OUT_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 
 file(GLOB HLSL_SHADERS CONFIGURE_DEPENDS ${SHADER_DIR}/*.hlsl)
+# .hlsli include files: never compiled standalone, but every .spv rule depends
+# on them so editing an include rebuilds its users.
+file(GLOB HLSL_INCLUDES CONFIGURE_DEPENDS ${SHADER_DIR}/*.hlsli)
 
 set(SPV_OUTPUTS "")
 foreach(HLSL ${HLSL_SHADERS})
@@ -186,7 +189,7 @@ foreach(HLSL ${HLSL_SHADERS})
         OUTPUT ${SPV}
         COMMAND ${GLSLC} -x hlsl -fshader-stage=${SHADER_STAGE} -fentry-point=main
                 --target-env=vulkan1.3 ${HLSL} -o ${SPV}
-        DEPENDS ${HLSL}
+        DEPENDS ${HLSL} ${HLSL_INCLUDES}
         COMMENT "HLSL→SPIR-V [${SHADER_STAGE}]: ${FNAME}"
         VERBATIM
     )

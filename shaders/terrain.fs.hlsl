@@ -1,3 +1,5 @@
+#include "planet_climate.hlsli"
+
 [[vk::binding(0, 0)]] cbuffer Camera {
     float4x4 view;
     float4x4 proj;
@@ -22,6 +24,7 @@ cbuffer PlanetTilePC {
     float heightmap_texel;
     float cloud_opacity;
     float sea_level;
+    float seed_f;        // planet seed, for the climate/biome functions
 };
 
 struct PSInput {
@@ -35,14 +38,38 @@ struct PSInput {
     [[vk::location(6)]] float  foam : TEXCOORD5;
 };
 
-float3 elevation_ramp(float h)
+// Land color from the shared climate/biome functions — the same weights the
+// generator used to shape this ground (dunes get sand, tundra gets tundra),
+// plus slope rock and a latitude-dependent snowline.
+float3 land_color(float h_norm, float3 N, float3 sphere_dir, float seed_v)
 {
-    float3 c = float3(0.85, 0.78, 0.55);
-    c = lerp(c, float3(0.30, 0.55, 0.25), smoothstep(0.00, 0.20, h));
-    c = lerp(c, float3(0.20, 0.40, 0.15), smoothstep(0.20, 0.45, h));
-    c = lerp(c, float3(0.50, 0.42, 0.32), smoothstep(0.45, 0.70, h));
-    c = lerp(c, float3(0.75, 0.72, 0.68), smoothstep(0.70, 0.90, h));
-    c = lerp(c, float3(0.98, 0.98, 1.00), smoothstep(0.90, 1.00, h));
+    float3 n = normalize(sphere_dir);
+    PlanetClimate clim = planet_climate(n, seed_v);
+    float4 bw = planet_biome_weights(clim);   // x desert, y grass, z forest, w tundra
+
+    // Per-biome ground palettes, lowland -> upland.
+    float hi = smoothstep(0.15, 0.65, h_norm);
+    float3 c = bw.x * lerp(float3(0.80, 0.66, 0.42), float3(0.71, 0.52, 0.35), hi)
+             + bw.y * lerp(float3(0.42, 0.50, 0.22), float3(0.54, 0.50, 0.28), hi)
+             + bw.z * lerp(float3(0.15, 0.34, 0.13), float3(0.23, 0.37, 0.17), hi)
+             + bw.w * lerp(float3(0.41, 0.43, 0.37), float3(0.51, 0.51, 0.47), hi);
+
+    // Shore sand just above sea level (sea_level/max_elevation is the waterline
+    // in h_norm units; the band is a sliver above it).
+    float sea_norm = max(sea_level, 0.0) / max(max_elevation, 1.0);
+    c = lerp(float3(0.83, 0.76, 0.55), c,
+             smoothstep(sea_norm + 0.004, sea_norm + 0.025, h_norm));
+
+    // Slope rock: steep faces lose soil regardless of biome.
+    float slope = 1.0 - saturate(dot(normalize(N), n));
+    float rock_w = smoothstep(0.22, 0.50, slope);
+    c = lerp(c, float3(0.42, 0.38, 0.34), rock_w);
+
+    // Snow: the snowline falls with sea-level temperature (toward the poles it
+    // reaches the ground); steep rock sheds snow.
+    float alt_temp = clim.temperature - h_norm * 0.95;
+    float snow_w = smoothstep(0.16, 0.04, alt_temp) * (1.0 - rock_w * 0.7);
+    c = lerp(c, float3(0.93, 0.94, 0.97), snow_w);
     return c;
 }
 
@@ -125,7 +152,8 @@ float4 main(PSInput input) : SV_Target
         color = compute_water_color(input.water_depth, input.sphere_direction, input.world_pos, sst);
         color = lerp(color, float3(0.95, 0.95, 0.97), saturate(input.foam));
     } else if (input.water_depth > 0.0) {
-        float3 terrain_color = elevation_ramp(input.height_normalized);
+        float3 terrain_color = land_color(input.height_normalized, input.world_normal,
+                                          input.sphere_direction, seed_f);
         float3 L = normalize(sun_dir);
         float3 N = normalize(input.world_normal);
         float NdotL = max(dot(N, L), 0.0);
@@ -135,7 +163,8 @@ float4 main(PSInput input) : SV_Target
         float blend = smoothstep(0.0, shore_band, input.water_depth);
         color = lerp(terrain_color, water_col, blend);
     } else {
-        color = elevation_ramp(input.height_normalized);
+        color = land_color(input.height_normalized, input.world_normal,
+                           input.sphere_direction, seed_f);
         float3 L = normalize(sun_dir);
         float3 N = normalize(input.world_normal);
         float NdotL = max(dot(N, L), 0.0);

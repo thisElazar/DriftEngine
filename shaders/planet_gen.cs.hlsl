@@ -1,6 +1,8 @@
 // planet_gen.cs.hlsl — Generate heightmap for one tile of the cube-sphere planet.
 // Each texel maps to a point on the sphere surface; height evaluated via 3D noise.
 
+#include "planet_climate.hlsli"
+
 [[vk::binding(0, 0)]] RWTexture2DArray<float> tile_pool;
 
 struct TerrainStamp {
@@ -217,19 +219,37 @@ float terrain_height(float3 sphere_dir)
     float3 rw    = sp * 0.02 + RANGE_WARP * warp3(sp * 0.01, seed * 0.4);
     float  ranges = ridged3d(rw, 5) * RANGE_H * belt;
 
-    // ===== ROLLING HILLS + MULTI-OCTAVE DETAIL =====
-    float hills = (fbm3d(sp * 0.05, 5, 2.0, 0.5) - 0.5) * HILL_H * land;
+    // ===== CLIMATE -> BIOME (shared with terrain.fs via planet_climate.hlsli)
+    // x = desert, y = grass, z = forest, w = tundra. Terrain CHARACTER varies
+    // by biome; the surface shader colors by the same weights, so a dune
+    // field is always painted sand and tundra is always painted tundra.
+    PlanetClimate clim = planet_climate(n, float(seed));
+    float4 bw = planet_biome_weights(clim);
+
+    // ===== ROLLING HILLS + MULTI-OCTAVE DETAIL, biome-scaled =====
+    // Deserts are low and sculpted, forests soft, tundra flattened, grass as
+    // before. Mountain belts above stay biome-independent (they're tectonic).
+    float hill_amp = HILL_H * dot(bw, float4(0.45, 1.0, 1.1, 0.55));
+    float hills = (fbm3d(sp * 0.05, 5, 2.0, 0.5) - 0.5) * hill_amp * land;
+
+    // Dune fields on deserts: ridged sand waves at two scales.
+    float dunes = (1.0 - abs(2.0 * fbm3d(sp * 0.12, 3, 2.0, 0.5) - 1.0)) * 45.0;
+    dunes += (1.0 - abs(2.0 * fbm3d(sp * 0.45, 2, 2.0, 0.5) - 1.0)) * 12.0;
+    dunes *= bw.x * land;
+
+    // Surface roughness: rocky in deserts/tundra, soft under forest.
+    float rough = dot(bw, float4(1.15, 0.85, 0.55, 1.0));
 
     float detail = 0.0;
-    detail += ridged3d(sp * 0.4, 4) * 120.0 * land;       // ridged texture on land
+    detail += ridged3d(sp * 0.4, 4) * 120.0 * land * rough;
     detail += (fbm3d(sp * 0.08, 6, 2.0, 0.5) - 0.5) * 120.0;
     detail += (gradient_noise_3d(sp * 0.15) - 0.5) * 40.0;
-    detail += (fbm3d(sp * 1.6, 3, 2.0, 0.5) - 0.5) * 90.0;
+    detail += (fbm3d(sp * 1.6, 3, 2.0, 0.5) - 0.5) * 90.0 * rough;
     detail += (gradient_noise_3d(sp * 13.0) - 0.5) * 25.0;
     detail += (gradient_noise_3d(sp * 80.0) - 0.5) * 8.0;
     detail += (gradient_noise_3d(sp * 640.0) - 0.5) * 1.5;
 
-    float h = base + ranges + hills + detail;
+    float h = base + ranges + hills + dunes + detail;
     return clamp(h, -3000.0, 8000.0);
 }
 

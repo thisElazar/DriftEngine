@@ -23,6 +23,7 @@ cbuffer PlanetTilePC {
     float heightmap_texel;
     float cloud_opacity;
     float sea_level;
+    float seed_f;        // planet seed, for the climate/biome functions
 };
 
 struct VSInput {
