@@ -51,7 +51,8 @@ struct HydroSample {
     float     river_strength = 0.0f;  // 0..1 (>threshold = river channel)
     float     moisture       = 1.0f;  // 0..1 watershed wetness (ocean defaults wet)
     glm::vec2 flow{0.0f};             // downstream direction, local east/north (unit)
-    float     lake_depth     = 0.0f;  // 0..1 normalized standing-water depth
+    float     lake_surface   = 0.0f;  // live water-surface ELEVATION (m); standing
+                                      // water exists where terrain sits below it
 };
 
 // Sample the field (6*res*res RGBA cells, as produced by bake/build) at a unit
@@ -122,6 +123,7 @@ struct LiveHydrology {
     //   a = current speed.
     void bake_climate(std::vector<glm::vec4>& out) const;
     // Bake the current state into the RGBA payload
-    // (r=river strength from live water, g=moisture, b=flow angle, a=lake depth).
+    // (r=river strength from live water, g=moisture, b=flow angle,
+    //  a=live water-surface elevation in metres).
     void bake(std::vector<glm::vec4>& out) const;
 };

@@ -123,13 +123,6 @@ struct PlanetSweInitPC {
     uint32_t grid_h;
     float    sea_level;
     uint32_t pool_index;
-    // Tile params for sphere_dir reconstruction (used to sample water stamps).
-    float    u_min;
-    float    v_min;
-    float    tile_size;
-    uint32_t face;
-    uint32_t water_stamp_count;
-    uint32_t _pad0, _pad1, _pad2;
 };
 
 struct PlanetSweHAdjustPC {
@@ -221,16 +214,6 @@ struct TerrainStamp {
     float    _pad0, _pad1;
 };
 
-// Mirrors TerrainStamp for the water brush. Persistent across LOD: tiles at
-// any level read these stamps in their SWE init pass to seed water above the
-// static sea level, so a brushed lake is visible at any zoom.
-struct WaterStamp {
-    float    pos_x, pos_y, pos_z;
-    float    radius;
-    float    water_amount;   // metres of water column to add at the stamp center
-    float    cos_radius;
-    float    _pad0, _pad1;
-};
 
 struct ClumpPC {
     glm::mat4 mvp;
@@ -245,7 +228,6 @@ static_assert(sizeof(ErosionPC) == 64, "ErosionPC layout must match shader");
 static_assert(sizeof(RiverOverlayPC) == 48, "RiverOverlayPC layout must match shader");
 
 constexpr uint32_t MAX_STAMPS = 4096;
-constexpr uint32_t MAX_WATER_STAMPS = 4096;
 
 struct Pipelines {
     VkShaderModule swe_init_shader = VK_NULL_HANDLE;

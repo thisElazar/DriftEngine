@@ -304,20 +304,6 @@ void globe_init(GlobeState& s, Renderer& r)
     VK_CHECK(vmaCreateBuffer(allocator, &stamp_buf_ci, &stamp_buf_ai,
         &s.stamp_buf, &s.stamp_buf_alloc, &s.stamp_buf_info));
 
-    // ---- Water stamp buffer (parallel to terrain stamps) --------------------
-    {
-        VkBufferCreateInfo bci{};
-        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bci.size = MAX_WATER_STAMPS * sizeof(WaterStamp);
-        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        VmaAllocationCreateInfo ai{};
-        ai.usage = VMA_MEMORY_USAGE_AUTO;
-        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-                 | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-        VK_CHECK(vmaCreateBuffer(allocator, &bci, &ai,
-            &s.water_stamp_buf, &s.water_stamp_buf_alloc, &s.water_stamp_buf_info));
-    }
-
     // ---- Planet SWE edge-flag buffer (per-pool-slot, host-readable) ----------
     // The step shader InterlockedOrs bits into edge_flags[pool_index] when water
     // crosses an edge above static depth. CPU reads this each frame to anchor
@@ -1688,12 +1674,7 @@ void globe_init(GlobeState& s, Renderer& r)
         output_info.imageView = s.water_output_view;
         output_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkDescriptorBufferInfo water_stamp_bi{};
-        water_stamp_bi.buffer = s.water_stamp_buf;
-        water_stamp_bi.offset = 0;
-        water_stamp_bi.range = MAX_WATER_STAMPS * sizeof(WaterStamp);
-
-        VkWriteDescriptorSet writes[5]{};
+        VkWriteDescriptorSet writes[4]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = s.planet_swe_init_desc_set;
         writes[0].dstBinding = 0;
@@ -1722,14 +1703,7 @@ void globe_init(GlobeState& s, Renderer& r)
         writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         writes[3].pImageInfo = &output_info;
 
-        writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[4].dstSet = s.planet_swe_init_desc_set;
-        writes[4].dstBinding = 4;
-        writes[4].descriptorCount = 1;
-        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[4].pBufferInfo = &water_stamp_bi;
-
-        vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
+        vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
     }
 
     // Planet SWE h-adjust descriptor: state_a + state_b (storage images, RW).
@@ -3006,12 +2980,6 @@ void globe_render(GlobeState& s, Renderer& r,
                 vmaFlushAllocation(allocator, s.stamp_buf_alloc, 0, copy_size);
                 s.stamps_dirty = false;
             }
-            if (s.water_stamps_dirty && !s.water_stamps.empty()) {
-                size_t copy_size = s.water_stamps.size() * sizeof(WaterStamp);
-                std::memcpy(s.water_stamp_buf_info.pMappedData, s.water_stamps.data(), copy_size);
-                vmaFlushAllocation(allocator, s.water_stamp_buf_alloc, 0, copy_size);
-                s.water_stamps_dirty = false;
-            }
 
             // Build the set of tiles that need terrain (re)generation:
             // - newly visible tiles (s.pending_init)
@@ -3105,11 +3073,6 @@ void globe_render(GlobeState& s, Renderer& r,
                     ipc.grid_h = PLANET_TILE_RES;
                     ipc.sea_level = s.ui.sea_level;
                     ipc.pool_index = it->second;
-                    ipc.u_min = -1.0f + t.x * ts;
-                    ipc.v_min = -1.0f + t.y * ts;
-                    ipc.tile_size = ts;
-                    ipc.face = t.face;
-                    ipc.water_stamp_count = static_cast<uint32_t>(s.water_stamps.size());
                     vkCmdPushConstants(frame.cmd, s.pipelines.planet_swe_init_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ipc), &ipc);
                     vkCmdDispatch(frame.cmd, (PLANET_TILE_RES + 7) / 8, (PLANET_TILE_RES + 7) / 8, 1);
@@ -3117,9 +3080,20 @@ void globe_render(GlobeState& s, Renderer& r,
                 s.pending_init.clear();
             }
 
-            // Pick target tile under the cursor for the water brush.
+            // Pick target tile under the cursor for the water brush — OCEAN ONLY.
+            // One owner per water body: inland water belongs to the hydrology
+            // field (the brush already deposits there), the SWE owns the ocean.
+            // Splashing the sea still wakes the tile and injects a pulse below
+            // (waves); pouring on land no longer creates a second,
+            // field-disconnected SWE puddle next to the field's lake.
             PlanetTilePick pick{};
             bool water_brush_active = s.brush_hit && s.brush_mode == BrushMode::Water;
+            if (water_brush_active && !s.hydro_field_cpu.empty()) {
+                HydroSample hs = sample_planet_field(s.hydro_field_cpu, s.hydro_field_res,
+                                                     s.stamp_sphere_dir);
+                // Channel a is the water-surface elevation; below sea level = ocean.
+                water_brush_active = (hs.lake_surface < s.ui.sea_level);
+            }
             if (water_brush_active) {
                 pick = planet_pick_tile(s.stamp_sphere_dir, visible_tiles, PLANET_TILE_RES);
                 if (pick.hit) s.disturbed_tiles.insert(pick.node);
@@ -3926,7 +3900,6 @@ void globe_shutdown(GlobeState& s, Renderer& r)
     vmaDestroyImage(allocator, s.water_state_b_img, s.water_state_b_alloc);
     vkDestroyImageView(device, s.water_output_view, nullptr);
     vmaDestroyImage(allocator, s.water_output_img, s.water_output_alloc);
-    vmaDestroyBuffer(allocator, s.water_stamp_buf, s.water_stamp_buf_alloc);
     vmaDestroyBuffer(allocator, s.edge_flags_buf, s.edge_flags_alloc);
     vmaDestroyBuffer(allocator, s.atmo_debug_buf, s.atmo_debug_alloc);
 }

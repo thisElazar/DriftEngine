@@ -120,9 +120,6 @@ struct GlobeState {
     VmaAllocation     stamp_buf_alloc = VK_NULL_HANDLE;
     VmaAllocationInfo stamp_buf_info{};
 
-    VkBuffer          water_stamp_buf       = VK_NULL_HANDLE;
-    VmaAllocation     water_stamp_buf_alloc = VK_NULL_HANDLE;
-    VmaAllocationInfo water_stamp_buf_info{};
 
     // --- Edge flags (planet SWE cross-tile anchoring) ---
     VkBuffer          edge_flags_buf       = VK_NULL_HANDLE;
@@ -232,8 +229,6 @@ struct GlobeState {
     // --- Terrain stamps (persistent brush edits) ---
     std::vector<TerrainStamp> stamps;
     bool stamps_dirty = false;
-    std::vector<WaterStamp> water_stamps;
-    bool water_stamps_dirty = false;
 
     // --- Camera + input + UI ---
     Camera     camera{};

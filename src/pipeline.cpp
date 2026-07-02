@@ -87,8 +87,7 @@ void pipelines_create(Pipelines& p, VkDevice device, VkFormat color_format)
                    {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
                    sizeof(PlanetSweInitPC),
                    p.planet_swe_init_shader, p.planet_swe_init_desc_layout,
                    p.planet_swe_init_pipeline_layout, p.planet_swe_init_pipeline);
@@ -386,11 +385,13 @@ void pipelines_create(Pipelines& p, VkDevice device, VkFormat color_format)
         rb[1].binding = 1;
         rb[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;   // terrain heightmap pool
         rb[1].descriptorCount = 1;
-        rb[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        // VS positions on the surface; FS clips lake shorelines per pixel.
+        rb[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         rb[2].binding = 2;
         rb[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;   // hydrology field
         rb[2].descriptorCount = 1;
-        rb[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        // VS lifts lake verts to the water surface; FS draws the water.
+        rb[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         rb[3].binding = 3;
         rb[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         rb[3].descriptorCount = 1;

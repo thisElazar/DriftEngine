@@ -223,8 +223,8 @@ PlanetHydrology build_planet_hydrology(uint32_t res, float sea_level,
         float la = std::log(1.0f + static_cast<float>(accum[c]));
 
         float strength = 0.0f, moisture = 1.0f, flow_a = 0.5f;
-        float lake = std::max(0.0f, filled[c] - height[c]);
-        float lake01 = (height[c] < sea_level) ? 0.0f : std::clamp(lake / LAKE_DEPTH_NORM, 0.0f, 1.0f);
+        // a = water-surface elevation (m), full depressions (static variant).
+        float surf = land ? filled[c] : height[c];
 
         if (land) {
             strength = std::clamp((la - lr_min) / std::max(lr_max - lr_min, 1e-4f), 0.0f, 1.0f);
@@ -232,7 +232,7 @@ PlanetHydrology build_planet_hydrology(uint32_t res, float sea_level,
             int d = downstream[c];
             if (d >= 0) flow_a = flow_angle01(dir[c], dir[d]);
         }
-        h.cells[c] = glm::vec4(strength, moisture, flow_a, lake01);
+        h.cells[c] = glm::vec4(strength, moisture, flow_a, surf);
     }
     return h;
 }
@@ -254,7 +254,7 @@ HydroSample sample_planet_field(const std::vector<glm::vec4>& cells, uint32_t re
     s.moisture       = c.y;
     float ang        = (c.z - 0.5f) * TWO_PI;
     s.flow           = glm::vec2(std::cos(ang), std::sin(ang));
-    s.lake_depth     = c.w;
+    s.lake_surface   = c.w;
     return s;
 }
 
@@ -462,21 +462,27 @@ void LiveHydrology::bake(std::vector<glm::vec4>& out) const
     const float lr_max = std::log(1.0f + static_cast<float>(maxf));
 
     for (size_t c = 0; c < N; ++c) {
-        float strength = 0.0f, lake = 0.0f;
+        float strength = 0.0f;
+        // Channel a is the LIVE WATER-SURFACE ELEVATION in metres: terrain
+        // height plus the filled fraction of the local depression. It equals
+        // the terrain height wherever nothing stands, so the field is
+        // continuous (bilinear-safe); the river overlay clips it against the
+        // fine tile heightmap per pixel — that is what turns coarse field
+        // cells into valley-hugging shorelines.
+        float surf = height[c];
         if (height[c] >= sea_level) {
             float flow = have_cap ? std::max(0.0f, water[c] - cap_w[c]) : water[c];
             float lf = std::log(1.0f + flow);
             strength = std::clamp((lf - lr_min) / std::max(lr_max - lr_min, 1e-4f), 0.0f, 1.0f);
-            // Live lake depth: how full the depression is (water/cap), scaled by its
-            // geometric depth. A brushed overfill briefly reads above "full" (LAKE_FLOOD)
-            // before it drains, so the lake level visibly responds.
-            if (have_cap && cap_w[c] > 1e-3f) {
-                float fill = std::clamp(water[c] / cap_w[c], 0.0f, LAKE_FLOOD);
-                lake = lake01[c] * fill;
-            } else {
-                lake = lake01[c];
-            }
+            // Live fill: how full the depression is (water/cap). A brushed
+            // overfill briefly reads above "full" (LAKE_FLOOD) before it
+            // drains, so the lake level visibly responds.
+            float depth_geo = std::max(filled[c] - height[c], 0.0f);
+            float fill = 1.0f;
+            if (have_cap && cap_w[c] > 1e-3f)
+                fill = std::clamp(water[c] / cap_w[c], 0.0f, LAKE_FLOOD);
+            surf = height[c] + depth_geo * fill;
         }
-        out[c] = glm::vec4(strength, moisture[c], flow_angle[c], lake);
+        out[c] = glm::vec4(strength, moisture[c], flow_angle[c], surf);
     }
 }
