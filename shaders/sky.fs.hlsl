@@ -44,22 +44,25 @@ float4 main(PSInput input) : SV_Target
     float3 ro = -planet_center;   // camera position relative to the planet center
     float3 L  = normalize(sun_dir);
 
-    // No explicit ground test: near the limb, a fp32 ray-sphere hit/miss flips
-    // under camera-motion jitter (the error grows with camera distance — this
-    // was the "flickers when high up" bug). Instead the march runs the whole
-    // shell chord and underground samples integrate at sea-level density, so
-    // grazing rays extinguish smoothly and the same formula covers sky, limb,
-    // and behind-the-horizon.
-    AtmoResult ar = atmo_integrate(ro, rd, 1e12, L, planet_radius,
+    // Rays that hit the planet datum stop there (terrain pixels have their own
+    // aerial perspective; this only covers sub-horizon gaps), others march the
+    // whole shell. The hit test runs in km inside the helper — see the
+    // precision note in atmosphere_planet.hlsli.
+    float ground_t = atmo_ground_hit(ro, rd, planet_radius);
+    float t_max = (ground_t > 0.0) ? ground_t : 1e12;
+
+    AtmoResult ar = atmo_integrate(ro, rd, t_max, L, planet_radius,
                                    density, sun_intensity, 24);
 
-    // Sun disk + glow, faded by the ray's own transmittance — a ray into the
-    // planet has ~zero transmittance, so no binary occlusion gate is needed.
+    // Sun disk + glow, attenuated by the atmosphere in front of it. Only when
+    // the ray leaves the shell unobstructed (t_max is space).
     float3 col = ar.inscatter;
-    float mu = dot(rd, L);
-    float disk = smoothstep(0.99995, 0.99999, mu);
-    float glow = pow(saturate(mu), 2000.0) * 0.4;
-    col += (disk * 4.0 + glow) * sun_color * ar.transmittance;
+    if (t_max > 1e11) {
+        float mu = dot(rd, L);
+        float disk = smoothstep(0.99995, 0.99999, mu);
+        float glow = pow(saturate(mu), 2000.0) * 0.4;
+        col += (disk * 4.0 + glow) * sun_color * ar.transmittance;
+    }
 
     return float4(col, 1.0);
 }

@@ -76,6 +76,15 @@ float2 atmo_sun_depth(float3 p, float3 sun_dir, float r_ground)
         H_MIE      * exp(-alt / H_MIE)      * atmo_chapman(xm, coschi));
 }
 
+// First ground-sphere hit along the ray, in METRES (negative = no hit).
+// For the sky pass's t_max; computed in km for the same precision reason.
+float atmo_ground_hit(float3 ro_m, float3 rd, float r_ground_m)
+{
+    float2 g = atmo_ray_sphere_km(ro_m * ATMO_KM_PER_M, rd, r_ground_m * ATMO_KM_PER_M);
+    if (g.x < g.y && g.x > 0.0) return g.x / ATMO_KM_PER_M;
+    return -1.0;
+}
+
 struct AtmoResult {
     float3 inscatter;      // radiance added along the path
     float3 transmittance;  // what survives of the surface behind it
@@ -111,9 +120,6 @@ AtmoResult atmo_integrate(float3 ro_m, float3 rd, float t_max_m, float3 sun_dir,
     float ti = t0 + seg * 0.5;
     [loop] for (int i = 0; i < view_steps; ++i) {
         float3 p = ro + rd * ti;
-        // Underground samples clamp to sea-level density: a ray that grazes
-        // into the planet extinguishes smoothly instead of needing a separate
-        // (fp32-fragile near the limb) ground-hit clip.
         float  h = max(length(p) - r_ground, 0.0);
         float  d_ray = exp(-h / H_RAYLEIGH) * seg;
         float  d_mie = exp(-h / H_MIE) * seg;
