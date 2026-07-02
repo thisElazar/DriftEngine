@@ -106,7 +106,13 @@ field, plus an inner ring that is actually alive."
       quiesce (GLOBE_SWE_QUIESCE_S). Standing water renders via the
       terrain/SWE path everywhere; the river overlay is flow-only.
 - [ ] M1a follow-ups: mesa/badlands terracing, palette tuning per seed
-- [ ] M1b atmosphere/tonemap
+- [x] M1b atmosphere/tonemap (2026-07-02) — single-scatter Rayleigh+Mie
+      (atmosphere_planet.hlsli) drives a depth-EQUAL fullscreen sky pass and
+      per-pixel aerial perspective in terrain + river shaders; scene renders
+      to an RGBA16F target, ACES tonemap + gamma to the swapchain. UI: Sky
+      panel (density, sun intensity, exposure). NEEDS A VISUAL TUNING PASS
+      from orbit + ground — defaults (density 1, sun 22, exposure 1) are
+      first-guess.
 - [ ] M1c palettes
 - [ ] M1d impostors
 - [ ] M2 delta store + sim ring on Globe

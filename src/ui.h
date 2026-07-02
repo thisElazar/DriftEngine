@@ -83,6 +83,12 @@ struct UIState {
     bool ocean_enabled = true;
     float sea_level = 800.0f;
 
+    // Sky / atmosphere rendering (M1b: scattering + aerial + tonemap)
+    bool  sky_enabled   = true;
+    float atmo_density  = 1.0f;   // scales Rayleigh+Mie optical depth
+    float sun_intensity = 22.0f;  // sun radiance feeding the scattering
+    float exposure      = 1.0f;   // tonemap exposure
+
     // Scene
     bool request_basin_reset = false;
 

@@ -18,9 +18,12 @@ static void create_compute(VkDevice device, const char* spv,
     pipeline = cp.pipeline;
 }
 
-void pipelines_create(Pipelines& p, VkDevice device, VkFormat color_format)
+void pipelines_create(Pipelines& p, VkDevice device, VkFormat color_format,
+                      VkFormat present_format)
 {
     p.color_format = color_format;
+    p.present_format = (present_format == VK_FORMAT_UNDEFINED) ? color_format
+                                                               : present_format;
 
     // ---- Compute pipelines ---------------------------------------------------
     create_compute(device, "shaders/swe_init.spv",
@@ -553,6 +556,132 @@ void pipelines_create(Pipelines& p, VkDevice device, VkFormat color_format)
 
         VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &sand_pipe_ci, nullptr, &p.sand_render_pipeline));
     }
+
+    // ---- Sky pipeline (fullscreen atmosphere raymarch) ------------------------
+    // Depth EQUAL against the reverse-Z clear value (0): the fullscreen triangle
+    // sits at z = 0, so only pixels no geometry touched get sky. Opaque.
+    {
+        p.fullscreen_vs = make_shader(device, "shaders/fullscreen_vs.spv");
+        p.sky_fs = make_shader(device, "shaders/sky_fs.spv");
+
+        VkDescriptorSetLayoutBinding sb{};
+        sb.binding = 0;
+        sb.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;   // camera UBO
+        sb.descriptorCount = 1;
+        sb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo sdsl_ci{};
+        sdsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        sdsl_ci.bindingCount = 1;
+        sdsl_ci.pBindings = &sb;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &sdsl_ci, nullptr, &p.sky_desc_layout));
+
+        VkPushConstantRange sky_push{};
+        sky_push.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        sky_push.offset = 0;
+        sky_push.size = sizeof(SkyPC);
+
+        VkPipelineLayoutCreateInfo sky_pl_ci{};
+        sky_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        sky_pl_ci.setLayoutCount = 1;
+        sky_pl_ci.pSetLayouts = &p.sky_desc_layout;
+        sky_pl_ci.pushConstantRangeCount = 1;
+        sky_pl_ci.pPushConstantRanges = &sky_push;
+        VK_CHECK(vkCreatePipelineLayout(device, &sky_pl_ci, nullptr, &p.sky_pipeline_layout));
+
+        VkPipelineShaderStageCreateInfo sky_stages[2]{};
+        sky_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        sky_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        sky_stages[0].module = p.fullscreen_vs;
+        sky_stages[0].pName = "main";
+        sky_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        sky_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        sky_stages[1].module = p.sky_fs;
+        sky_stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo sky_vi{};
+        sky_vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+        VkPipelineDepthStencilStateCreateInfo sky_ds{};
+        sky_ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        sky_ds.depthTestEnable = VK_TRUE;
+        sky_ds.depthWriteEnable = VK_FALSE;
+        sky_ds.depthCompareOp = VK_COMPARE_OP_EQUAL;
+
+        VkGraphicsPipelineCreateInfo sky_pipe_ci = gfx_pipe_ci;
+        sky_pipe_ci.pStages = sky_stages;
+        sky_pipe_ci.pVertexInputState = &sky_vi;
+        sky_pipe_ci.pDepthStencilState = &sky_ds;
+        sky_pipe_ci.pColorBlendState = &color_blend;   // opaque
+        sky_pipe_ci.layout = p.sky_pipeline_layout;
+        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &sky_pipe_ci, nullptr, &p.sky_pipeline));
+    }
+
+    // ---- Tonemap pipeline (HDR scene → present format) ------------------------
+    {
+        p.tonemap_fs = make_shader(device, "shaders/tonemap_fs.spv");
+
+        VkDescriptorSetLayoutBinding tb2[2]{};
+        tb2[0].binding = 0;
+        tb2[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;   // HDR scene
+        tb2[0].descriptorCount = 1;
+        tb2[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        tb2[1].binding = 1;
+        tb2[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        tb2[1].descriptorCount = 1;
+        tb2[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo tdsl_ci{};
+        tdsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        tdsl_ci.bindingCount = 2;
+        tdsl_ci.pBindings = tb2;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &tdsl_ci, nullptr, &p.tonemap_desc_layout));
+
+        VkPushConstantRange tm_push{};
+        tm_push.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        tm_push.offset = 0;
+        tm_push.size = sizeof(TonemapPC);
+
+        VkPipelineLayoutCreateInfo tm_pl_ci{};
+        tm_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        tm_pl_ci.setLayoutCount = 1;
+        tm_pl_ci.pSetLayouts = &p.tonemap_desc_layout;
+        tm_pl_ci.pushConstantRangeCount = 1;
+        tm_pl_ci.pPushConstantRanges = &tm_push;
+        VK_CHECK(vkCreatePipelineLayout(device, &tm_pl_ci, nullptr, &p.tonemap_pipeline_layout));
+
+        VkPipelineShaderStageCreateInfo tm_stages[2]{};
+        tm_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        tm_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        tm_stages[0].module = p.fullscreen_vs;
+        tm_stages[0].pName = "main";
+        tm_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        tm_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        tm_stages[1].module = p.tonemap_fs;
+        tm_stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo tm_vi{};
+        tm_vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+        VkPipelineDepthStencilStateCreateInfo tm_ds{};
+        tm_ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+
+        // Own rendering info: writes the PRESENT format, no depth attachment.
+        VkPipelineRenderingCreateInfo tm_rendering_ci{};
+        tm_rendering_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+        tm_rendering_ci.colorAttachmentCount = 1;
+        tm_rendering_ci.pColorAttachmentFormats = &p.present_format;
+        tm_rendering_ci.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+
+        VkGraphicsPipelineCreateInfo tm_pipe_ci = gfx_pipe_ci;
+        tm_pipe_ci.pNext = &tm_rendering_ci;
+        tm_pipe_ci.pStages = tm_stages;
+        tm_pipe_ci.pVertexInputState = &tm_vi;
+        tm_pipe_ci.pDepthStencilState = &tm_ds;
+        tm_pipe_ci.pColorBlendState = &color_blend;
+        tm_pipe_ci.layout = p.tonemap_pipeline_layout;
+        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &tm_pipe_ci, nullptr, &p.tonemap_pipeline));
+    }
 }
 
 void pipelines_reload(Pipelines& p, VkDevice device)
@@ -587,6 +716,9 @@ void pipelines_reload(Pipelines& p, VkDevice device)
         {"../shaders/planet_swe_init.cs.hlsl", "shaders/planet_swe_init_cs.spv", "compute"},
         {"../shaders/planet_swe_step.cs.hlsl", "shaders/planet_swe_step_cs.spv", "compute"},
         {"../shaders/planet_swe_h_adjust.cs.hlsl", "shaders/planet_swe_h_adjust_cs.spv", "compute"},
+        {"../shaders/fullscreen.vs.hlsl",  "shaders/fullscreen_vs.spv",  "vertex"},
+        {"../shaders/sky.fs.hlsl",         "shaders/sky_fs.spv",         "fragment"},
+        {"../shaders/tonemap.fs.hlsl",     "shaders/tonemap_fs.spv",     "fragment"},
     };
     constexpr int NUM_SHADERS = static_cast<int>(sizeof(entries) / sizeof(entries[0]));
 
@@ -624,7 +756,7 @@ void pipelines_reload(Pipelines& p, VkDevice device)
     // descriptor sets allocated against the old ones stay binding-compatible.
     vkDeviceWaitIdle(device);
     pipelines_destroy(p, device);
-    pipelines_create(p, device, p.color_format);
+    pipelines_create(p, device, p.color_format, p.present_format);
 }
 
 void pipelines_destroy(Pipelines& p, VkDevice device)
@@ -646,9 +778,13 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
     vkDestroyPipeline(device, p.planet_swe_step_pipeline, nullptr);
     vkDestroyPipeline(device, p.planet_swe_h_adjust_pipeline, nullptr);
     vkDestroyPipeline(device, p.river_pipeline, nullptr);
+    vkDestroyPipeline(device, p.sky_pipeline, nullptr);
+    vkDestroyPipeline(device, p.tonemap_pipeline, nullptr);
 
     // Destroy pipeline layouts
     vkDestroyPipelineLayout(device, p.river_pipeline_layout, nullptr);
+    vkDestroyPipelineLayout(device, p.sky_pipeline_layout, nullptr);
+    vkDestroyPipelineLayout(device, p.tonemap_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.clipmap_gfx_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.terrain_gen_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.sand_render_pipeline_layout, nullptr);
@@ -666,6 +802,8 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
 
     // Destroy descriptor set layouts
     vkDestroyDescriptorSetLayout(device, p.river_desc_layout, nullptr);
+    vkDestroyDescriptorSetLayout(device, p.sky_desc_layout, nullptr);
+    vkDestroyDescriptorSetLayout(device, p.tonemap_desc_layout, nullptr);
     vkDestroyDescriptorSetLayout(device, p.sand_render_desc_layout, nullptr);
     vkDestroyDescriptorSetLayout(device, p.sand_sim_desc_layout, nullptr);
     vkDestroyDescriptorSetLayout(device, p.terrain_gen_desc_layout, nullptr);
@@ -682,6 +820,9 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
     // Destroy shader modules
     vkDestroyShaderModule(device, p.river_vs, nullptr);
     vkDestroyShaderModule(device, p.river_fs, nullptr);
+    vkDestroyShaderModule(device, p.fullscreen_vs, nullptr);
+    vkDestroyShaderModule(device, p.sky_fs, nullptr);
+    vkDestroyShaderModule(device, p.tonemap_fs, nullptr);
     vkDestroyShaderModule(device, p.terrain_gen_shader, nullptr);
     vkDestroyShaderModule(device, p.sand_render_fs, nullptr);
     vkDestroyShaderModule(device, p.sand_render_vs, nullptr);

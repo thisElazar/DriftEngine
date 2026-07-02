@@ -98,6 +98,52 @@ static void start_hydrology_worker(GlobeState& s)
     s.hydro->worker = std::thread(hydrology_worker_main, s.hydro.get());
 }
 
+// (Re)create the HDR scene target at the given extent and point the tonemap
+// descriptor set at it (when the set exists — init writes it separately the
+// first time). Caller must ensure the GPU is idle if the old image may be in
+// flight (resize path).
+static void globe_create_hdr_target(GlobeState& s, Renderer& r, VkExtent2D extent)
+{
+    if (s.hdr_view) vkDestroyImageView(r.device, s.hdr_view, nullptr);
+    if (s.hdr_img)  vmaDestroyImage(r.allocator, s.hdr_img, s.hdr_alloc);
+
+    VkImageCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    ci.extent = {extent.width, extent.height, 1};
+    ci.mipLevels = 1;
+    ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_AUTO;
+    VK_CHECK(vmaCreateImage(r.allocator, &ci, &ai, &s.hdr_img, &s.hdr_alloc, nullptr));
+
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = s.hdr_img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(r.device, &vi, nullptr, &s.hdr_view));
+    s.hdr_extent = extent;
+
+    if (s.tonemap_desc_set != VK_NULL_HANDLE) {
+        VkDescriptorImageInfo hdr_info{};
+        hdr_info.imageView = s.hdr_view;
+        hdr_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = s.tonemap_desc_set;
+        w.dstBinding = 0;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        w.pImageInfo = &hdr_info;
+        vkUpdateDescriptorSets(r.device, 1, &w, 0, nullptr);
+    }
+}
+
 void globe_init(GlobeState& s, Renderer& r)
 {
 #ifdef __APPLE__
@@ -507,7 +553,10 @@ void globe_init(GlobeState& s, Renderer& r)
     terrain_samp_ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VK_CHECK(vkCreateSampler(device, &terrain_samp_ci, nullptr, &s.terrain_linear_sampler));
 
-    pipelines_create(s.pipelines, device, r.vkb_swapchain.image_format);
+    // Scene pipelines render into an RGBA16F HDR target; the tonemap pipeline
+    // resolves it to the swapchain (M1b: scattering + aerial + tonemap).
+    pipelines_create(s.pipelines, device, VK_FORMAT_R16G16B16A16_SFLOAT,
+                     r.vkb_swapchain.image_format);
 
     // ---- Descriptor pool + sets ---------------------------------------------
     // Counts: SWE init(2) + SWE step×2(8) + terrain brush(1) + gfx(4 incl sediment) + erosion×2(8) = needs ~23 descriptors
@@ -515,17 +564,17 @@ void globe_init(GlobeState& s, Renderer& r)
     pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     pool_sizes[0].descriptorCount = 45;
     pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    pool_sizes[1].descriptorCount = 56;   // +climate binding(9) on gfx + clipmap sets
+    pool_sizes[1].descriptorCount = 60;   // +climate on gfx/clipmap, +hydrology on swe-init, +hdr on tonemap
     pool_sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    pool_sizes[2].descriptorCount = 6;
+    pool_sizes[2].descriptorCount = 8;    // +sky
     pool_sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     pool_sizes[3].descriptorCount = 12;
     pool_sizes[4].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-    pool_sizes[4].descriptorCount = 32;
+    pool_sizes[4].descriptorCount = 34;   // +swe-init, +tonemap
 
     VkDescriptorPoolCreateInfo dp_ci{};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dp_ci.maxSets = 26;
+    dp_ci.maxSets = 28;                   // +sky, +tonemap
     dp_ci.poolSizeCount = 5;
     dp_ci.pPoolSizes = pool_sizes;
 
@@ -1822,6 +1871,61 @@ void globe_init(GlobeState& s, Renderer& r)
         vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
     }
 
+    // ---- HDR target + sky/tonemap descriptor sets (M1b) ----------------------
+    {
+        globe_create_hdr_target(s, r, r.vkb_swapchain.extent);
+
+        VkDescriptorSetAllocateInfo sky_ai{};
+        sky_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        sky_ai.descriptorPool = s.desc_pool;
+        sky_ai.descriptorSetCount = 1;
+        sky_ai.pSetLayouts = &s.pipelines.sky_desc_layout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &sky_ai, &s.sky_desc_set));
+
+        VkDescriptorSetAllocateInfo tm_ai{};
+        tm_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        tm_ai.descriptorPool = s.desc_pool;
+        tm_ai.descriptorSetCount = 1;
+        tm_ai.pSetLayouts = &s.pipelines.tonemap_desc_layout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &tm_ai, &s.tonemap_desc_set));
+
+        VkDescriptorBufferInfo cam_bi{};
+        cam_bi.buffer = s.camera_ubo;
+        cam_bi.offset = 0;
+        cam_bi.range  = VK_WHOLE_SIZE;
+
+        VkDescriptorImageInfo hdr_info{};
+        hdr_info.imageView = s.hdr_view;
+        hdr_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkDescriptorImageInfo samp_info{};
+        samp_info.sampler = s.sampler;
+
+        VkWriteDescriptorSet w[3]{};
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[0].dstSet = s.sky_desc_set;
+        w[0].dstBinding = 0;
+        w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w[0].pBufferInfo = &cam_bi;
+
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[1].dstSet = s.tonemap_desc_set;
+        w[1].dstBinding = 0;
+        w[1].descriptorCount = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        w[1].pImageInfo = &hdr_info;
+
+        w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[2].dstSet = s.tonemap_desc_set;
+        w[2].dstBinding = 1;
+        w[2].descriptorCount = 1;
+        w[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        w[2].pImageInfo = &samp_info;
+
+        vkUpdateDescriptorSets(device, 3, w, 0, nullptr);
+    }
+
     {
         VkDescriptorSetLayout layouts[2] = {s.pipelines.planet_swe_step_desc_layout, s.pipelines.planet_swe_step_desc_layout};
         VkDescriptorSetAllocateInfo ai{};
@@ -2876,7 +2980,12 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
             cam._pad0 = 0.0f;
             cam.sun_color = glm::vec3(1.0f, 0.95f, 0.85f);
             cam.time = static_cast<float>(glfwGetTime());  // drives water-surface animation
-            cam.cam_pos = glm::vec3(0.0f);  // camera-relative rendering
+            // Repurposed under camera-relative rendering: the planet center's
+            // position relative to the camera, for the atmosphere/sky passes
+            // (fp32 of ~6.4e6 m is ~0.5 m of noise — irrelevant at km scale
+            // heights). Flat-mode shaders that read this as a camera position
+            // are all dead (if(false)) paths in planet mode.
+            cam.cam_pos = glm::vec3(-camera_eye_position(s.camera));
             cam._pad2 = s.ui.mud_visibility;
             // Two protocols, picked by brush_color.a:
             //   FP (alpha=1): camera-relative world pos + meter radius.
@@ -2940,6 +3049,13 @@ void globe_render(GlobeState& s, Renderer& r,
     GLFWwindow* window = r.window;
     float terrain_size = s.terrain_size;
     (void)allocator; (void)graphics_queue; (void)gfx_family; (void)window;
+
+    // HDR target follows the swapchain extent (resize is rare; idle first so
+    // the in-flight frame can't be sampling the old image).
+    if (extent.width != s.hdr_extent.width || extent.height != s.hdr_extent.height) {
+        vkDeviceWaitIdle(device);
+        globe_create_hdr_target(s, r, extent);
+    }
 
         // ---- Cross-frame WAR guard -------------------------------------------
         // With FRAMES_IN_FLIGHT > 1 the previous frame's draws may still be
@@ -3750,6 +3866,8 @@ void globe_render(GlobeState& s, Renderer& r,
                                   | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
                                   | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
+            // The scene renders into the HDR target; the swapchain is
+            // transitioned later, before the tonemap pass.
             VkImageMemoryBarrier2 sc_barrier{};
             sc_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
             sc_barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
@@ -3758,7 +3876,7 @@ void globe_render(GlobeState& s, Renderer& r,
             sc_barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
             sc_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             sc_barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            sc_barrier.image = r.swapchain_images[image_index];
+            sc_barrier.image = s.hdr_img;
             sc_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
             VkImageMemoryBarrier2 depth_barrier{};
@@ -3787,11 +3905,12 @@ void globe_render(GlobeState& s, Renderer& r,
         {
             VkRenderingAttachmentInfo color_attachment{};
             color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            color_attachment.imageView = r.swapchain_views[image_index];
+            color_attachment.imageView = s.hdr_view;
             color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            color_attachment.clearValue.color = {{0.02f, 0.02f, 0.05f, 1.0f}};
+            // Space is black; the sky pass paints the atmosphere where it exists.
+            color_attachment.clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
 
             VkRenderingAttachmentInfo depth_attachment{};
             depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -3858,6 +3977,8 @@ void globe_render(GlobeState& s, Renderer& r,
                 tpc.cloud_opacity = 0.0f;
                 tpc.sea_level = s.ui.ocean_enabled ? s.ui.sea_level : -1.0f;
                 tpc.seed_f = static_cast<float>(PLANET_SEED);
+                tpc.atmo_density = s.ui.sky_enabled ? s.ui.atmo_density : 0.0f;
+                tpc.sun_intensity = s.ui.sun_intensity;
 
                 vkCmdPushConstants(frame.cmd, s.pipelines.clipmap_gfx_pipeline_layout,
                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -3893,12 +4014,29 @@ void globe_render(GlobeState& s, Renderer& r,
                     rpc.heightmap_texel = 1.0f / static_cast<float>(PLANET_TILE_RES);
                     rpc.time = river_time;
                     rpc.river_threshold = 0.25f;
+                    rpc.atmo_density = s.ui.sky_enabled ? s.ui.atmo_density : 0.0f;
+                    rpc.sun_intensity = s.ui.sun_intensity;
 
                     vkCmdPushConstants(frame.cmd, s.pipelines.river_pipeline_layout,
                         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                         0, sizeof(rpc), &rpc);
                     vkCmdDrawIndexed(frame.cmd, s.clipmap_index_count, 1, 0, 0, 0);
                 }
+            }
+
+            // Sky pass — fullscreen atmosphere raymarch, depth-EQUAL against the
+            // clear value so it fills exactly the pixels no geometry touched.
+            if (s.ui.sky_enabled) {
+                vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipelines.sky_pipeline);
+                vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    s.pipelines.sky_pipeline_layout, 0, 1, &s.sky_desc_set, 0, nullptr);
+                SkyPC spc{};
+                spc.planet_radius = PLANET_RADIUS;
+                spc.density = s.ui.atmo_density;
+                spc.sun_intensity = s.ui.sun_intensity;
+                vkCmdPushConstants(frame.cmd, s.pipelines.sky_pipeline_layout,
+                    VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(spc), &spc);
+                vkCmdDraw(frame.cmd, 3, 1, 0, 0);
             }
 
             // Water pass (disabled for planet mode — Phase 2)
@@ -3959,6 +4097,63 @@ void globe_render(GlobeState& s, Renderer& r,
                 vkCmdDraw(frame.cmd, SAND_MAX_PARTICLES * 2, 1, 0, 0);
             }
 
+            vkCmdEndRendering(frame.cmd);
+        }
+
+        // ---- Tonemap pass: HDR scene → swapchain ----
+        {
+            VkImageMemoryBarrier2 hdr_to_read{};
+            hdr_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            hdr_to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            hdr_to_read.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+            hdr_to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            hdr_to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            hdr_to_read.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            hdr_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            hdr_to_read.image = s.hdr_img;
+            hdr_to_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+            VkImageMemoryBarrier2 sc_to_color{};
+            sc_to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            sc_to_color.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+            sc_to_color.srcAccessMask = VK_ACCESS_2_NONE;
+            sc_to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            sc_to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+            sc_to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            sc_to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            sc_to_color.image = r.swapchain_images[image_index];
+            sc_to_color.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+            VkImageMemoryBarrier2 tm_barriers[] = {hdr_to_read, sc_to_color};
+            VkDependencyInfo tm_dep{};
+            tm_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            tm_dep.imageMemoryBarrierCount = 2;
+            tm_dep.pImageMemoryBarriers = tm_barriers;
+            vkCmdPipelineBarrier2(frame.cmd, &tm_dep);
+
+            VkRenderingAttachmentInfo tm_color{};
+            tm_color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            tm_color.imageView = r.swapchain_views[image_index];
+            tm_color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            tm_color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;   // fully overwritten
+            tm_color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+            VkRenderingInfo tm_ri{};
+            tm_ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            tm_ri.renderArea = {{0, 0}, extent};
+            tm_ri.layerCount = 1;
+            tm_ri.colorAttachmentCount = 1;
+            tm_ri.pColorAttachments = &tm_color;
+
+            vkCmdBeginRendering(frame.cmd, &tm_ri);
+            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipelines.tonemap_pipeline);
+            vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                s.pipelines.tonemap_pipeline_layout, 0, 1, &s.tonemap_desc_set, 0, nullptr);
+            TonemapPC tmpc{};
+            tmpc.exposure = s.ui.exposure;
+            vkCmdPushConstants(frame.cmd, s.pipelines.tonemap_pipeline_layout,
+                VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(tmpc), &tmpc);
+            vkCmdDraw(frame.cmd, 3, 1, 0, 0);
             vkCmdEndRendering(frame.cmd);
         }
 
@@ -4069,6 +4264,8 @@ void globe_shutdown(GlobeState& s, Renderer& r)
     vmaDestroyImage(allocator, s.water_state_b_img, s.water_state_b_alloc);
     vkDestroyImageView(device, s.water_output_view, nullptr);
     vmaDestroyImage(allocator, s.water_output_img, s.water_output_alloc);
+    vkDestroyImageView(device, s.hdr_view, nullptr);
+    vmaDestroyImage(allocator, s.hdr_img, s.hdr_alloc);
     vmaDestroyBuffer(allocator, s.edge_flags_buf, s.edge_flags_alloc);
     vmaDestroyBuffer(allocator, s.atmo_debug_buf, s.atmo_debug_alloc);
 }

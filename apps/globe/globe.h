@@ -197,6 +197,13 @@ struct GlobeState {
     VkBuffer      sand_particle_buf   = VK_NULL_HANDLE;
     VmaAllocation sand_particle_alloc = VK_NULL_HANDLE;
 
+    // --- HDR scene target (RGBA16F; scene renders here, tonemap writes the
+    //     swapchain). Recreated when the swapchain extent changes. ---
+    VkImage       hdr_img    = VK_NULL_HANDLE;
+    VmaAllocation hdr_alloc  = VK_NULL_HANDLE;
+    VkImageView   hdr_view   = VK_NULL_HANDLE;
+    VkExtent2D    hdr_extent{0, 0};
+
     // --- Samplers ---
     VkSampler sampler                = VK_NULL_HANDLE;
     VkSampler terrain_linear_sampler = VK_NULL_HANDLE;
@@ -222,6 +229,8 @@ struct GlobeState {
     VkDescriptorSet planet_swe_h_adjust_desc_set = VK_NULL_HANDLE;
     VkDescriptorSet planet_swe_step_desc_sets[2]{};
     VkDescriptorSet river_desc_set = VK_NULL_HANDLE;
+    VkDescriptorSet sky_desc_set = VK_NULL_HANDLE;
+    VkDescriptorSet tonemap_desc_set = VK_NULL_HANDLE;
 
     // --- Frame state ---
     uint32_t swe_ping_pong      = 0;

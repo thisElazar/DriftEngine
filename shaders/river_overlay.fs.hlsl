@@ -3,11 +3,15 @@
 // along the per-cell flow direction (time-driven) so it reads as motion at any
 // planet scale, independent of the (too-slow) SWE timescale.
 
+#include "atmosphere_planet.hlsli"
+
 [[vk::binding(0, 0)]] cbuffer Camera {
     float4x4 view;
     float4x4 proj;
     float3 sun_dir;   float _pad0;
     float3 sun_color; float _cam_time;   // (=time; FS uses RiverPC.time)
+    // Repurposed under camera-relative rendering: planet center rel. camera.
+    float3 planet_center; float _pad2;
 };
 [[vk::binding(2, 0)]] Texture2DArray<float4> hydrology;  // .r=strength .g=moist .b=flow .a=surface elevation
 [[vk::binding(3, 0)]] SamplerState samp;
@@ -22,6 +26,8 @@ cbuffer RiverPC {
     float heightmap_texel;
     float time;
     float river_threshold;
+    float atmo_density;  // aerial perspective density (0 = off)
+    float sun_intensity; // sun radiance scale, shared with the sky pass
 };
 
 struct PSInput {
@@ -95,6 +101,17 @@ float4 main(PSInput input) : SV_Target
     float  NdotL = saturate(dot(Nw, L));
     float3 lit = col * (0.4 + 0.6 * NdotL);
     float3 outc = lerp(lit, sky, fresnel) + specular;
+
+    // Aerial perspective, matching the terrain beneath so distant rivers haze
+    // out with the landscape instead of staying saturated.
+    if (atmo_density > 0.0) {
+        float dist = length(input.world_pos);
+        float3 rd = input.world_pos / max(dist, 1.0);
+        AtmoResult ar = atmo_integrate(-planet_center, rd, dist, L,
+                                       planet_radius, atmo_density, sun_intensity,
+                                       6, 2);
+        outc = outc * ar.transmittance + ar.inscatter;
+    }
 
     // Reflective water reads more opaque at grazing angles (like the sea).
     float alpha = saturate(present * 1.6) * saturate(0.72 + 0.22 * motion + 0.28 * fresnel);

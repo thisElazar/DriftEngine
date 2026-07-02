@@ -185,6 +185,8 @@ struct PlanetTilePC {
     float    cloud_opacity;
     float    sea_level;
     float    seed_f;        // planet seed, for the shaders' climate/biome functions
+    float    atmo_density;  // aerial perspective density (0 = off)
+    float    sun_intensity; // sun radiance scale, shared with the sky pass
 };
 
 // River overlay: a subset of PlanetTilePC (the fields the overlay VS needs to
@@ -199,6 +201,22 @@ struct RiverOverlayPC {
     float    heightmap_texel;
     float    time;
     float    river_threshold;
+    float    atmo_density;  // aerial perspective density (0 = off)
+    float    sun_intensity; // sun radiance scale, shared with the sky pass
+};
+
+// Sky pass (fullscreen atmosphere raymarch): geometry comes from the camera
+// UBO (inv_view_proj + planet_center); these are the tuning knobs.
+struct SkyPC {
+    float planet_radius;
+    float density;
+    float sun_intensity;
+    float _pad;
+};
+
+struct TonemapPC {
+    float exposure;
+    float _pad0, _pad1, _pad2;
 };
 
 struct PlanetGenPC {
@@ -231,7 +249,7 @@ struct ClumpPC {
 static_assert(sizeof(SweStepPC) == 56, "SweStepPC layout must match shader");
 static_assert(sizeof(TerrainBrushPC) == 32, "TerrainBrushPC layout must match shader");
 static_assert(sizeof(ErosionPC) == 64, "ErosionPC layout must match shader");
-static_assert(sizeof(RiverOverlayPC) == 48, "RiverOverlayPC layout must match shader");
+static_assert(sizeof(RiverOverlayPC) == 56, "RiverOverlayPC layout must match shader");
 
 constexpr uint32_t MAX_STAMPS = 4096;
 
@@ -256,6 +274,9 @@ struct Pipelines {
     VkShaderModule planet_swe_h_adjust_shader = VK_NULL_HANDLE;
     VkShaderModule river_vs = VK_NULL_HANDLE;
     VkShaderModule river_fs = VK_NULL_HANDLE;
+    VkShaderModule fullscreen_vs = VK_NULL_HANDLE;
+    VkShaderModule sky_fs = VK_NULL_HANDLE;
+    VkShaderModule tonemap_fs = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout swe_init_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout swe_step_desc_layout = VK_NULL_HANDLE;
@@ -270,6 +291,8 @@ struct Pipelines {
     VkDescriptorSetLayout planet_swe_step_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout planet_swe_h_adjust_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout river_desc_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout sky_desc_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout tonemap_desc_layout = VK_NULL_HANDLE;
 
     VkPipelineLayout swe_init_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout swe_step_pipeline_layout = VK_NULL_HANDLE;
@@ -286,6 +309,8 @@ struct Pipelines {
     VkPipelineLayout planet_swe_step_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout planet_swe_h_adjust_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout river_pipeline_layout = VK_NULL_HANDLE;
+    VkPipelineLayout sky_pipeline_layout = VK_NULL_HANDLE;
+    VkPipelineLayout tonemap_pipeline_layout = VK_NULL_HANDLE;
 
     VkPipeline swe_init_pipeline = VK_NULL_HANDLE;
     VkPipeline swe_step_pipeline = VK_NULL_HANDLE;
@@ -303,12 +328,21 @@ struct Pipelines {
     VkPipeline planet_swe_step_pipeline = VK_NULL_HANDLE;
     VkPipeline planet_swe_h_adjust_pipeline = VK_NULL_HANDLE;
     VkPipeline river_pipeline = VK_NULL_HANDLE;
+    VkPipeline sky_pipeline = VK_NULL_HANDLE;
+    VkPipeline tonemap_pipeline = VK_NULL_HANDLE;
 
-    // Swapchain color format the graphics pipelines were built against;
-    // remembered so pipelines_reload can recreate them identically.
+    // Color format the scene graphics pipelines were built against (the HDR
+    // intermediate when the app tonemaps, else the swapchain format), and the
+    // present format the tonemap pipeline writes to; remembered so
+    // pipelines_reload can recreate them identically.
     VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
+    VkFormat present_format = VK_FORMAT_B8G8R8A8_UNORM;
 };
 
-void pipelines_create(Pipelines& p, VkDevice device, VkFormat color_format);
+// `color_format` is what the scene pipelines render into. `present_format`
+// (when not UNDEFINED) is what the tonemap pipeline writes to; UNDEFINED means
+// "same as color_format" (apps that render straight to the swapchain).
+void pipelines_create(Pipelines& p, VkDevice device, VkFormat color_format,
+                      VkFormat present_format = VK_FORMAT_UNDEFINED);
 void pipelines_reload(Pipelines& p, VkDevice device);
 void pipelines_destroy(Pipelines& p, VkDevice device);

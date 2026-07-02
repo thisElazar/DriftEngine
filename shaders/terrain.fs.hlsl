@@ -1,11 +1,14 @@
 #include "planet_climate.hlsli"
+#include "atmosphere_planet.hlsli"
 
 [[vk::binding(0, 0)]] cbuffer Camera {
     float4x4 view;
     float4x4 proj;
     float3 sun_dir;   float _pad0;
     float3 sun_color; float time;
-    float3 cam_pos;   float _pad2;
+    // Repurposed under camera-relative rendering: position of the PLANET
+    // CENTER relative to the camera (metres). See CameraData in camera.h.
+    float3 planet_center; float _pad2;
     float4 brush_world;
     float4 brush_color;
 };
@@ -25,6 +28,8 @@ cbuffer PlanetTilePC {
     float cloud_opacity;
     float sea_level;
     float seed_f;        // planet seed, for the climate/biome functions
+    float atmo_density;  // aerial perspective density (0 = off)
+    float sun_intensity; // sun radiance scale, shared with the sky pass
 };
 
 struct PSInput {
@@ -199,11 +204,18 @@ float4 main(PSInput input) : SV_Target
         color = lerp(color, brush_color.rgb, t * 0.85);
     }
 
-    // Distance fog
-    float dist = length(input.world_pos);
-    float fog = saturate(dist / 50000000.0);
-    float3 fog_color = float3(0.65, 0.75, 0.90);
-    color = lerp(color, fog_color, fog);
+    // Aerial perspective: physically-based haze from the same scattering model
+    // as the sky pass — distant terrain fades into the atmosphere it sits
+    // under, blue at midday, warm at low sun, none in the void from orbit.
+    if (atmo_density > 0.0) {
+        float dist = length(input.world_pos);
+        float3 rd = input.world_pos / max(dist, 1.0);
+        float3 ro = -planet_center;   // camera position relative to planet center
+        AtmoResult ar = atmo_integrate(ro, rd, dist, normalize(sun_dir),
+                                       planet_radius, atmo_density, sun_intensity,
+                                       6, 2);
+        color = color * ar.transmittance + ar.inscatter;
+    }
 
     return float4(color, 1.0);
 }
