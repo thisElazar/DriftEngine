@@ -2,34 +2,55 @@
 // by the sky pass (full-quality march) and the aerial-perspective term in the
 // terrain / river shaders (short march to the fragment).
 //
-// All positions are relative to the PLANET CENTER, in metres. Constants are
-// Earth-like; `density` scales both optical depths so one slider moves the
-// whole look from vacuum to soup.
+// The public API (atmo_integrate, atmo_ground_hit) takes METRES relative to
+// the planet center. ALL INTERNAL MATH RUNS IN KILOMETRES: fp32 ray–sphere
+// at planet radii in metres is catastrophic — b² ≈ 4e13 carries ~4e6 of ULP
+// error into the discriminant, so intersection distances jitter by kilometres
+// as the camera moves, which reads as full-screen flicker. In km the same
+// terms sit near 4e7 with ~5 ULP, and the residual error is metre-scale.
 
-static const float ATMO_HEIGHT = 100000.0;  // shell thickness above r_ground (m)
-static const float H_RAYLEIGH  = 8500.0;    // Rayleigh density scale height (m)
-static const float H_MIE       = 1200.0;    // Mie density scale height (m)
-static const float3 BETA_RAY   = float3(5.802e-6, 13.558e-6, 33.1e-6);  // per metre
-static const float  BETA_MIE   = 3.996e-6;
-static const float  MIE_G      = 0.76;      // Henyey-Greenstein anisotropy
+static const float ATMO_KM_PER_M = 1.0e-3;
 
-// Ray vs sphere centred at the origin. Returns (t_near, t_far); miss when
-// t_near > t_far.
-float2 atmo_ray_sphere(float3 ro, float3 rd, float r)
+static const float ATMO_HEIGHT = 100.0;   // shell thickness above r_ground (km)
+static const float H_RAYLEIGH  = 8.5;     // Rayleigh density scale height (km)
+static const float H_MIE       = 1.2;     // Mie density scale height (km)
+static const float3 BETA_RAY   = float3(5.802e-3, 13.558e-3, 33.1e-3);  // per km
+static const float  BETA_MIE   = 3.996e-3;
+static const float  MIE_G      = 0.76;    // Henyey-Greenstein anisotropy
+// Width of the soft terminator when testing per-sample sun visibility (km).
+// A smooth factor instead of a binary occlusion test — the hard branch made
+// whole samples snap on/off under camera-motion jitter (visible flicker).
+static const float  SHADOW_SOFT_KM = 12.0;
+
+// Ray vs sphere centred at the origin, KILOMETRE inputs. Uses the
+// perpendicular-distance form, which cancels far less than b² - c.
+// Returns (t_near, t_far) in km; miss when t_near > t_far.
+float2 atmo_ray_sphere_km(float3 ro, float3 rd, float r)
 {
-    float b = dot(ro, rd);
-    float c = dot(ro, ro) - r * r;
-    float disc = b * b - c;
+    float  b = dot(ro, rd);
+    float3 perp = ro - b * rd;
+    float  disc = r * r - dot(perp, perp);
     if (disc < 0.0) return float2(1.0, -1.0);
     float s = sqrt(disc);
     return float2(-b - s, -b + s);
 }
 
-// Optical depth (rayleigh, mie) along a ray to the top of the atmosphere.
+// Smooth sun visibility at a point (km frame): 1 in full sun, 0 behind the
+// planet, with a SHADOW_SOFT_KM-wide ramp across the geometric horizon.
+float atmo_sun_visibility(float3 p, float3 sun_dir, float r_ground)
+{
+    float t_close = -dot(p, sun_dir);        // closest approach along the sun ray
+    if (t_close <= 0.0) return 1.0;          // sun is above the local horizon
+    float3 perp = p + sun_dir * t_close;
+    float  min_r = length(perp);
+    return smoothstep(r_ground - SHADOW_SOFT_KM, r_ground + SHADOW_SOFT_KM, min_r);
+}
+
+// Optical depth (rayleigh, mie) along a ray to the top of the atmosphere (km frame).
 float2 atmo_light_depth(float3 p, float3 sun_dir, float r_ground, int steps)
 {
     float r_top = r_ground + ATMO_HEIGHT;
-    float2 t = atmo_ray_sphere(p, sun_dir, r_top);
+    float2 t = atmo_ray_sphere_km(p, sun_dir, r_top);
     float  seg = max(t.y, 0.0) / float(steps);
     float2 depth = 0.0;
     float  ti = seg * 0.5;
@@ -43,31 +64,43 @@ float2 atmo_light_depth(float3 p, float3 sun_dir, float r_ground, int steps)
     return depth;
 }
 
+// First ground-sphere hit along the ray, in METRES (negative = no hit).
+// For the sky pass's t_max; computed in km for the same precision reason.
+float atmo_ground_hit(float3 ro_m, float3 rd, float r_ground_m)
+{
+    float2 g = atmo_ray_sphere_km(ro_m * ATMO_KM_PER_M, rd, r_ground_m * ATMO_KM_PER_M);
+    if (g.x < g.y && g.x > 0.0) return g.x / ATMO_KM_PER_M;
+    return -1.0;
+}
+
 struct AtmoResult {
     float3 inscatter;      // radiance added along the path
     float3 transmittance;  // what survives of the surface behind it
 };
 
 // Integrate scattering along ro + t*rd for t in [0, t_max] (clipped to the
-// atmosphere shell). `t_max` = distance to the fragment for aerial perspective,
-// or 1e12 for the open sky. Sun visibility is tested per sample against the
-// ground sphere, which is what makes the shadowed band after sunset.
-AtmoResult atmo_integrate(float3 ro, float3 rd, float t_max, float3 sun_dir,
-                          float r_ground, float density, float sun_intensity,
+// atmosphere shell). METRE inputs: `t_max` = distance to the fragment for
+// aerial perspective, or 1e12 for the open sky.
+AtmoResult atmo_integrate(float3 ro_m, float3 rd, float t_max_m, float3 sun_dir,
+                          float r_ground_m, float density, float sun_intensity,
                           int view_steps, int light_steps)
 {
     AtmoResult res;
     res.inscatter = 0.0;
     res.transmittance = 1.0;
 
+    float3 ro = ro_m * ATMO_KM_PER_M;
+    float  r_ground = r_ground_m * ATMO_KM_PER_M;
+    float  t_max = min(t_max_m, 1.0e9) * ATMO_KM_PER_M;
+
     float r_top = r_ground + ATMO_HEIGHT;
-    float2 shell = atmo_ray_sphere(ro, rd, r_top);
+    float2 shell = atmo_ray_sphere_km(ro, rd, r_top);
     float t0 = max(shell.x, 0.0);
     float t1 = min(shell.y, t_max);
     if (t1 <= t0) return res;   // ray never enters the shell before t_max
 
     float seg = (t1 - t0) / float(view_steps);
-    float2 view_depth = 0.0;              // accumulated (rayleigh, mie) depth
+    float2 view_depth = 0.0;              // accumulated (rayleigh, mie) depth, km
     float3 sum_ray = 0.0;
     float3 sum_mie = 0.0;
 
@@ -79,13 +112,12 @@ AtmoResult atmo_integrate(float3 ro, float3 rd, float t_max, float3 sun_dir,
         float  d_mie = exp(-h / H_MIE) * seg;
         view_depth += float2(d_ray, d_mie);
 
-        // Sun below the local horizon → this sample is in the planet's shadow.
-        float2 g = atmo_ray_sphere(p, sun_dir, r_ground * 0.9999);
-        if (!(g.x < g.y && g.y > 0.0)) {
+        float sun_vis = atmo_sun_visibility(p, sun_dir, r_ground);
+        if (sun_vis > 0.0) {
             float2 light_depth = atmo_light_depth(p, sun_dir, r_ground, light_steps);
             float3 tau = BETA_RAY * (view_depth.x + light_depth.x)
                        + BETA_MIE * 1.1 * (view_depth.y + light_depth.y);
-            float3 attn = exp(-tau * density);
+            float3 attn = exp(-tau * density) * sun_vis;
             sum_ray += attn * d_ray;
             sum_mie += attn * d_mie;
         }

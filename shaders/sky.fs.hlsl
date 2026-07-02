@@ -46,9 +46,10 @@ float4 main(PSInput input) : SV_Target
 
     // Rays that hit the planet datum stop there (terrain pixels have their own
     // aerial perspective; this only covers sub-horizon gaps), others march the
-    // whole shell.
-    float2 g = atmo_ray_sphere(ro, rd, planet_radius);
-    float t_max = (g.x < g.y && g.y > 0.0 && g.x > 0.0) ? g.x : 1e12;
+    // whole shell. The hit test runs in km inside the helper — see the
+    // precision note in atmosphere_planet.hlsli.
+    float ground_t = atmo_ground_hit(ro, rd, planet_radius);
+    float t_max = (ground_t > 0.0) ? ground_t : 1e12;
 
     AtmoResult ar = atmo_integrate(ro, rd, t_max, L, planet_radius,
                                    density, sun_intensity, 16, 4);
