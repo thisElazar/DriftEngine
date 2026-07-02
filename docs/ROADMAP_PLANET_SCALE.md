@@ -99,6 +99,12 @@ field, plus an inner ring that is actually alive."
 - [x] M1a biome terrain (`a3a3a79`, 2026-06-12) — shared climate fn
       (planet_climate.hlsli) drives both generator character and surface
       palette; needs a visual pass from low orbit / ground
+- [x] M2 groundwork: field ↔ SWE water handoff (2026-07-02) — one water
+      body at two resolutions. planet_swe_init seeds standing water from
+      the hydrology field's surface elevation (re-seeded on every field
+      publish); brushed tiles run live SWE and bake back into the field on
+      quiesce (GLOBE_SWE_QUIESCE_S). Standing water renders via the
+      terrain/SWE path everywhere; the river overlay is flow-only.
 - [ ] M1a follow-ups: mesa/badlands terracing, palette tuning per seed
 - [ ] M1b atmosphere/tonemap
 - [ ] M1c palettes

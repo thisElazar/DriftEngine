@@ -381,6 +381,24 @@ void LiveHydrology::add_water_deposit(glm::vec3 dir, float cos_radius, float amo
     }
 }
 
+void LiveHydrology::apply_surface_set(int cell, float surf, float mean_depth)
+{
+    if (cell < 0 || static_cast<size_t>(cell) >= water.size()) return;
+    if (height.size() != water.size() || cap_w.size() != water.size()) return;
+    if (height[cell] < sea_level) return;               // ocean is a sink
+    float depth_geo = std::max(filled[cell] - height[cell], 0.0f);
+    if (depth_geo > 1e-3f && cap_w[cell] > 1e-6f) {
+        // Depression: freeze the lake at the observed surface level.
+        float fill = std::clamp((surf - height[cell]) / depth_geo, 0.0f, LAKE_FLOOD);
+        water[cell] = cap_w[cell] * fill;
+    } else {
+        // No storage here: the observed water is in transit — add it as a slug
+        // (mean depth is robust to coarse-vs-fine terrain height mismatch) and
+        // let step() route it downstream.
+        water[cell] += LAKE_FILL_K * std::max(mean_depth, 0.0f);
+    }
+}
+
 void LiveHydrology::step()
 {
     const size_t N = water.size();

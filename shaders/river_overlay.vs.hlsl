@@ -9,7 +9,6 @@
 };
 
 [[vk::binding(1, 0)]] Texture2DArray<float> heightmap;   // terrain pool
-[[vk::binding(2, 0)]] Texture2DArray<float4> hydrology;  // .a = water-surface elevation (m)
 [[vk::binding(3, 0)]] SamplerState samp;
 
 [[vk::push_constant]]
@@ -77,17 +76,13 @@ VSOutput main(VSInput input)
     float2 hm_uv = (grid + 0.5) * heightmap_texel;
     float terrain_h = heightmap.SampleLevel(samp, float3(hm_uv, float(pool_index)), 0).r;
 
-    // Standing water: the hydrology field carries the live water-surface
-    // elevation (== terrain height where nothing stands, so this is a no-op
-    // outside lakes). Lift submerged verts to the surface so a lake renders
-    // as a FLAT plane and its shoreline falls exactly where the fine terrain
-    // crosses the water level.
+    // Rivers hug the terrain. Standing water (ocean + lakes) is owned by the
+    // SWE textures and rendered by the terrain pass — planet_swe_init seeds
+    // them from the hydrology field, so the overlay only draws FLOW.
     float2 hyd_uv01 = face_uv * 0.5 + 0.5;
-    float water_surf = hydrology.SampleLevel(samp, float3(hyd_uv01, float(face)), 0).a;
-    float render_h = max(terrain_h, water_surf);
 
     float3 delta_dir = sphere_dir - center_dir;
-    float3 displacement = delta_dir * planet_radius + sphere_dir * (render_h + RIVER_LIFT);
+    float3 displacement = delta_dir * planet_radius + sphere_dir * (terrain_h + RIVER_LIFT);
     float3 world_rel = displacement + float3(rel_x, rel_y, rel_z);
 
     VSOutput o;

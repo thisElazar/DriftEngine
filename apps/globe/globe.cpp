@@ -67,6 +67,12 @@ static void hydrology_worker_main(HydroAsync* ha)
             std::vector<WaterDeposit> drained;
             { std::lock_guard<std::mutex> lk(ha->deposits_mtx); drained.swap(ha->pending_deposits); }
             for (const auto& d : drained) live.add_water_deposit(d.dir, d.cos_radius, d.amount);
+            // Drain SWE bake-backs (quiesced disturbed tiles handing their
+            // water back to the field) before stepping so the set is atomic
+            // with respect to routing.
+            std::vector<SurfaceSet> sets;
+            { std::lock_guard<std::mutex> lk(ha->sets_mtx); sets.swap(ha->pending_surface_sets); }
+            for (const auto& ss : sets) live.apply_surface_set(ss.cell, ss.surf, ss.mean_depth);
             live.step();
             live.step_climate();
             {
@@ -1674,7 +1680,14 @@ void globe_init(GlobeState& s, Renderer& r)
         output_info.imageView = s.water_output_view;
         output_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[4]{};
+        VkDescriptorImageInfo hyd_info{};
+        hyd_info.imageView = s.hydrology_view;
+        hyd_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo samp_info{};
+        samp_info.sampler = s.sampler;
+
+        VkWriteDescriptorSet writes[6]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = s.planet_swe_init_desc_set;
         writes[0].dstBinding = 0;
@@ -1703,7 +1716,21 @@ void globe_init(GlobeState& s, Renderer& r)
         writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         writes[3].pImageInfo = &output_info;
 
-        vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
+        writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[4].dstSet = s.planet_swe_init_desc_set;
+        writes[4].dstBinding = 4;
+        writes[4].descriptorCount = 1;
+        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[4].pImageInfo = &hyd_info;
+
+        writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[5].dstSet = s.planet_swe_init_desc_set;
+        writes[5].dstBinding = 5;
+        writes[5].descriptorCount = 1;
+        writes[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes[5].pImageInfo = &samp_info;
+
+        vkUpdateDescriptorSets(device, 6, writes, 0, nullptr);
     }
 
     // Planet SWE h-adjust descriptor: state_a + state_b (storage images, RW).
@@ -2125,6 +2152,135 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
                                  VK_IMAGE_LAYOUT_GENERAL);
         }
         s.hydro_last_upload = glfwGetTime();
+
+        // Re-seed every resident tile's SWE standing water from the fresh field
+        // so far lakes track the live field (rise as it rains, drop as they
+        // drain). Disturbed tiles are skipped — their SWE is the live sim and
+        // wins until it quiesces and bakes back. Each re-seed is one tiny
+        // 64² init dispatch; the whole resident set costs well under a ms.
+        for (const auto& [tile, slot] : s.tile_slot_map)
+            if (!s.disturbed_tiles.count(tile))
+                s.pending_water_reseed.insert(tile);
+    }
+
+    // ---- Bake-back: quiesced disturbed tiles return their water to the field ----
+    // A disturbed tile that has gone GLOBE_SWE_QUIESCE_S without a brush pulse or
+    // cross-edge flow has settled; read back its terrain + water layers (one tiny
+    // blocking submit, ≤1 tile per tick), aggregate the observed water surface per
+    // field cell, hand the sets to the hydrology worker, and un-disturb the tile.
+    // From then on the field owns that water and the re-seed path renders it.
+    if (s.hydro && !s.disturbed_tiles.empty()) {
+        double now_s = glfwGetTime();
+        QuadNode bake_tile{};
+        uint32_t bake_slot = 0;
+        bool     have_bake = false;
+        for (const auto& tile : s.disturbed_tiles) {
+            auto tt = s.disturbed_touch.find(tile);
+            if (tt != s.disturbed_touch.end() && (now_s - tt->second) < GLOBE_SWE_QUIESCE_S)
+                continue;
+            auto it = s.tile_slot_map.find(tile);
+            if (it == s.tile_slot_map.end()) {   // lost its slot somehow — just drop it
+                s.disturbed_tiles.erase(tile);
+                s.disturbed_touch.erase(tile);
+                break;
+            }
+            bake_tile = tile;
+            bake_slot = it->second;
+            have_bake = true;
+            break;
+        }
+
+        if (have_bake) {
+            constexpr uint32_t R = PLANET_TILE_RES;
+            constexpr VkDeviceSize terrain_bytes = R * R * sizeof(float);
+            constexpr VkDeviceSize water_bytes   = R * R * 4 * sizeof(uint16_t);  // RGBA16F
+
+            GpuBuffer rb = create_readback_buffer(allocator, terrain_bytes + water_bytes);
+            OneShot os = oneshot_begin(device, graphics_queue, gfx_family);
+            {
+                VkMemoryBarrier2 pre{};
+                pre.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                pre.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                pre.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                pre.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                pre.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+                VkDependencyInfo dep{};
+                dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                dep.memoryBarrierCount = 1;
+                dep.pMemoryBarriers = &pre;
+                vkCmdPipelineBarrier2(os.cmd, &dep);
+
+                VkBufferImageCopy tcopy{};
+                tcopy.bufferOffset = 0;
+                tcopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, bake_slot, 1};
+                tcopy.imageExtent = {R, R, 1};
+                vkCmdCopyImageToBuffer(os.cmd, s.clipmap_hm_image, VK_IMAGE_LAYOUT_GENERAL,
+                                       rb.buffer, 1, &tcopy);
+                VkBufferImageCopy wcopy = tcopy;
+                wcopy.bufferOffset = terrain_bytes;
+                vkCmdCopyImageToBuffer(os.cmd, s.water_output_img, VK_IMAGE_LAYOUT_GENERAL,
+                                       rb.buffer, 1, &wcopy);
+
+                VkMemoryBarrier2 post{};
+                post.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                post.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                post.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                post.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+                post.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+                dep.pMemoryBarriers = &post;
+                vkCmdPipelineBarrier2(os.cmd, &dep);
+            }
+            oneshot_end(os);   // submits + waits (~sub-ms for 48 KB)
+
+            VmaAllocationInfo rb_info{};
+            vmaGetAllocationInfo(allocator, rb.allocation, &rb_info);
+            vmaInvalidateAllocation(allocator, rb.allocation, 0, VK_WHOLE_SIZE);
+            const float*    terr = static_cast<const float*>(rb_info.pMappedData);
+            const uint16_t* wat  = reinterpret_cast<const uint16_t*>(
+                static_cast<const uint8_t*>(rb_info.pMappedData) + terrain_bytes);
+
+            // Aggregate wet texels per hydrology field cell (same face as the
+            // tile — tiles never straddle faces). Ocean texels are excluded so
+            // coastal cells don't read the sea as a flood.
+            struct CellAgg { float sum_surf = 0.0f; float sum_h = 0.0f; int n = 0; };
+            std::unordered_map<int, CellAgg> agg;
+            float ts = 2.0f / static_cast<float>(1u << bake_tile.level);
+            float tile_u_min = -1.0f + bake_tile.x * ts;
+            float tile_v_min = -1.0f + bake_tile.y * ts;
+            const float cell_ts = 2.0f / static_cast<float>(GLOBE_HYDRO_RES);
+            const int   RES = static_cast<int>(GLOBE_HYDRO_RES);
+            for (uint32_t y = 0; y < R; ++y) {
+                for (uint32_t x = 0; x < R; ++x) {
+                    float t_h = terr[y * R + x];
+                    if (t_h < s.ui.sea_level) continue;               // ocean texel
+                    float h = half_to_float(wat[(y * R + x) * 4]);    // .r = depth (m)
+                    if (h <= 0.05f) continue;                          // dry
+                    float u = tile_u_min + (static_cast<float>(x) / (R - 1)) * ts;
+                    float v = tile_v_min + (static_cast<float>(y) / (R - 1)) * ts;
+                    int ci = std::clamp(static_cast<int>((u + 1.0f) / cell_ts), 0, RES - 1);
+                    int cj = std::clamp(static_cast<int>((v + 1.0f) / cell_ts), 0, RES - 1);
+                    int cell = static_cast<int>(bake_tile.face) * RES * RES + cj * RES + ci;
+                    CellAgg& a = agg[cell];
+                    a.sum_surf += t_h + h;
+                    a.sum_h    += h;
+                    a.n        += 1;
+                }
+            }
+            destroy_buffer(allocator, rb);
+
+            if (!agg.empty()) {
+                std::vector<SurfaceSet> sets;
+                sets.reserve(agg.size());
+                for (const auto& [cell, a] : agg)
+                    sets.push_back({cell, a.sum_surf / a.n, a.sum_h / a.n});
+                std::lock_guard<std::mutex> lk(s.hydro->sets_mtx);
+                s.hydro->pending_surface_sets.insert(s.hydro->pending_surface_sets.end(),
+                                                     sets.begin(), sets.end());
+            }
+
+            s.disturbed_tiles.erase(bake_tile);
+            s.disturbed_touch.erase(bake_tile);
+        }
     }
 
     // Signal a drainage-structure rebuild whenever the terrain changes — every
@@ -2906,6 +3062,10 @@ void globe_render(GlobeState& s, Renderer& r,
                     if (flags[sl] == 0) continue;
                     QuadNode tile = s.slot_to_tile[sl];
                     if (tile.face == INVALID_TILE.face) continue;  // slot is unassigned
+                    // Water is actively crossing this tile's edges — it is not
+                    // quiescent, so keep its bake-back clock pushed out.
+                    if (s.disturbed_tiles.count(tile))
+                        s.disturbed_touch[tile] = glfwGetTime();
                     for (int dir = 0; dir < 4; ++dir) {
                         uint32_t bit = 1u << dir;
                         if (!(flags[sl] & bit)) continue;
@@ -2914,6 +3074,7 @@ void globe_render(GlobeState& s, Renderer& r,
                         if (s.tile_slot_map.count(nb.tile)) {
                             // Already anchored. Just join the simulation.
                             s.disturbed_tiles.insert(nb.tile);
+                            s.disturbed_touch[nb.tile] = glfwGetTime();
                             continue;
                         }
                         if (s.free_slots.empty()) continue;
@@ -2922,6 +3083,7 @@ void globe_render(GlobeState& s, Renderer& r,
                         s.tile_slot_map.emplace(nb.tile, ns);
                         s.slot_to_tile[ns] = nb.tile;
                         s.disturbed_tiles.insert(nb.tile);
+                        s.disturbed_touch[nb.tile] = glfwGetTime();
                         s.pending_init.insert(nb.tile);
                     }
                 }
@@ -3056,14 +3218,18 @@ void globe_render(GlobeState& s, Renderer& r,
                 vkCmdPipelineBarrier2(frame.cmd, &dep);
             }
 
-            // Init dispatch — consume s.pending_init.
-            bool any_init = !s.pending_init.empty();
+            // Init dispatch — consume s.pending_init (new slots: terrain was just
+            // generated) plus s.pending_water_reseed (resident tiles re-seeded from
+            // a freshly-published hydrology field; terrain untouched). Init clears
+            // velocity, which is correct for field water — it is standing state.
+            bool any_init = !s.pending_init.empty() || !s.pending_water_reseed.empty();
             if (any_init) {
                 vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                     s.pipelines.planet_swe_init_pipeline);
                 vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                     s.pipelines.planet_swe_init_pipeline_layout, 0, 1,
                     &s.planet_swe_init_desc_set, 0, nullptr);
+                for (const auto& t : s.pending_water_reseed) s.pending_init.insert(t);
                 for (const auto& t : s.pending_init) {
                     auto it = s.tile_slot_map.find(t);
                     if (it == s.tile_slot_map.end()) continue;
@@ -3073,30 +3239,33 @@ void globe_render(GlobeState& s, Renderer& r,
                     ipc.grid_h = PLANET_TILE_RES;
                     ipc.sea_level = s.ui.sea_level;
                     ipc.pool_index = it->second;
+                    ipc.u_min = -1.0f + t.x * ts;
+                    ipc.v_min = -1.0f + t.y * ts;
+                    ipc.tile_size = ts;
+                    ipc.face = t.face;
                     vkCmdPushConstants(frame.cmd, s.pipelines.planet_swe_init_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ipc), &ipc);
                     vkCmdDispatch(frame.cmd, (PLANET_TILE_RES + 7) / 8, (PLANET_TILE_RES + 7) / 8, 1);
                 }
                 s.pending_init.clear();
+                s.pending_water_reseed.clear();
             }
 
-            // Pick target tile under the cursor for the water brush — OCEAN ONLY.
-            // One owner per water body: inland water belongs to the hydrology
-            // field (the brush already deposits there), the SWE owns the ocean.
-            // Splashing the sea still wakes the tile and injects a pulse below
-            // (waves); pouring on land no longer creates a second,
-            // field-disconnected SWE puddle next to the field's lake.
+            // Pick target tile under the cursor for the water brush. Pouring
+            // anywhere wakes the tile into the live SWE ring: the pulse splashes
+            // and flows at fine resolution while the same brush ALSO deposits
+            // into the coarse field (globe_tick), which routes the flood
+            // downstream planet-wide. When the tile quiesces its SWE water is
+            // baked back into the field and the field re-seeds it — so live
+            // water and field water stay one continuous body over time.
             PlanetTilePick pick{};
             bool water_brush_active = s.brush_hit && s.brush_mode == BrushMode::Water;
-            if (water_brush_active && !s.hydro_field_cpu.empty()) {
-                HydroSample hs = sample_planet_field(s.hydro_field_cpu, s.hydro_field_res,
-                                                     s.stamp_sphere_dir);
-                // Channel a is the water-surface elevation; below sea level = ocean.
-                water_brush_active = (hs.lake_surface < s.ui.sea_level);
-            }
             if (water_brush_active) {
                 pick = planet_pick_tile(s.stamp_sphere_dir, visible_tiles, PLANET_TILE_RES);
-                if (pick.hit) s.disturbed_tiles.insert(pick.node);
+                if (pick.hit) {
+                    s.disturbed_tiles.insert(pick.node);
+                    s.disturbed_touch[pick.node] = glfwGetTime();
+                }
             }
 
             if (any_init) {

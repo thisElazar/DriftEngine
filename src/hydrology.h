@@ -113,6 +113,12 @@ struct LiveHydrology {
     // (ocean is a sink). Subsequent step()s route it downstream / drain it to sea —
     // i.e. a coarse flood pulse. Cheap: one O(N) scan of the field.
     void add_water_deposit(glm::vec3 dir, float cos_radius, float amount);
+    // Bake-back from the fine SWE sim: set one cell's water from an observed
+    // water-surface elevation (m). Depression cells are SET to the matching fill
+    // (the lake freezes at the level the live sim left it); slope cells (no
+    // storage) receive mean_depth as an ADDED slug that routes downstream on
+    // subsequent steps. Ocean cells are ignored (the SWE ocean is not field water).
+    void apply_surface_set(int cell, float surf, float mean_depth);
     // Advance the live water by one step: rain in, route downstream, ocean sink.
     void step();
     // Advance the ocean climate by one step: advect SST along the current field,

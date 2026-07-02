@@ -59,6 +59,17 @@ constexpr float    WATER_BRUSH_DEPOSIT     = 75.0f; // brush_strength → field 
 // water: the brush feeds the field, the field drives everything downstream).
 struct WaterDeposit { glm::vec3 dir; float cos_radius; float amount; };
 
+// A baked-back observation from the fine SWE sim, handed main-thread →
+// hydrology worker when a disturbed tile quiesces: one field cell's observed
+// water-surface elevation (m) + mean water depth (m) over its wet texels.
+// The worker applies these via LiveHydrology::apply_surface_set.
+struct SurfaceSet { int cell; float surf; float mean_depth; };
+
+// Seconds a disturbed tile must go untouched (no brush, no cross-edge flow)
+// before its live SWE water is baked back into the field and the tile returns
+// to the re-seed pool. Long enough for a splash to settle under damping.
+constexpr double GLOBE_SWE_QUIESCE_S = 6.0;
+
 struct HydroAsync {
     std::thread       worker;
     std::atomic<bool> stop{false};
@@ -70,6 +81,9 @@ struct HydroAsync {
 
     std::mutex                deposits_mtx;
     std::vector<WaterDeposit> pending_deposits; // brush deposits, guarded by deposits_mtx
+
+    std::mutex               sets_mtx;
+    std::vector<SurfaceSet>  pending_surface_sets; // SWE bake-backs, guarded by sets_mtx
 
     std::mutex             pub_mtx;
     std::vector<glm::vec4> published;           // latest baked hydrology field, guarded by pub_mtx
@@ -222,7 +236,15 @@ struct GlobeState {
     std::vector<uint32_t>   free_slots;
     bool                    planet_swe_needs_full_init = true;
     std::unordered_set<QuadNode, QuadNodeHash> disturbed_tiles;
+    // Last time each disturbed tile was actively driven (brush pulse or
+    // cross-edge flow). Once a tile goes GLOBE_SWE_QUIESCE_S untouched, its
+    // water is baked back into the hydrology field and it is un-disturbed.
+    std::unordered_map<QuadNode, double, QuadNodeHash> disturbed_touch;
     std::unordered_set<QuadNode, QuadNodeHash> pending_init;
+    // Resident tiles whose SWE water should be re-seeded from the hydrology
+    // field (queued on every field publish; skips disturbed tiles so live SWE
+    // dynamics are never overwritten). Init-only — no terrain regeneration.
+    std::unordered_set<QuadNode, QuadNodeHash> pending_water_reseed;
     uint32_t last_processed_stamp_count = 0;
     uint32_t terrain_gen_stamp_count    = 0;
 

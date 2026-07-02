@@ -123,6 +123,12 @@ struct PlanetSweInitPC {
     uint32_t grid_h;
     float    sea_level;
     uint32_t pool_index;
+    // Tile → cube-face uv mapping, for sampling the per-face hydrology field
+    // (init seeds standing water from its water-surface elevation channel).
+    float    u_min;
+    float    v_min;
+    float    tile_size;
+    uint32_t face;
 };
 
 struct PlanetSweHAdjustPC {
