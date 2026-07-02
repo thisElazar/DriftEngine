@@ -213,7 +213,7 @@ float4 main(PSInput input) : SV_Target
         float3 ro = -planet_center;   // camera position relative to planet center
         AtmoResult ar = atmo_integrate(ro, rd, dist, normalize(sun_dir),
                                        planet_radius, atmo_density, sun_intensity,
-                                       6, 2);
+                                       8);
         color = color * ar.transmittance + ar.inscatter;
     }
 

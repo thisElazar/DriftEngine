@@ -109,7 +109,7 @@ float4 main(PSInput input) : SV_Target
         float3 rd = input.world_pos / max(dist, 1.0);
         AtmoResult ar = atmo_integrate(-planet_center, rd, dist, L,
                                        planet_radius, atmo_density, sun_intensity,
-                                       6, 2);
+                                       8);
         outc = outc * ar.transmittance + ar.inscatter;
     }
 

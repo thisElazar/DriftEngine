@@ -52,7 +52,7 @@ float4 main(PSInput input) : SV_Target
     float t_max = (ground_t > 0.0) ? ground_t : 1e12;
 
     AtmoResult ar = atmo_integrate(ro, rd, t_max, L, planet_radius,
-                                   density, sun_intensity, 16, 4);
+                                   density, sun_intensity, 24);
 
     // Sun disk + glow, attenuated by the atmosphere in front of it. Only when
     // the ray leaves the shell unobstructed (t_max is space).

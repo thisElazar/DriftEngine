@@ -6,21 +6,29 @@
 // the planet center. ALL INTERNAL MATH RUNS IN KILOMETRES: fp32 ray–sphere
 // at planet radii in metres is catastrophic — b² ≈ 4e13 carries ~4e6 of ULP
 // error into the discriminant, so intersection distances jitter by kilometres
-// as the camera moves, which reads as full-screen flicker. In km the same
-// terms sit near 4e7 with ~5 ULP, and the residual error is metre-scale.
+// as the camera moves, which reads as full-screen flicker.
+//
+// Sun transmittance is ANALYTIC (Chapman function approximation), not
+// marched. A 2–4 sample light march over a path that is hundreds of km and
+// horizon-sensitive is stable when the camera is still but decorrelates into
+// visible noise the moment it moves — the closed form is smooth by
+// construction and also handles the terminator (below-horizon depths grow
+// exponentially, so the shadowed side fades out without a branch).
+//
+// The shell is deliberately TALLER than Earth's (scale heights ~2.6× real,
+// β rescaled to keep the zenith optical depth): the atmosphere occupies more
+// of the view and the ground stays visible through less haze at distance.
 
 static const float ATMO_KM_PER_M = 1.0e-3;
 
-static const float ATMO_HEIGHT = 100.0;   // shell thickness above r_ground (km)
-static const float H_RAYLEIGH  = 8.5;     // Rayleigh density scale height (km)
-static const float H_MIE       = 1.2;     // Mie density scale height (km)
-static const float3 BETA_RAY   = float3(5.802e-3, 13.558e-3, 33.1e-3);  // per km
-static const float  BETA_MIE   = 3.996e-3;
+static const float ATMO_HEIGHT = 240.0;   // shell thickness above r_ground (km)
+static const float H_RAYLEIGH  = 22.0;    // Rayleigh density scale height (km)
+static const float H_MIE       = 4.0;     // Mie density scale height (km)
+// Per-km scattering, rescaled from Earth's (β·H preserved → same zenith depth,
+// spread over a taller shell → thinner horizontal haze).
+static const float3 BETA_RAY   = float3(2.242e-3, 5.238e-3, 12.789e-3);
+static const float  BETA_MIE   = 1.199e-3;
 static const float  MIE_G      = 0.76;    // Henyey-Greenstein anisotropy
-// Width of the soft terminator when testing per-sample sun visibility (km).
-// A smooth factor instead of a binary occlusion test — the hard branch made
-// whole samples snap on/off under camera-motion jitter (visible flicker).
-static const float  SHADOW_SOFT_KM = 12.0;
 
 // Ray vs sphere centred at the origin, KILOMETRE inputs. Uses the
 // perpendicular-distance form, which cancels far less than b² - c.
@@ -35,33 +43,37 @@ float2 atmo_ray_sphere_km(float3 ro, float3 rd, float r)
     return float2(-b - s, -b + s);
 }
 
-// Smooth sun visibility at a point (km frame): 1 in full sun, 0 behind the
-// planet, with a SHADOW_SOFT_KM-wide ramp across the geometric horizon.
-float atmo_sun_visibility(float3 p, float3 sun_dir, float r_ground)
+// Chapman grazing-incidence function, Schüler's approximation: the optical
+// depth to space along a ray at cos-zenith `coschi`, in units of (local
+// density × H). x = r/H (radius in scale heights). The below-horizon branch
+// reflects through the tangent point and explodes exponentially — which is
+// exactly the terminator falloff.
+float atmo_chapman(float x, float coschi)
 {
-    float t_close = -dot(p, sun_dir);        // closest approach along the sun ray
-    if (t_close <= 0.0) return 1.0;          // sun is above the local horizon
-    float3 perp = p + sun_dir * t_close;
-    float  min_r = length(perp);
-    return smoothstep(r_ground - SHADOW_SOFT_KM, r_ground + SHADOW_SOFT_KM, min_r);
+    float c = sqrt(1.57079632 * x);   // sqrt(pi/2 · x)
+    if (coschi >= 0.0)
+        return c / ((c - 1.0) * coschi + 1.0);
+    float sinchi = sqrt(saturate(1.0 - coschi * coschi));
+    float x_h = x * sinchi;           // radius (in H units) of the tangent point
+    float c_h = sqrt(1.57079632 * x_h);
+    float refl = c / ((c - 1.0) * (-coschi) + 1.0);
+    // exp(x - x_h) can overflow deep below the horizon; the clamp keeps the
+    // arithmetic finite (transmittance is 0 either way).
+    return min(2.0 * exp(min(x - x_h, 60.0)) * c_h - refl, 1.0e16);
 }
 
-// Optical depth (rayleigh, mie) along a ray to the top of the atmosphere (km frame).
-float2 atmo_light_depth(float3 p, float3 sun_dir, float r_ground, int steps)
+// Analytic optical depth (rayleigh, mie) from a point to space toward the sun.
+// p in the km frame; returns km of equivalent sea-level-density path per species.
+float2 atmo_sun_depth(float3 p, float3 sun_dir, float r_ground)
 {
-    float r_top = r_ground + ATMO_HEIGHT;
-    float2 t = atmo_ray_sphere_km(p, sun_dir, r_top);
-    float  seg = max(t.y, 0.0) / float(steps);
-    float2 depth = 0.0;
-    float  ti = seg * 0.5;
-    [loop] for (int i = 0; i < steps; ++i) {
-        float3 sp = p + sun_dir * ti;
-        float  h = max(length(sp) - r_ground, 0.0);
-        depth.x += exp(-h / H_RAYLEIGH) * seg;
-        depth.y += exp(-h / H_MIE) * seg;
-        ti += seg;
-    }
-    return depth;
+    float r = length(p);
+    float coschi = dot(p, sun_dir) / max(r, 1e-3);
+    float alt = max(r - r_ground, 0.0);
+    float xr = r / H_RAYLEIGH;
+    float xm = r / H_MIE;
+    return float2(
+        H_RAYLEIGH * exp(-alt / H_RAYLEIGH) * atmo_chapman(xr, coschi),
+        H_MIE      * exp(-alt / H_MIE)      * atmo_chapman(xm, coschi));
 }
 
 // First ground-sphere hit along the ray, in METRES (negative = no hit).
@@ -80,10 +92,11 @@ struct AtmoResult {
 
 // Integrate scattering along ro + t*rd for t in [0, t_max] (clipped to the
 // atmosphere shell). METRE inputs: `t_max` = distance to the fragment for
-// aerial perspective, or 1e12 for the open sky.
+// aerial perspective, or 1e12 for the open sky. Only the view ray is marched;
+// sun transmittance per sample is analytic (see atmo_sun_depth).
 AtmoResult atmo_integrate(float3 ro_m, float3 rd, float t_max_m, float3 sun_dir,
                           float r_ground_m, float density, float sun_intensity,
-                          int view_steps, int light_steps)
+                          int view_steps)
 {
     AtmoResult res;
     res.inscatter = 0.0;
@@ -112,15 +125,12 @@ AtmoResult atmo_integrate(float3 ro_m, float3 rd, float t_max_m, float3 sun_dir,
         float  d_mie = exp(-h / H_MIE) * seg;
         view_depth += float2(d_ray, d_mie);
 
-        float sun_vis = atmo_sun_visibility(p, sun_dir, r_ground);
-        if (sun_vis > 0.0) {
-            float2 light_depth = atmo_light_depth(p, sun_dir, r_ground, light_steps);
-            float3 tau = BETA_RAY * (view_depth.x + light_depth.x)
-                       + BETA_MIE * 1.1 * (view_depth.y + light_depth.y);
-            float3 attn = exp(-tau * density) * sun_vis;
-            sum_ray += attn * d_ray;
-            sum_mie += attn * d_mie;
-        }
+        float2 sun_depth = atmo_sun_depth(p, sun_dir, r_ground);
+        float3 tau = BETA_RAY * (view_depth.x + sun_depth.x)
+                   + BETA_MIE * 1.1 * (view_depth.y + sun_depth.y);
+        float3 attn = exp(-tau * density);
+        sum_ray += attn * d_ray;
+        sum_mie += attn * d_mie;
         ti += seg;
     }
 
