@@ -6,7 +6,7 @@ target_link_libraries(plant_lab PRIVATE drift_engine_core bestiary)
 
 # --- HLSL -> SPIR-V for Plant Lab shaders ---
 set(SL_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
-file(GLOB SL_HLSL_SHADERS ${SL_SHADER_DIR}/*.hlsl)
+file(GLOB SL_HLSL_SHADERS CONFIGURE_DEPENDS ${SL_SHADER_DIR}/*.hlsl)
 
 set(SL_SPV_OUTPUTS "")
 foreach(HLSL ${SL_HLSL_SHADERS})

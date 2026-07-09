@@ -1,160 +1,137 @@
 #include "pipeline.h"
 #include "vk_util.h"
 #include <cstdio>
-#include <cstring>
 
-void pipelines_create(Pipelines& p, VkDevice device)
+// Standard single-set compute pipeline quartet (shader module, descriptor set
+// layout with binding i = bindings[i], pipeline layout with one push-constant
+// range, pipeline), unpacked into the Pipelines struct's loose fields.
+static void create_compute(VkDevice device, const char* spv,
+                           const std::vector<VkDescriptorType>& bindings,
+                           uint32_t push_size,
+                           VkShaderModule& shader, VkDescriptorSetLayout& dsl,
+                           VkPipelineLayout& layout, VkPipeline& pipeline)
 {
-    // ---- SWE init pipeline --------------------------------------------------
-    auto swe_init_spirv = load_spirv("shaders/swe_init.spv");
+    ComputePipeline cp = make_compute_pipeline(device, spv, bindings, push_size);
+    shader   = cp.shader;
+    dsl      = cp.dsl;
+    layout   = cp.layout;
+    pipeline = cp.pipeline;
+}
 
-    VkShaderModuleCreateInfo swe_init_sm_ci{};
-    swe_init_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    swe_init_sm_ci.codeSize = swe_init_spirv.size() * sizeof(uint32_t);
-    swe_init_sm_ci.pCode = swe_init_spirv.data();
+void pipelines_create(Pipelines& p, VkDevice device, VkFormat color_format,
+                      VkFormat present_format)
+{
+    p.color_format = color_format;
+    p.present_format = (present_format == VK_FORMAT_UNDEFINED) ? color_format
+                                                               : present_format;
 
-    VK_CHECK(vkCreateShaderModule(device, &swe_init_sm_ci, nullptr, &p.swe_init_shader));
+    // ---- Compute pipelines ---------------------------------------------------
+    create_compute(device, "shaders/swe_init.spv",
+                   {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                   sizeof(SweInitPC),
+                   p.swe_init_shader, p.swe_init_desc_layout,
+                   p.swe_init_pipeline_layout, p.swe_init_pipeline);
 
-    VkDescriptorSetLayoutBinding swe_init_bindings[2]{};
-    swe_init_bindings[0].binding = 0;
-    swe_init_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    swe_init_bindings[0].descriptorCount = 1;
-    swe_init_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    create_compute(device, "shaders/swe_step.spv",
+                   {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLER},
+                   sizeof(SweStepPC),
+                   p.swe_step_shader, p.swe_step_desc_layout,
+                   p.swe_step_pipeline_layout, p.swe_step_pipeline);
 
-    swe_init_bindings[1].binding = 1;
-    swe_init_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    swe_init_bindings[1].descriptorCount = 1;
-    swe_init_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    create_compute(device, "shaders/terrain_brush.spv",
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                   sizeof(TerrainBrushPC),
+                   p.terrain_brush_shader, p.tb_desc_layout,
+                   p.tb_pipeline_layout, p.terrain_brush_pipeline);
 
-    VkDescriptorSetLayoutCreateInfo swe_init_dsl_ci{};
-    swe_init_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    swe_init_dsl_ci.bindingCount = 2;
-    swe_init_dsl_ci.pBindings = swe_init_bindings;
+    create_compute(device, "shaders/erosion.spv",
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLER,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLER},
+                   sizeof(ErosionPC),
+                   p.erosion_shader, p.ero_desc_layout,
+                   p.ero_pipeline_layout, p.erosion_pipeline);
 
-    VK_CHECK(vkCreateDescriptorSetLayout(device, &swe_init_dsl_ci, nullptr, &p.swe_init_desc_layout));
+    create_compute(device, "shaders/atmosphere3d_cs.spv",
+                   {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLER,
+                    VK_DESCRIPTOR_TYPE_SAMPLER},
+                   sizeof(Atmo3DPC),
+                   p.atmo_shader, p.atmo_desc_layout,
+                   p.atmo_pipeline_layout, p.atmo_pipeline);
 
-    VkPushConstantRange swe_init_push{};
-    swe_init_push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    swe_init_push.offset = 0;
-    swe_init_push.size = sizeof(SweInitPC);
+    create_compute(device, "shaders/planet_gen_cs.spv",
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+                   sizeof(PlanetGenPC),
+                   p.terrain_gen_shader, p.terrain_gen_desc_layout,
+                   p.terrain_gen_pipeline_layout, p.terrain_gen_pipeline);
 
-    VkPipelineLayoutCreateInfo swe_init_pl_ci{};
-    swe_init_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    swe_init_pl_ci.setLayoutCount = 1;
-    swe_init_pl_ci.pSetLayouts = &p.swe_init_desc_layout;
-    swe_init_pl_ci.pushConstantRangeCount = 1;
-    swe_init_pl_ci.pPushConstantRanges = &swe_init_push;
+    create_compute(device, "shaders/planet_swe_init_cs.spv",
+                   {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,   // hydrology field (water surface)
+                    VK_DESCRIPTOR_TYPE_SAMPLER},
+                   sizeof(PlanetSweInitPC),
+                   p.planet_swe_init_shader, p.planet_swe_init_desc_layout,
+                   p.planet_swe_init_pipeline_layout, p.planet_swe_init_pipeline);
 
-    VK_CHECK(vkCreatePipelineLayout(device, &swe_init_pl_ci, nullptr, &p.swe_init_pipeline_layout));
+    create_compute(device, "shaders/planet_swe_step_cs.spv",
+                   {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+                   sizeof(PlanetSweStepPC),
+                   p.planet_swe_step_shader, p.planet_swe_step_desc_layout,
+                   p.planet_swe_step_pipeline_layout, p.planet_swe_step_pipeline);
 
-    VkPipelineShaderStageCreateInfo swe_init_stage{};
-    swe_init_stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    swe_init_stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    swe_init_stage.module = p.swe_init_shader;
-    swe_init_stage.pName = "main";
+    create_compute(device, "shaders/planet_swe_h_adjust_cs.spv",
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                   sizeof(PlanetSweHAdjustPC),
+                   p.planet_swe_h_adjust_shader, p.planet_swe_h_adjust_desc_layout,
+                   p.planet_swe_h_adjust_pipeline_layout, p.planet_swe_h_adjust_pipeline);
 
-    VkComputePipelineCreateInfo swe_init_cp_ci{};
-    swe_init_cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    swe_init_cp_ci.stage = swe_init_stage;
-    swe_init_cp_ci.layout = p.swe_init_pipeline_layout;
-
-    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &swe_init_cp_ci, nullptr, &p.swe_init_pipeline));
-
-    // ---- SWE step pipeline --------------------------------------------------
-    auto swe_step_spirv = load_spirv("shaders/swe_step.spv");
-
-    VkShaderModuleCreateInfo swe_step_sm_ci{};
-    swe_step_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    swe_step_sm_ci.codeSize = swe_step_spirv.size() * sizeof(uint32_t);
-    swe_step_sm_ci.pCode = swe_step_spirv.data();
-
-    VK_CHECK(vkCreateShaderModule(device, &swe_step_sm_ci, nullptr, &p.swe_step_shader));
-
-    VkDescriptorSetLayoutBinding swe_step_bindings[6]{};
-    swe_step_bindings[0].binding = 0;
-    swe_step_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    swe_step_bindings[0].descriptorCount = 1;
-    swe_step_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    swe_step_bindings[1].binding = 1;
-    swe_step_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    swe_step_bindings[1].descriptorCount = 1;
-    swe_step_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    swe_step_bindings[2].binding = 2;
-    swe_step_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    swe_step_bindings[2].descriptorCount = 1;
-    swe_step_bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    swe_step_bindings[3].binding = 3;
-    swe_step_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    swe_step_bindings[3].descriptorCount = 1;
-    swe_step_bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    swe_step_bindings[4].binding = 4;
-    swe_step_bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    swe_step_bindings[4].descriptorCount = 1;
-    swe_step_bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    swe_step_bindings[5].binding = 5;
-    swe_step_bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    swe_step_bindings[5].descriptorCount = 1;
-    swe_step_bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutCreateInfo swe_step_dsl_ci{};
-    swe_step_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    swe_step_dsl_ci.bindingCount = 6;
-    swe_step_dsl_ci.pBindings = swe_step_bindings;
-
-    VK_CHECK(vkCreateDescriptorSetLayout(device, &swe_step_dsl_ci, nullptr, &p.swe_step_desc_layout));
-
-    VkPushConstantRange swe_step_push{};
-    swe_step_push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    swe_step_push.offset = 0;
-    swe_step_push.size = sizeof(SweStepPC);
-
-    VkPipelineLayoutCreateInfo swe_step_pl_ci{};
-    swe_step_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    swe_step_pl_ci.setLayoutCount = 1;
-    swe_step_pl_ci.pSetLayouts = &p.swe_step_desc_layout;
-    swe_step_pl_ci.pushConstantRangeCount = 1;
-    swe_step_pl_ci.pPushConstantRanges = &swe_step_push;
-
-    VK_CHECK(vkCreatePipelineLayout(device, &swe_step_pl_ci, nullptr, &p.swe_step_pipeline_layout));
-
-    VkPipelineShaderStageCreateInfo swe_step_stage{};
-    swe_step_stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    swe_step_stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    swe_step_stage.module = p.swe_step_shader;
-    swe_step_stage.pName = "main";
-
-    VkComputePipelineCreateInfo swe_step_cp_ci{};
-    swe_step_cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    swe_step_cp_ci.stage = swe_step_stage;
-    swe_step_cp_ci.layout = p.swe_step_pipeline_layout;
-
-    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &swe_step_cp_ci, nullptr, &p.swe_step_pipeline));
+    create_compute(device, "shaders/sand_sim_cs.spv",
+                   {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    VK_DESCRIPTOR_TYPE_SAMPLER,
+                    VK_DESCRIPTOR_TYPE_SAMPLER,
+                    VK_DESCRIPTOR_TYPE_SAMPLER},
+                   sizeof(SandSimPC),
+                   p.sand_sim_shader, p.sand_sim_desc_layout,
+                   p.sand_sim_pipeline_layout, p.sand_sim_pipeline);
 
     // ---- Graphics pipeline (terrain) ----------------------------------------
-    auto terrain_vs_spirv = load_spirv("shaders/terrain_vs.spv");
-    auto terrain_fs_spirv = load_spirv("shaders/terrain_fs.spv");
-
-    VkShaderModuleCreateInfo vs_sm_ci{};
-    vs_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    vs_sm_ci.codeSize = terrain_vs_spirv.size() * sizeof(uint32_t);
-    vs_sm_ci.pCode = terrain_vs_spirv.data();
-
-    VK_CHECK(vkCreateShaderModule(device, &vs_sm_ci, nullptr, &p.terrain_vs));
-
-    VkShaderModuleCreateInfo fs_sm_ci{};
-    fs_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    fs_sm_ci.codeSize = terrain_fs_spirv.size() * sizeof(uint32_t);
-    fs_sm_ci.pCode = terrain_fs_spirv.data();
-
-    VK_CHECK(vkCreateShaderModule(device, &fs_sm_ci, nullptr, &p.terrain_fs));
+    p.terrain_vs = make_shader(device, "shaders/terrain_vs.spv");
+    p.terrain_fs = make_shader(device, "shaders/terrain_fs.spv");
 
     // Graphics descriptor set layout: UBO + 7 textures (SAMPLED_IMAGE) + 1 shared sampler
-    VkDescriptorSetLayoutBinding gfx_bindings[9]{};
+    VkDescriptorSetLayoutBinding gfx_bindings[10]{};
     gfx_bindings[0].binding = 0;
     gfx_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     gfx_bindings[0].descriptorCount = 1;
@@ -200,9 +177,14 @@ void pipelines_create(Pipelines& p, VkDevice device)
     gfx_bindings[8].descriptorCount = 1;
     gfx_bindings[8].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
+    gfx_bindings[9].binding = 9;
+    gfx_bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;   // climate (sst/current)
+    gfx_bindings[9].descriptorCount = 1;
+    gfx_bindings[9].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
     VkDescriptorSetLayoutCreateInfo gfx_dsl_ci{};
     gfx_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    gfx_dsl_ci.bindingCount = 9;
+    gfx_dsl_ci.bindingCount = 10;
     gfx_dsl_ci.pBindings = gfx_bindings;
 
     VK_CHECK(vkCreateDescriptorSetLayout(device, &gfx_dsl_ci, nullptr, &p.gfx_desc_layout));
@@ -305,13 +287,12 @@ void pipelines_create(Pipelines& p, VkDevice device)
     dynamic_state.dynamicStateCount = 2;
     dynamic_state.pDynamicStates = dynamic_states;
 
-    VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
     VkFormat depth_format = VK_FORMAT_D32_SFLOAT;
 
     VkPipelineRenderingCreateInfo rendering_ci{};
     rendering_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     rendering_ci.colorAttachmentCount = 1;
-    rendering_ci.pColorAttachmentFormats = &color_format;
+    rendering_ci.pColorAttachmentFormats = &p.color_format;
     rendering_ci.depthAttachmentFormat = depth_format;
 
     VkGraphicsPipelineCreateInfo gfx_pipe_ci{};
@@ -352,22 +333,8 @@ void pipelines_create(Pipelines& p, VkDevice device)
     VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &clip_gfx_pipe_ci, nullptr, &p.clipmap_terrain_pipeline));
 
     // ---- Water pipeline (transparent, same layout) --------------------------
-    auto water_vs_spirv = load_spirv("shaders/water_vs.spv");
-    auto water_fs_spirv = load_spirv("shaders/water_fs.spv");
-
-    VkShaderModuleCreateInfo water_vs_sm_ci{};
-    water_vs_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    water_vs_sm_ci.codeSize = water_vs_spirv.size() * sizeof(uint32_t);
-    water_vs_sm_ci.pCode = water_vs_spirv.data();
-
-    VK_CHECK(vkCreateShaderModule(device, &water_vs_sm_ci, nullptr, &p.water_vs));
-
-    VkShaderModuleCreateInfo water_fs_sm_ci{};
-    water_fs_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    water_fs_sm_ci.codeSize = water_fs_spirv.size() * sizeof(uint32_t);
-    water_fs_sm_ci.pCode = water_fs_spirv.data();
-
-    VK_CHECK(vkCreateShaderModule(device, &water_fs_sm_ci, nullptr, &p.water_fs));
+    p.water_vs = make_shader(device, "shaders/water_vs.spv");
+    p.water_fs = make_shader(device, "shaders/water_fs.spv");
 
     VkPipelineShaderStageCreateInfo water_stages[2]{};
     water_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -409,21 +376,71 @@ void pipelines_create(Pipelines& p, VkDevice device)
 
     VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &water_pipe_ci, nullptr, &p.water_pipeline));
 
+    // ---- River overlay pipeline (animated drainage, alpha blend, no depth write)
+    {
+        p.river_vs = make_shader(device, "shaders/river_overlay_vs.spv");
+        p.river_fs = make_shader(device, "shaders/river_overlay_fs.spv");
+
+        // Own minimal descriptor layout: camera UBO + heightmap pool + hydrology + sampler.
+        VkDescriptorSetLayoutBinding rb[4]{};
+        rb[0].binding = 0;
+        rb[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        rb[0].descriptorCount = 1;
+        rb[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT; // FS reads sun for water lighting
+        rb[1].binding = 1;
+        rb[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;   // terrain heightmap pool
+        rb[1].descriptorCount = 1;
+        rb[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        rb[2].binding = 2;
+        rb[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;   // hydrology field
+        rb[2].descriptorCount = 1;
+        rb[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        rb[3].binding = 3;
+        rb[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        rb[3].descriptorCount = 1;
+        rb[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo rdsl_ci{};
+        rdsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        rdsl_ci.bindingCount = 4;
+        rdsl_ci.pBindings = rb;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &rdsl_ci, nullptr, &p.river_desc_layout));
+
+        VkPushConstantRange river_push{};
+        river_push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        river_push.offset = 0;
+        river_push.size = sizeof(RiverOverlayPC);
+
+        VkPipelineLayoutCreateInfo river_pl_ci{};
+        river_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        river_pl_ci.setLayoutCount = 1;
+        river_pl_ci.pSetLayouts = &p.river_desc_layout;
+        river_pl_ci.pushConstantRangeCount = 1;
+        river_pl_ci.pPushConstantRanges = &river_push;
+        VK_CHECK(vkCreatePipelineLayout(device, &river_pl_ci, nullptr, &p.river_pipeline_layout));
+
+        VkPipelineShaderStageCreateInfo river_stages[2]{};
+        river_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        river_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        river_stages[0].module = p.river_vs;
+        river_stages[0].pName = "main";
+        river_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        river_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        river_stages[1].module = p.river_fs;
+        river_stages[1].pName = "main";
+
+        // Same tile grid mesh, alpha blend, depth test on / write off (like water).
+        VkGraphicsPipelineCreateInfo river_pipe_ci = gfx_pipe_ci;
+        river_pipe_ci.pStages = river_stages;
+        river_pipe_ci.pDepthStencilState = &water_depth_stencil;
+        river_pipe_ci.pColorBlendState = &water_color_blend;
+        river_pipe_ci.layout = p.river_pipeline_layout;
+        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &river_pipe_ci, nullptr, &p.river_pipeline));
+    }
+
     // ---- Cloud raymarch pipeline (fullscreen, alpha blend, no depth) ---------
-    auto rm_vs_spirv = load_spirv("shaders/cloud_raymarch_vs.spv");
-    auto rm_fs_spirv = load_spirv("shaders/cloud_raymarch_fs.spv");
-
-    VkShaderModuleCreateInfo rm_vs_sm_ci{};
-    rm_vs_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    rm_vs_sm_ci.codeSize = rm_vs_spirv.size() * sizeof(uint32_t);
-    rm_vs_sm_ci.pCode = rm_vs_spirv.data();
-    VK_CHECK(vkCreateShaderModule(device, &rm_vs_sm_ci, nullptr, &p.raymarch_vs));
-
-    VkShaderModuleCreateInfo rm_fs_sm_ci{};
-    rm_fs_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    rm_fs_sm_ci.codeSize = rm_fs_spirv.size() * sizeof(uint32_t);
-    rm_fs_sm_ci.pCode = rm_fs_spirv.data();
-    VK_CHECK(vkCreateShaderModule(device, &rm_fs_sm_ci, nullptr, &p.raymarch_fs));
+    p.raymarch_vs = make_shader(device, "shaders/cloud_raymarch_vs.spv");
+    p.raymarch_fs = make_shader(device, "shaders/cloud_raymarch_fs.spv");
 
     VkPipelineShaderStageCreateInfo rm_stages[2]{};
     rm_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -451,555 +468,6 @@ void pipelines_create(Pipelines& p, VkDevice device)
     rm_pipe_ci.layout = p.raymarch_pipeline_layout;
 
     VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &rm_pipe_ci, nullptr, &p.raymarch_pipeline));
-
-    // ---- Terrain brush compute pipeline -------------------------------------
-    auto terrain_brush_spirv = load_spirv("shaders/terrain_brush.spv");
-
-    VkShaderModuleCreateInfo tb_sm_ci{};
-    tb_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    tb_sm_ci.codeSize = terrain_brush_spirv.size() * sizeof(uint32_t);
-    tb_sm_ci.pCode = terrain_brush_spirv.data();
-
-    VK_CHECK(vkCreateShaderModule(device, &tb_sm_ci, nullptr, &p.terrain_brush_shader));
-
-    VkDescriptorSetLayoutBinding tb_binding{};
-    tb_binding.binding = 0;
-    tb_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    tb_binding.descriptorCount = 1;
-    tb_binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutCreateInfo tb_dsl_ci{};
-    tb_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    tb_dsl_ci.bindingCount = 1;
-    tb_dsl_ci.pBindings = &tb_binding;
-
-    VK_CHECK(vkCreateDescriptorSetLayout(device, &tb_dsl_ci, nullptr, &p.tb_desc_layout));
-
-    VkPushConstantRange tb_push{};
-    tb_push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    tb_push.offset = 0;
-    tb_push.size = sizeof(TerrainBrushPC);
-
-    VkPipelineLayoutCreateInfo tb_pl_ci{};
-    tb_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    tb_pl_ci.setLayoutCount = 1;
-    tb_pl_ci.pSetLayouts = &p.tb_desc_layout;
-    tb_pl_ci.pushConstantRangeCount = 1;
-    tb_pl_ci.pPushConstantRanges = &tb_push;
-
-    VK_CHECK(vkCreatePipelineLayout(device, &tb_pl_ci, nullptr, &p.tb_pipeline_layout));
-
-    VkPipelineShaderStageCreateInfo tb_stage{};
-    tb_stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    tb_stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    tb_stage.module = p.terrain_brush_shader;
-    tb_stage.pName = "main";
-
-    VkComputePipelineCreateInfo tb_cp_ci{};
-    tb_cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    tb_cp_ci.stage = tb_stage;
-    tb_cp_ci.layout = p.tb_pipeline_layout;
-
-    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &tb_cp_ci, nullptr, &p.terrain_brush_pipeline));
-
-    // ---- Erosion compute pipeline -------------------------------------------
-    auto erosion_spirv = load_spirv("shaders/erosion.spv");
-
-    VkShaderModuleCreateInfo ero_sm_ci{};
-    ero_sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    ero_sm_ci.codeSize = erosion_spirv.size() * sizeof(uint32_t);
-    ero_sm_ci.pCode = erosion_spirv.data();
-
-    VK_CHECK(vkCreateShaderModule(device, &ero_sm_ci, nullptr, &p.erosion_shader));
-
-    VkDescriptorSetLayoutBinding ero_bindings[8]{};
-    ero_bindings[0].binding = 0;
-    ero_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    ero_bindings[0].descriptorCount = 1;
-    ero_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    ero_bindings[1].binding = 1;
-    ero_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    ero_bindings[1].descriptorCount = 1;
-    ero_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    ero_bindings[2].binding = 2;
-    ero_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    ero_bindings[2].descriptorCount = 1;
-    ero_bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    ero_bindings[3].binding = 3;
-    ero_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    ero_bindings[3].descriptorCount = 1;
-    ero_bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    ero_bindings[4].binding = 4;
-    ero_bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    ero_bindings[4].descriptorCount = 1;
-    ero_bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    ero_bindings[5].binding = 5;
-    ero_bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    ero_bindings[5].descriptorCount = 1;
-    ero_bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    ero_bindings[6].binding = 6;
-    ero_bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    ero_bindings[6].descriptorCount = 1;
-    ero_bindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    ero_bindings[7].binding = 7;
-    ero_bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    ero_bindings[7].descriptorCount = 1;
-    ero_bindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutCreateInfo ero_dsl_ci{};
-    ero_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    ero_dsl_ci.bindingCount = 8;
-    ero_dsl_ci.pBindings = ero_bindings;
-
-    VK_CHECK(vkCreateDescriptorSetLayout(device, &ero_dsl_ci, nullptr, &p.ero_desc_layout));
-
-    VkPushConstantRange ero_push{};
-    ero_push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    ero_push.offset = 0;
-    ero_push.size = sizeof(ErosionPC);
-
-    VkPipelineLayoutCreateInfo ero_pl_ci{};
-    ero_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    ero_pl_ci.setLayoutCount = 1;
-    ero_pl_ci.pSetLayouts = &p.ero_desc_layout;
-    ero_pl_ci.pushConstantRangeCount = 1;
-    ero_pl_ci.pPushConstantRanges = &ero_push;
-
-    VK_CHECK(vkCreatePipelineLayout(device, &ero_pl_ci, nullptr, &p.ero_pipeline_layout));
-
-    VkPipelineShaderStageCreateInfo ero_stage{};
-    ero_stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    ero_stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    ero_stage.module = p.erosion_shader;
-    ero_stage.pName = "main";
-
-    VkComputePipelineCreateInfo ero_cp_ci{};
-    ero_cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    ero_cp_ci.stage = ero_stage;
-    ero_cp_ci.layout = p.ero_pipeline_layout;
-
-    VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &ero_cp_ci, nullptr, &p.erosion_pipeline));
-
-    // ---- Atmosphere descriptor set layout --------------------------------------
-    VkDescriptorSetLayoutBinding atmo_bindings[11]{};
-    atmo_bindings[0].binding = 0;
-    atmo_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    atmo_bindings[0].descriptorCount = 1;
-    atmo_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    atmo_bindings[1].binding = 1;
-    atmo_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    atmo_bindings[1].descriptorCount = 1;
-    atmo_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    atmo_bindings[2].binding = 2;
-    atmo_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    atmo_bindings[2].descriptorCount = 1;
-    atmo_bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    atmo_bindings[3].binding = 3;
-    atmo_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    atmo_bindings[3].descriptorCount = 1;
-    atmo_bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    atmo_bindings[4].binding = 4;
-    atmo_bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    atmo_bindings[4].descriptorCount = 1;
-    atmo_bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    atmo_bindings[5].binding = 5;
-    atmo_bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    atmo_bindings[5].descriptorCount = 1;
-    atmo_bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    atmo_bindings[6].binding = 6;
-    atmo_bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    atmo_bindings[6].descriptorCount = 1;
-    atmo_bindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    atmo_bindings[7].binding = 7;
-    atmo_bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    atmo_bindings[7].descriptorCount = 1;
-    atmo_bindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    atmo_bindings[8].binding = 8;
-    atmo_bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    atmo_bindings[8].descriptorCount = 1;
-    atmo_bindings[8].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    atmo_bindings[9].binding = 9;
-    atmo_bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    atmo_bindings[9].descriptorCount = 1;
-    atmo_bindings[9].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    atmo_bindings[10].binding = 10;
-    atmo_bindings[10].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    atmo_bindings[10].descriptorCount = 1;
-    atmo_bindings[10].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutCreateInfo atmo_dsl_ci{};
-    atmo_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    atmo_dsl_ci.bindingCount = 11;
-    atmo_dsl_ci.pBindings = atmo_bindings;
-
-    VK_CHECK(vkCreateDescriptorSetLayout(device, &atmo_dsl_ci, nullptr, &p.atmo_desc_layout));
-
-    // ---- Terrain gen compute descriptor set layout + pipeline layout -----------
-    VkDescriptorSetLayoutBinding tgen_bindings[2]{};
-    tgen_bindings[0].binding = 0;
-    tgen_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    tgen_bindings[0].descriptorCount = 1;
-    tgen_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    tgen_bindings[1].binding = 1;
-    tgen_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    tgen_bindings[1].descriptorCount = 1;
-    tgen_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutCreateInfo tgen_dsl_ci{};
-    tgen_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    tgen_dsl_ci.bindingCount = 2;
-    tgen_dsl_ci.pBindings = tgen_bindings;
-
-    VK_CHECK(vkCreateDescriptorSetLayout(device, &tgen_dsl_ci, nullptr, &p.terrain_gen_desc_layout));
-
-    VkPushConstantRange tgen_push{};
-    tgen_push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    tgen_push.offset = 0;
-    tgen_push.size = sizeof(PlanetGenPC);
-
-    VkPipelineLayoutCreateInfo tgen_pl_ci{};
-    tgen_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    tgen_pl_ci.setLayoutCount = 1;
-    tgen_pl_ci.pSetLayouts = &p.terrain_gen_desc_layout;
-    tgen_pl_ci.pushConstantRangeCount = 1;
-    tgen_pl_ci.pPushConstantRanges = &tgen_push;
-
-    VK_CHECK(vkCreatePipelineLayout(device, &tgen_pl_ci, nullptr, &p.terrain_gen_pipeline_layout));
-
-    {
-        auto spv = load_spirv("shaders/planet_gen_cs.spv");
-        VkShaderModuleCreateInfo sm_ci{};
-        sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        sm_ci.codeSize = spv.size() * sizeof(uint32_t);
-        sm_ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &p.terrain_gen_shader));
-    }
-
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.terrain_gen_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.terrain_gen_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.terrain_gen_pipeline));
-    }
-
-    // ---- Planet SWE init pipeline -----------------------------------------------
-    {
-        VkDescriptorSetLayoutBinding bindings[5]{};
-        bindings[0].binding = 0;
-        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        bindings[0].descriptorCount = 1;
-        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-        for (int i = 1; i <= 3; ++i) {
-            bindings[i].binding = (uint32_t)i;
-            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            bindings[i].descriptorCount = 1;
-            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        }
-
-        bindings[4].binding = 4;
-        bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[4].descriptorCount = 1;
-        bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-        VkDescriptorSetLayoutCreateInfo dsl_ci{};
-        dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dsl_ci.bindingCount = 5;
-        dsl_ci.pBindings = bindings;
-        VK_CHECK(vkCreateDescriptorSetLayout(device, &dsl_ci, nullptr, &p.planet_swe_init_desc_layout));
-
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(PlanetSweInitPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.planet_swe_init_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.planet_swe_init_pipeline_layout));
-
-        auto spv = load_spirv("shaders/planet_swe_init_cs.spv");
-        VkShaderModuleCreateInfo sm_ci{};
-        sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        sm_ci.codeSize = spv.size() * sizeof(uint32_t);
-        sm_ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &p.planet_swe_init_shader));
-
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.planet_swe_init_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.planet_swe_init_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.planet_swe_init_pipeline));
-    }
-
-    // ---- Planet SWE step pipeline -----------------------------------------------
-    {
-        VkDescriptorSetLayoutBinding bindings[5]{};
-        bindings[0].binding = 0;
-        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        bindings[0].descriptorCount = 1;
-        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-        bindings[1].binding = 1;
-        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        bindings[1].descriptorCount = 1;
-        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-        bindings[2].binding = 2;
-        bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        bindings[2].descriptorCount = 1;
-        bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-        bindings[3].binding = 3;
-        bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        bindings[3].descriptorCount = 1;
-        bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-        bindings[4].binding = 4;
-        bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        bindings[4].descriptorCount = 1;
-        bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-        VkDescriptorSetLayoutCreateInfo dsl_ci{};
-        dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dsl_ci.bindingCount = 5;
-        dsl_ci.pBindings = bindings;
-        VK_CHECK(vkCreateDescriptorSetLayout(device, &dsl_ci, nullptr, &p.planet_swe_step_desc_layout));
-
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(PlanetSweStepPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.planet_swe_step_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.planet_swe_step_pipeline_layout));
-
-        auto spv = load_spirv("shaders/planet_swe_step_cs.spv");
-        VkShaderModuleCreateInfo sm_ci{};
-        sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        sm_ci.codeSize = spv.size() * sizeof(uint32_t);
-        sm_ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &p.planet_swe_step_shader));
-
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.planet_swe_step_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.planet_swe_step_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.planet_swe_step_pipeline));
-    }
-
-    // ---- Planet SWE h-adjust pipeline ------------------------------------------
-    {
-        VkDescriptorSetLayoutBinding bindings[2]{};
-        for (int i = 0; i < 2; ++i) {
-            bindings[i].binding = (uint32_t)i;
-            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            bindings[i].descriptorCount = 1;
-            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        }
-
-        VkDescriptorSetLayoutCreateInfo dsl_ci{};
-        dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dsl_ci.bindingCount = 2;
-        dsl_ci.pBindings = bindings;
-        VK_CHECK(vkCreateDescriptorSetLayout(device, &dsl_ci, nullptr, &p.planet_swe_h_adjust_desc_layout));
-
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(PlanetSweHAdjustPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.planet_swe_h_adjust_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.planet_swe_h_adjust_pipeline_layout));
-
-        auto spv = load_spirv("shaders/planet_swe_h_adjust_cs.spv");
-        VkShaderModuleCreateInfo sm_ci{};
-        sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        sm_ci.codeSize = spv.size() * sizeof(uint32_t);
-        sm_ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &p.planet_swe_h_adjust_shader));
-
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.planet_swe_h_adjust_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.planet_swe_h_adjust_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.planet_swe_h_adjust_pipeline));
-    }
-
-    // ---- Atmosphere pipeline layout + pipeline ---------------------------------
-    VkPushConstantRange atmo_push{};
-    atmo_push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    atmo_push.offset = 0;
-    atmo_push.size = sizeof(Atmo3DPC);
-
-    VkPipelineLayoutCreateInfo atmo_pl_ci{};
-    atmo_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    atmo_pl_ci.setLayoutCount = 1;
-    atmo_pl_ci.pSetLayouts = &p.atmo_desc_layout;
-    atmo_pl_ci.pushConstantRangeCount = 1;
-    atmo_pl_ci.pPushConstantRanges = &atmo_push;
-
-    VK_CHECK(vkCreatePipelineLayout(device, &atmo_pl_ci, nullptr, &p.atmo_pipeline_layout));
-
-    {
-        auto spv = load_spirv("shaders/atmosphere3d_cs.spv");
-        VkShaderModuleCreateInfo sm_ci{};
-        sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        sm_ci.codeSize = spv.size() * sizeof(uint32_t);
-        sm_ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &p.atmo_shader));
-    }
-
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.atmo_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.atmo_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.atmo_pipeline));
-    }
-
-    // ---- Sand compute descriptor set layout ------------------------------------
-    VkDescriptorSetLayoutBinding sand_sim_bindings[7]{};
-    sand_sim_bindings[0].binding = 0;
-    sand_sim_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    sand_sim_bindings[0].descriptorCount = 1;
-    sand_sim_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    sand_sim_bindings[1].binding = 1;
-    sand_sim_bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    sand_sim_bindings[1].descriptorCount = 1;
-    sand_sim_bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    sand_sim_bindings[2].binding = 2;
-    sand_sim_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sand_sim_bindings[2].descriptorCount = 1;
-    sand_sim_bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    sand_sim_bindings[3].binding = 3;
-    sand_sim_bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    sand_sim_bindings[3].descriptorCount = 1;
-    sand_sim_bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    sand_sim_bindings[4].binding = 4;
-    sand_sim_bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    sand_sim_bindings[4].descriptorCount = 1;
-    sand_sim_bindings[4].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    sand_sim_bindings[5].binding = 5;
-    sand_sim_bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    sand_sim_bindings[5].descriptorCount = 1;
-    sand_sim_bindings[5].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    sand_sim_bindings[6].binding = 6;
-    sand_sim_bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
-    sand_sim_bindings[6].descriptorCount = 1;
-    sand_sim_bindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutCreateInfo sand_sim_dsl_ci{};
-    sand_sim_dsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    sand_sim_dsl_ci.bindingCount = 7;
-    sand_sim_dsl_ci.pBindings = sand_sim_bindings;
-
-    VK_CHECK(vkCreateDescriptorSetLayout(device, &sand_sim_dsl_ci, nullptr, &p.sand_sim_desc_layout));
-
-    // ---- Sand compute pipeline layout + pipeline --------------------------------
-    VkPushConstantRange sand_sim_push{};
-    sand_sim_push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    sand_sim_push.offset = 0;
-    sand_sim_push.size = sizeof(SandSimPC);
-
-    VkPipelineLayoutCreateInfo sand_sim_pl_ci{};
-    sand_sim_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    sand_sim_pl_ci.setLayoutCount = 1;
-    sand_sim_pl_ci.pSetLayouts = &p.sand_sim_desc_layout;
-    sand_sim_pl_ci.pushConstantRangeCount = 1;
-    sand_sim_pl_ci.pPushConstantRanges = &sand_sim_push;
-
-    VK_CHECK(vkCreatePipelineLayout(device, &sand_sim_pl_ci, nullptr, &p.sand_sim_pipeline_layout));
-
-    {
-        auto spv = load_spirv("shaders/sand_sim_cs.spv");
-        VkShaderModuleCreateInfo sm_ci{};
-        sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        sm_ci.codeSize = spv.size() * sizeof(uint32_t);
-        sm_ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &p.sand_sim_shader));
-    }
-
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.sand_sim_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.sand_sim_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.sand_sim_pipeline));
-    }
 
     // ---- Sand render descriptor set layout + pipeline layout --------------------
     VkDescriptorSetLayoutBinding sand_render_bindings[2]{};
@@ -1035,22 +503,8 @@ void pipelines_create(Pipelines& p, VkDevice device)
     VK_CHECK(vkCreatePipelineLayout(device, &sand_render_pl_ci, nullptr, &p.sand_render_pipeline_layout));
 
     // ---- Sand render shaders + pipeline -----------------------------------------
-    {
-        auto spv = load_spirv("shaders/sand_render_vs.spv");
-        VkShaderModuleCreateInfo sm_ci{};
-        sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        sm_ci.codeSize = spv.size() * sizeof(uint32_t);
-        sm_ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &p.sand_render_vs));
-    }
-    {
-        auto spv = load_spirv("shaders/sand_render_fs.spv");
-        VkShaderModuleCreateInfo sm_ci{};
-        sm_ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        sm_ci.codeSize = spv.size() * sizeof(uint32_t);
-        sm_ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &sm_ci, nullptr, &p.sand_render_fs));
-    }
+    p.sand_render_vs = make_shader(device, "shaders/sand_render_vs.spv");
+    p.sand_render_fs = make_shader(device, "shaders/sand_render_fs.spv");
 
     {
         VkPipelineShaderStageCreateInfo sand_stages[2]{};
@@ -1102,6 +556,132 @@ void pipelines_create(Pipelines& p, VkDevice device)
 
         VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &sand_pipe_ci, nullptr, &p.sand_render_pipeline));
     }
+
+    // ---- Sky pipeline (fullscreen atmosphere raymarch) ------------------------
+    // Depth EQUAL against the reverse-Z clear value (0): the fullscreen triangle
+    // sits at z = 0, so only pixels no geometry touched get sky. Opaque.
+    {
+        p.fullscreen_vs = make_shader(device, "shaders/fullscreen_vs.spv");
+        p.sky_fs = make_shader(device, "shaders/sky_fs.spv");
+
+        VkDescriptorSetLayoutBinding sb{};
+        sb.binding = 0;
+        sb.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;   // camera UBO
+        sb.descriptorCount = 1;
+        sb.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo sdsl_ci{};
+        sdsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        sdsl_ci.bindingCount = 1;
+        sdsl_ci.pBindings = &sb;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &sdsl_ci, nullptr, &p.sky_desc_layout));
+
+        VkPushConstantRange sky_push{};
+        sky_push.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        sky_push.offset = 0;
+        sky_push.size = sizeof(SkyPC);
+
+        VkPipelineLayoutCreateInfo sky_pl_ci{};
+        sky_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        sky_pl_ci.setLayoutCount = 1;
+        sky_pl_ci.pSetLayouts = &p.sky_desc_layout;
+        sky_pl_ci.pushConstantRangeCount = 1;
+        sky_pl_ci.pPushConstantRanges = &sky_push;
+        VK_CHECK(vkCreatePipelineLayout(device, &sky_pl_ci, nullptr, &p.sky_pipeline_layout));
+
+        VkPipelineShaderStageCreateInfo sky_stages[2]{};
+        sky_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        sky_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        sky_stages[0].module = p.fullscreen_vs;
+        sky_stages[0].pName = "main";
+        sky_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        sky_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        sky_stages[1].module = p.sky_fs;
+        sky_stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo sky_vi{};
+        sky_vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+        VkPipelineDepthStencilStateCreateInfo sky_ds{};
+        sky_ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        sky_ds.depthTestEnable = VK_TRUE;
+        sky_ds.depthWriteEnable = VK_FALSE;
+        sky_ds.depthCompareOp = VK_COMPARE_OP_EQUAL;
+
+        VkGraphicsPipelineCreateInfo sky_pipe_ci = gfx_pipe_ci;
+        sky_pipe_ci.pStages = sky_stages;
+        sky_pipe_ci.pVertexInputState = &sky_vi;
+        sky_pipe_ci.pDepthStencilState = &sky_ds;
+        sky_pipe_ci.pColorBlendState = &color_blend;   // opaque
+        sky_pipe_ci.layout = p.sky_pipeline_layout;
+        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &sky_pipe_ci, nullptr, &p.sky_pipeline));
+    }
+
+    // ---- Tonemap pipeline (HDR scene → present format) ------------------------
+    {
+        p.tonemap_fs = make_shader(device, "shaders/tonemap_fs.spv");
+
+        VkDescriptorSetLayoutBinding tb2[2]{};
+        tb2[0].binding = 0;
+        tb2[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;   // HDR scene
+        tb2[0].descriptorCount = 1;
+        tb2[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        tb2[1].binding = 1;
+        tb2[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        tb2[1].descriptorCount = 1;
+        tb2[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo tdsl_ci{};
+        tdsl_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        tdsl_ci.bindingCount = 2;
+        tdsl_ci.pBindings = tb2;
+        VK_CHECK(vkCreateDescriptorSetLayout(device, &tdsl_ci, nullptr, &p.tonemap_desc_layout));
+
+        VkPushConstantRange tm_push{};
+        tm_push.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        tm_push.offset = 0;
+        tm_push.size = sizeof(TonemapPC);
+
+        VkPipelineLayoutCreateInfo tm_pl_ci{};
+        tm_pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        tm_pl_ci.setLayoutCount = 1;
+        tm_pl_ci.pSetLayouts = &p.tonemap_desc_layout;
+        tm_pl_ci.pushConstantRangeCount = 1;
+        tm_pl_ci.pPushConstantRanges = &tm_push;
+        VK_CHECK(vkCreatePipelineLayout(device, &tm_pl_ci, nullptr, &p.tonemap_pipeline_layout));
+
+        VkPipelineShaderStageCreateInfo tm_stages[2]{};
+        tm_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        tm_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+        tm_stages[0].module = p.fullscreen_vs;
+        tm_stages[0].pName = "main";
+        tm_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        tm_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        tm_stages[1].module = p.tonemap_fs;
+        tm_stages[1].pName = "main";
+
+        VkPipelineVertexInputStateCreateInfo tm_vi{};
+        tm_vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+        VkPipelineDepthStencilStateCreateInfo tm_ds{};
+        tm_ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+
+        // Own rendering info: writes the PRESENT format, no depth attachment.
+        VkPipelineRenderingCreateInfo tm_rendering_ci{};
+        tm_rendering_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+        tm_rendering_ci.colorAttachmentCount = 1;
+        tm_rendering_ci.pColorAttachmentFormats = &p.present_format;
+        tm_rendering_ci.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+
+        VkGraphicsPipelineCreateInfo tm_pipe_ci = gfx_pipe_ci;
+        tm_pipe_ci.pNext = &tm_rendering_ci;
+        tm_pipe_ci.pStages = tm_stages;
+        tm_pipe_ci.pVertexInputState = &tm_vi;
+        tm_pipe_ci.pDepthStencilState = &tm_ds;
+        tm_pipe_ci.pColorBlendState = &color_blend;
+        tm_pipe_ci.layout = p.tonemap_pipeline_layout;
+        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &tm_pipe_ci, nullptr, &p.tonemap_pipeline));
+    }
 }
 
 void pipelines_reload(Pipelines& p, VkDevice device)
@@ -1115,13 +695,15 @@ void pipelines_reload(Pipelines& p, VkDevice device)
         const char* stage;
     };
 
-    ShaderEntry entries[] = {
+    const ShaderEntry entries[] = {
         {"../shaders/swe_init.hlsl",       "shaders/swe_init.spv",       "compute"},
         {"../shaders/swe_step.hlsl",       "shaders/swe_step.spv",       "compute"},
         {"../shaders/terrain.vs.hlsl",     "shaders/terrain_vs.spv",     "vertex"},
         {"../shaders/terrain.fs.hlsl",     "shaders/terrain_fs.spv",     "fragment"},
         {"../shaders/water.vs.hlsl",       "shaders/water_vs.spv",       "vertex"},
         {"../shaders/water.fs.hlsl",       "shaders/water_fs.spv",       "fragment"},
+        {"../shaders/river_overlay.vs.hlsl", "shaders/river_overlay_vs.spv", "vertex"},
+        {"../shaders/river_overlay.fs.hlsl", "shaders/river_overlay_fs.spv", "fragment"},
         {"../shaders/terrain_brush.hlsl",  "shaders/terrain_brush.spv",  "compute"},
         {"../shaders/erosion.hlsl",        "shaders/erosion.spv",        "compute"},
         {"../shaders/atmosphere3d.cs.hlsl", "shaders/atmosphere3d_cs.spv", "compute"},
@@ -1134,8 +716,11 @@ void pipelines_reload(Pipelines& p, VkDevice device)
         {"../shaders/planet_swe_init.cs.hlsl", "shaders/planet_swe_init_cs.spv", "compute"},
         {"../shaders/planet_swe_step.cs.hlsl", "shaders/planet_swe_step_cs.spv", "compute"},
         {"../shaders/planet_swe_h_adjust.cs.hlsl", "shaders/planet_swe_h_adjust_cs.spv", "compute"},
+        {"../shaders/fullscreen.vs.hlsl",  "shaders/fullscreen_vs.spv",  "vertex"},
+        {"../shaders/sky.fs.hlsl",         "shaders/sky_fs.spv",         "fragment"},
+        {"../shaders/tonemap.fs.hlsl",     "shaders/tonemap_fs.spv",     "fragment"},
     };
-    constexpr int NUM_SHADERS = 18;
+    constexpr int NUM_SHADERS = static_cast<int>(sizeof(entries) / sizeof(entries[0]));
 
     // Compile all shaders first; abort on any failure
     for (int i = 0; i < NUM_SHADERS; ++i) {
@@ -1166,761 +751,12 @@ void pipelines_reload(Pipelines& p, VkDevice device)
 
     std::fprintf(stderr, "[shader reload] All %d shaders compiled. Recreating pipelines...\n", NUM_SHADERS);
 
-    // Wait for GPU idle before touching anything
+    // Tear everything down and rebuild from the fresh SPIR-V. Recreating the
+    // descriptor set layouts is safe: the new layouts are identical, so
+    // descriptor sets allocated against the old ones stay binding-compatible.
     vkDeviceWaitIdle(device);
-
-    // Destroy old shader modules
-    vkDestroyShaderModule(device, p.swe_init_shader, nullptr);
-    vkDestroyShaderModule(device, p.swe_step_shader, nullptr);
-    vkDestroyShaderModule(device, p.terrain_vs, nullptr);
-    vkDestroyShaderModule(device, p.terrain_fs, nullptr);
-    vkDestroyShaderModule(device, p.water_vs, nullptr);
-    vkDestroyShaderModule(device, p.water_fs, nullptr);
-    vkDestroyShaderModule(device, p.terrain_brush_shader, nullptr);
-    vkDestroyShaderModule(device, p.erosion_shader, nullptr);
-    vkDestroyShaderModule(device, p.atmo_shader, nullptr);
-    vkDestroyShaderModule(device, p.raymarch_vs, nullptr);
-    vkDestroyShaderModule(device, p.raymarch_fs, nullptr);
-    vkDestroyShaderModule(device, p.sand_sim_shader, nullptr);
-    vkDestroyShaderModule(device, p.sand_render_vs, nullptr);
-    vkDestroyShaderModule(device, p.sand_render_fs, nullptr);
-    vkDestroyShaderModule(device, p.terrain_gen_shader, nullptr);
-    vkDestroyShaderModule(device, p.planet_swe_init_shader, nullptr);
-    vkDestroyShaderModule(device, p.planet_swe_step_shader, nullptr);
-    vkDestroyShaderModule(device, p.planet_swe_h_adjust_shader, nullptr);
-
-    // Destroy old pipelines
-    vkDestroyPipeline(device, p.swe_init_pipeline, nullptr);
-    vkDestroyPipeline(device, p.swe_step_pipeline, nullptr);
-    vkDestroyPipeline(device, p.gfx_pipeline, nullptr);
-    vkDestroyPipeline(device, p.water_pipeline, nullptr);
-    vkDestroyPipeline(device, p.raymarch_pipeline, nullptr);
-    vkDestroyPipeline(device, p.terrain_brush_pipeline, nullptr);
-    vkDestroyPipeline(device, p.erosion_pipeline, nullptr);
-    vkDestroyPipeline(device, p.atmo_pipeline, nullptr);
-    vkDestroyPipeline(device, p.sand_sim_pipeline, nullptr);
-    vkDestroyPipeline(device, p.sand_render_pipeline, nullptr);
-    vkDestroyPipeline(device, p.terrain_gen_pipeline, nullptr);
-    vkDestroyPipeline(device, p.clipmap_terrain_pipeline, nullptr);
-    vkDestroyPipeline(device, p.planet_swe_init_pipeline, nullptr);
-    vkDestroyPipeline(device, p.planet_swe_step_pipeline, nullptr);
-    vkDestroyPipeline(device, p.planet_swe_h_adjust_pipeline, nullptr);
-
-    // Destroy old pipeline layouts
-    vkDestroyPipelineLayout(device, p.swe_init_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.swe_step_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.gfx_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.raymarch_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.tb_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.ero_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.atmo_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.sand_sim_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.sand_render_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.terrain_gen_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.clipmap_gfx_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.planet_swe_init_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.planet_swe_step_pipeline_layout, nullptr);
-    vkDestroyPipelineLayout(device, p.planet_swe_h_adjust_pipeline_layout, nullptr);
-
-    // Reload SPIR-V and recreate shader modules
-    {
-        auto spv = load_spirv("shaders/swe_init.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.swe_init_shader));
-    }
-    {
-        auto spv = load_spirv("shaders/swe_step.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.swe_step_shader));
-    }
-    {
-        auto spv = load_spirv("shaders/terrain_vs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.terrain_vs));
-    }
-    {
-        auto spv = load_spirv("shaders/terrain_fs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.terrain_fs));
-    }
-    {
-        auto spv = load_spirv("shaders/water_vs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.water_vs));
-    }
-    {
-        auto spv = load_spirv("shaders/water_fs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.water_fs));
-    }
-    {
-        auto spv = load_spirv("shaders/terrain_brush.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.terrain_brush_shader));
-    }
-    {
-        auto spv = load_spirv("shaders/erosion.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.erosion_shader));
-    }
-    {
-        auto spv = load_spirv("shaders/atmosphere3d_cs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.atmo_shader));
-    }
-    {
-        auto spv = load_spirv("shaders/cloud_raymarch_vs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.raymarch_vs));
-    }
-    {
-        auto spv = load_spirv("shaders/cloud_raymarch_fs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.raymarch_fs));
-    }
-    {
-        auto spv = load_spirv("shaders/sand_sim_cs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.sand_sim_shader));
-    }
-    {
-        auto spv = load_spirv("shaders/sand_render_vs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.sand_render_vs));
-    }
-    {
-        auto spv = load_spirv("shaders/sand_render_fs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.sand_render_fs));
-    }
-    {
-        auto spv = load_spirv("shaders/planet_gen_cs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.terrain_gen_shader));
-    }
-    {
-        auto spv = load_spirv("shaders/planet_swe_init_cs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.planet_swe_init_shader));
-    }
-    {
-        auto spv = load_spirv("shaders/planet_swe_step_cs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.planet_swe_step_shader));
-    }
-    {
-        auto spv = load_spirv("shaders/planet_swe_h_adjust_cs.spv");
-        VkShaderModuleCreateInfo ci{};
-        ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        ci.codeSize = spv.size() * sizeof(uint32_t);
-        ci.pCode = spv.data();
-        VK_CHECK(vkCreateShaderModule(device, &ci, nullptr, &p.planet_swe_h_adjust_shader));
-    }
-
-    // Recreate pipeline layouts
-    // (descriptor set layouts are unchanged, only pipeline layouts are rebuilt)
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(SweInitPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.swe_init_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.swe_init_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(SweStepPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.swe_step_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.swe_step_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-        push.offset = 0;
-        push.size = sizeof(GfxPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.gfx_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.gfx_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-        push.offset = 0;
-        push.size = sizeof(RaymarchPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.gfx_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.raymarch_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(TerrainBrushPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.tb_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.tb_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(ErosionPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.ero_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.ero_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(Atmo3DPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.atmo_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.atmo_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(SandSimPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.sand_sim_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.sand_sim_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-        push.offset = 0;
-        push.size = sizeof(SandRenderPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.sand_render_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.sand_render_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(PlanetGenPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.terrain_gen_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.terrain_gen_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-        push.offset = 0;
-        push.size = sizeof(PlanetTilePC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.gfx_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.clipmap_gfx_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(PlanetSweInitPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.planet_swe_init_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.planet_swe_init_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(PlanetSweStepPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.planet_swe_step_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.planet_swe_step_pipeline_layout));
-    }
-    {
-        VkPushConstantRange push{};
-        push.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        push.offset = 0;
-        push.size = sizeof(PlanetSweHAdjustPC);
-
-        VkPipelineLayoutCreateInfo pl_ci{};
-        pl_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pl_ci.setLayoutCount = 1;
-        pl_ci.pSetLayouts = &p.planet_swe_h_adjust_desc_layout;
-        pl_ci.pushConstantRangeCount = 1;
-        pl_ci.pPushConstantRanges = &push;
-        VK_CHECK(vkCreatePipelineLayout(device, &pl_ci, nullptr, &p.planet_swe_h_adjust_pipeline_layout));
-    }
-
-    // Recreate compute pipelines
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.swe_init_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.swe_init_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.swe_init_pipeline));
-    }
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.swe_step_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.swe_step_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.swe_step_pipeline));
-    }
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.terrain_brush_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.tb_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.terrain_brush_pipeline));
-    }
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.erosion_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.ero_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.erosion_pipeline));
-    }
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.atmo_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.atmo_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.atmo_pipeline));
-    }
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.sand_sim_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.sand_sim_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.sand_sim_pipeline));
-    }
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.terrain_gen_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.terrain_gen_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.terrain_gen_pipeline));
-    }
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.planet_swe_init_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.planet_swe_init_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.planet_swe_init_pipeline));
-    }
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.planet_swe_step_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.planet_swe_step_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.planet_swe_step_pipeline));
-    }
-    {
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = p.planet_swe_h_adjust_shader;
-        stage.pName = "main";
-
-        VkComputePipelineCreateInfo cp_ci{};
-        cp_ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cp_ci.stage = stage;
-        cp_ci.layout = p.planet_swe_h_adjust_pipeline_layout;
-        VK_CHECK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp_ci, nullptr, &p.planet_swe_h_adjust_pipeline));
-    }
-
-    // Recreate graphics pipelines (terrain + water)
-    {
-        VkPipelineShaderStageCreateInfo stages[2]{};
-        stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-        stages[0].module = p.terrain_vs;
-        stages[0].pName = "main";
-        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        stages[1].module = p.terrain_fs;
-        stages[1].pName = "main";
-
-        VkVertexInputBindingDescription vb{};
-        vb.binding = 0;
-        vb.stride = sizeof(float) * 2;
-        vb.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-        VkVertexInputAttributeDescription va{};
-        va.binding = 0;
-        va.location = 0;
-        va.format = VK_FORMAT_R32G32_SFLOAT;
-        va.offset = 0;
-
-        VkPipelineVertexInputStateCreateInfo vi{};
-        vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vi.vertexBindingDescriptionCount = 1;
-        vi.pVertexBindingDescriptions = &vb;
-        vi.vertexAttributeDescriptionCount = 1;
-        vi.pVertexAttributeDescriptions = &va;
-
-        VkPipelineInputAssemblyStateCreateInfo ia{};
-        ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-        VkPipelineViewportStateCreateInfo vp{};
-        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vp.viewportCount = 1;
-        vp.scissorCount = 1;
-
-        VkPipelineRasterizationStateCreateInfo rs{};
-        rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-        rs.polygonMode = VK_POLYGON_MODE_FILL;
-        rs.cullMode = VK_CULL_MODE_NONE;
-        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-        rs.lineWidth = 1.0f;
-
-        VkPipelineMultisampleStateCreateInfo ms{};
-        ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-        VkPipelineDepthStencilStateCreateInfo ds{};
-        ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.depthTestEnable = VK_TRUE;
-        ds.depthWriteEnable = VK_TRUE;
-        ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
-
-        VkPipelineColorBlendAttachmentState ba{};
-        ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
-                          | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-
-        VkPipelineColorBlendStateCreateInfo cb{};
-        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1;
-        cb.pAttachments = &ba;
-
-        VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-        VkPipelineDynamicStateCreateInfo dy{};
-        dy.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dy.dynamicStateCount = 2;
-        dy.pDynamicStates = dyn;
-
-        VkFormat cf = VK_FORMAT_B8G8R8A8_UNORM;
-        VkFormat df = VK_FORMAT_D32_SFLOAT;
-
-        VkPipelineRenderingCreateInfo ri{};
-        ri.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-        ri.colorAttachmentCount = 1;
-        ri.pColorAttachmentFormats = &cf;
-        ri.depthAttachmentFormat = df;
-
-        VkGraphicsPipelineCreateInfo gp_ci{};
-        gp_ci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        gp_ci.pNext = &ri;
-        gp_ci.stageCount = 2;
-        gp_ci.pStages = stages;
-        gp_ci.pVertexInputState = &vi;
-        gp_ci.pInputAssemblyState = &ia;
-        gp_ci.pViewportState = &vp;
-        gp_ci.pRasterizationState = &rs;
-        gp_ci.pMultisampleState = &ms;
-        gp_ci.pDepthStencilState = &ds;
-        gp_ci.pColorBlendState = &cb;
-        gp_ci.pDynamicState = &dy;
-        gp_ci.layout = p.gfx_pipeline_layout;
-
-        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &gp_ci, nullptr, &p.gfx_pipeline));
-
-        // Clipmap terrain pipeline (same state, different layout)
-        VkGraphicsPipelineCreateInfo clip_ci = gp_ci;
-        clip_ci.layout = p.clipmap_gfx_pipeline_layout;
-        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &clip_ci, nullptr, &p.clipmap_terrain_pipeline));
-
-        // Water pipeline (alpha blend, no depth write)
-        VkPipelineShaderStageCreateInfo w_stages[2]{};
-        w_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        w_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-        w_stages[0].module = p.water_vs;
-        w_stages[0].pName = "main";
-        w_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        w_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        w_stages[1].module = p.water_fs;
-        w_stages[1].pName = "main";
-
-        VkPipelineDepthStencilStateCreateInfo w_ds{};
-        w_ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        w_ds.depthTestEnable = VK_TRUE;
-        w_ds.depthWriteEnable = VK_FALSE;
-        w_ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
-
-        VkPipelineColorBlendAttachmentState w_ba{};
-        w_ba.blendEnable = VK_TRUE;
-        w_ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-        w_ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        w_ba.colorBlendOp = VK_BLEND_OP_ADD;
-        w_ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        w_ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        w_ba.alphaBlendOp = VK_BLEND_OP_ADD;
-        w_ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
-                            | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-
-        VkPipelineColorBlendStateCreateInfo w_cb{};
-        w_cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        w_cb.attachmentCount = 1;
-        w_cb.pAttachments = &w_ba;
-
-        VkGraphicsPipelineCreateInfo w_ci = gp_ci;
-        w_ci.pStages = w_stages;
-        w_ci.pDepthStencilState = &w_ds;
-        w_ci.pColorBlendState = &w_cb;
-
-        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &w_ci, nullptr, &p.water_pipeline));
-
-        // Raymarch pipeline (fullscreen, no depth, alpha blend)
-        VkPipelineShaderStageCreateInfo rm_stg[2]{};
-        rm_stg[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        rm_stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-        rm_stg[0].module = p.raymarch_vs;
-        rm_stg[0].pName = "main";
-        rm_stg[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        rm_stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        rm_stg[1].module = p.raymarch_fs;
-        rm_stg[1].pName = "main";
-
-        VkPipelineVertexInputStateCreateInfo rm_vi_s{};
-        rm_vi_s.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-
-        VkPipelineDepthStencilStateCreateInfo rm_ds_s{};
-        rm_ds_s.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        rm_ds_s.depthTestEnable = VK_FALSE;
-        rm_ds_s.depthWriteEnable = VK_FALSE;
-
-        VkGraphicsPipelineCreateInfo rm_ci = gp_ci;
-        rm_ci.pStages = rm_stg;
-        rm_ci.pVertexInputState = &rm_vi_s;
-        rm_ci.pDepthStencilState = &rm_ds_s;
-        rm_ci.pColorBlendState = &w_cb;
-        rm_ci.layout = p.raymarch_pipeline_layout;
-
-        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &rm_ci, nullptr, &p.raymarch_pipeline));
-
-        // Sand render pipeline (line list, no vertex input, depth test no write, alpha blend)
-        VkPipelineShaderStageCreateInfo sand_stg[2]{};
-        sand_stg[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        sand_stg[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-        sand_stg[0].module = p.sand_render_vs;
-        sand_stg[0].pName = "main";
-        sand_stg[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        sand_stg[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-        sand_stg[1].module = p.sand_render_fs;
-        sand_stg[1].pName = "main";
-
-        VkPipelineVertexInputStateCreateInfo sand_vi_s{};
-        sand_vi_s.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-
-        VkPipelineInputAssemblyStateCreateInfo sand_ia_s{};
-        sand_ia_s.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-        sand_ia_s.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-
-        VkPipelineDepthStencilStateCreateInfo sand_ds_s{};
-        sand_ds_s.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        sand_ds_s.depthTestEnable = VK_TRUE;
-        sand_ds_s.depthWriteEnable = VK_FALSE;
-        sand_ds_s.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
-
-        VkPipelineColorBlendAttachmentState sand_ba_s{};
-        sand_ba_s.blendEnable = VK_TRUE;
-        sand_ba_s.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-        sand_ba_s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        sand_ba_s.colorBlendOp = VK_BLEND_OP_ADD;
-        sand_ba_s.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        sand_ba_s.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        sand_ba_s.alphaBlendOp = VK_BLEND_OP_ADD;
-        sand_ba_s.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
-                                 | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-
-        VkPipelineColorBlendStateCreateInfo sand_cb_s{};
-        sand_cb_s.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        sand_cb_s.attachmentCount = 1;
-        sand_cb_s.pAttachments = &sand_ba_s;
-
-        VkGraphicsPipelineCreateInfo sand_ci = gp_ci;
-        sand_ci.pStages = sand_stg;
-        sand_ci.pVertexInputState = &sand_vi_s;
-        sand_ci.pInputAssemblyState = &sand_ia_s;
-        sand_ci.pDepthStencilState = &sand_ds_s;
-        sand_ci.pColorBlendState = &sand_cb_s;
-        sand_ci.layout = p.sand_render_pipeline_layout;
-
-        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &sand_ci, nullptr, &p.sand_render_pipeline));
-    }
-
-    std::fprintf(stderr, "[shader reload] Done — %d shaders reloaded, all pipelines recreated.\n", NUM_SHADERS);
+    pipelines_destroy(p, device);
+    pipelines_create(p, device, p.color_format, p.present_format);
 }
 
 void pipelines_destroy(Pipelines& p, VkDevice device)
@@ -1941,8 +777,14 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
     vkDestroyPipeline(device, p.planet_swe_init_pipeline, nullptr);
     vkDestroyPipeline(device, p.planet_swe_step_pipeline, nullptr);
     vkDestroyPipeline(device, p.planet_swe_h_adjust_pipeline, nullptr);
+    vkDestroyPipeline(device, p.river_pipeline, nullptr);
+    vkDestroyPipeline(device, p.sky_pipeline, nullptr);
+    vkDestroyPipeline(device, p.tonemap_pipeline, nullptr);
 
     // Destroy pipeline layouts
+    vkDestroyPipelineLayout(device, p.river_pipeline_layout, nullptr);
+    vkDestroyPipelineLayout(device, p.sky_pipeline_layout, nullptr);
+    vkDestroyPipelineLayout(device, p.tonemap_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.clipmap_gfx_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.terrain_gen_pipeline_layout, nullptr);
     vkDestroyPipelineLayout(device, p.sand_render_pipeline_layout, nullptr);
@@ -1959,6 +801,9 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
     vkDestroyPipelineLayout(device, p.planet_swe_h_adjust_pipeline_layout, nullptr);
 
     // Destroy descriptor set layouts
+    vkDestroyDescriptorSetLayout(device, p.river_desc_layout, nullptr);
+    vkDestroyDescriptorSetLayout(device, p.sky_desc_layout, nullptr);
+    vkDestroyDescriptorSetLayout(device, p.tonemap_desc_layout, nullptr);
     vkDestroyDescriptorSetLayout(device, p.sand_render_desc_layout, nullptr);
     vkDestroyDescriptorSetLayout(device, p.sand_sim_desc_layout, nullptr);
     vkDestroyDescriptorSetLayout(device, p.terrain_gen_desc_layout, nullptr);
@@ -1973,6 +818,11 @@ void pipelines_destroy(Pipelines& p, VkDevice device)
     vkDestroyDescriptorSetLayout(device, p.planet_swe_h_adjust_desc_layout, nullptr);
 
     // Destroy shader modules
+    vkDestroyShaderModule(device, p.river_vs, nullptr);
+    vkDestroyShaderModule(device, p.river_fs, nullptr);
+    vkDestroyShaderModule(device, p.fullscreen_vs, nullptr);
+    vkDestroyShaderModule(device, p.sky_fs, nullptr);
+    vkDestroyShaderModule(device, p.tonemap_fs, nullptr);
     vkDestroyShaderModule(device, p.terrain_gen_shader, nullptr);
     vkDestroyShaderModule(device, p.sand_render_fs, nullptr);
     vkDestroyShaderModule(device, p.sand_render_vs, nullptr);

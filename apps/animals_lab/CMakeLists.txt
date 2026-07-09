@@ -6,7 +6,7 @@ target_link_libraries(animals_lab PRIVATE drift_engine_core bestiary)
 
 # --- HLSL -> SPIR-V for Animals Lab shaders ---
 set(AL_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
-file(GLOB AL_HLSL_SHADERS ${AL_SHADER_DIR}/*.hlsl)
+file(GLOB AL_HLSL_SHADERS CONFIGURE_DEPENDS ${AL_SHADER_DIR}/*.hlsl)
 
 set(AL_SPV_OUTPUTS "")
 foreach(HLSL ${AL_HLSL_SHADERS})

@@ -5,6 +5,7 @@ add_executable(launcher
     ../plant_lab/plant_lab.cpp
     ../animals_lab/animals_lab.cpp
     ../world_lab/world_lab.cpp
+    ../planet_dev/planet_dev.cpp
     ../globe/globe.cpp
 )
 
@@ -13,4 +14,4 @@ target_include_directories(launcher PRIVATE
 )
 
 target_link_libraries(launcher PRIVATE drift_engine_core bestiary)
-add_dependencies(launcher world_lab_shaders shaders)
+add_dependencies(launcher world_lab_shaders planet_dev_shaders shaders)

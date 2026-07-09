@@ -27,6 +27,22 @@ static vkb::Swapchain build_swapchain(Renderer& r)
     return sc_ret.value();
 }
 
+static void create_render_finished_semaphores(Renderer& r)
+{
+    r.render_finished.resize(r.swapchain_images.size());
+    VkSemaphoreCreateInfo sem_ci{};
+    sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    for (auto& sem : r.render_finished)
+        VK_CHECK(vkCreateSemaphore(r.device, &sem_ci, nullptr, &sem));
+}
+
+static void destroy_render_finished_semaphores(Renderer& r)
+{
+    for (auto sem : r.render_finished)
+        vkDestroySemaphore(r.device, sem, nullptr);
+    r.render_finished.clear();
+}
+
 void renderer_init(Renderer& r, int width, int height, const char* title)
 {
     if (!glfwInit()) {
@@ -52,9 +68,12 @@ void renderer_init(Renderer& r, int width, int height, const char* title)
         .set_app_name(title)
         .set_engine_name(title)
         .require_api_version(1, 3, 0)
-        .enable_extensions(glfw_ext_count, glfw_exts)
+        .enable_extensions(glfw_ext_count, glfw_exts);
+#ifndef NDEBUG
+    instance_builder
         .request_validation_layers(true)
         .use_default_debug_messenger();
+#endif
 
     auto inst_ret = instance_builder.build();
     if (!inst_ret) {
@@ -121,6 +140,7 @@ void renderer_init(Renderer& r, int width, int height, const char* title)
     r.vkb_swapchain = build_swapchain(r);
     r.swapchain_images = r.vkb_swapchain.get_images().value();
     r.swapchain_views = r.vkb_swapchain.get_image_views().value();
+    create_render_finished_semaphores(r);
 
     r.depth_buffer = create_depth_buffer(r.device, r.allocator, r.vkb_swapchain.extent);
 
@@ -141,7 +161,6 @@ void renderer_init(Renderer& r, int width, int height, const char* title)
         VkSemaphoreCreateInfo sem_ci{};
         sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         VK_CHECK(vkCreateSemaphore(r.device, &sem_ci, nullptr, &f.image_available));
-        VK_CHECK(vkCreateSemaphore(r.device, &sem_ci, nullptr, &f.render_finished));
 
         VkFenceCreateInfo fence_ci{};
         fence_ci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -173,7 +192,7 @@ void renderer_init(Renderer& r, int width, int height, const char* title)
     imgui_dp_ci.pPoolSizes = imgui_pool_sizes;
     VK_CHECK(vkCreateDescriptorPool(r.device, &imgui_dp_ci, nullptr, &r.imgui_pool));
 
-    VkFormat swapchain_format = VK_FORMAT_B8G8R8A8_UNORM;
+    VkFormat swapchain_format = r.vkb_swapchain.image_format;
     VkPipelineRenderingCreateInfo imgui_rendering_ci{};
     imgui_rendering_ci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     imgui_rendering_ci.colorAttachmentCount = 1;
@@ -208,10 +227,12 @@ void renderer_rebuild_swapchain(Renderer& r)
     for (auto view : r.swapchain_views)
         vkDestroyImageView(r.device, view, nullptr);
     vkb::destroy_swapchain(r.vkb_swapchain);
+    destroy_render_finished_semaphores(r);
 
     r.vkb_swapchain = build_swapchain(r);
     r.swapchain_images = r.vkb_swapchain.get_images().value();
     r.swapchain_views = r.vkb_swapchain.get_image_views().value();
+    create_render_finished_semaphores(r);
 
     destroy_depth_buffer(r.device, r.allocator, r.depth_buffer);
     r.depth_buffer = create_depth_buffer(r.device, r.allocator, r.vkb_swapchain.extent);
@@ -265,7 +286,7 @@ void renderer_end_frame(Renderer& r, FrameData& frame, uint32_t image_index)
 
     VkSemaphoreSubmitInfo signal_sem{};
     signal_sem.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-    signal_sem.semaphore = frame.render_finished;
+    signal_sem.semaphore = r.render_finished[image_index];
     signal_sem.stageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
 
     VkCommandBufferSubmitInfo cmd_info{};
@@ -286,7 +307,7 @@ void renderer_end_frame(Renderer& r, FrameData& frame, uint32_t image_index)
     VkPresentInfoKHR present_info{};
     present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     present_info.waitSemaphoreCount = 1;
-    present_info.pWaitSemaphores = &frame.render_finished;
+    present_info.pWaitSemaphores = &r.render_finished[image_index];
     present_info.swapchainCount = 1;
     present_info.pSwapchains = &r.vkb_swapchain.swapchain;
     present_info.pImageIndices = &image_index;
@@ -314,10 +335,10 @@ void renderer_shutdown(Renderer& r)
 
     for (auto& f : r.frames) {
         vkDestroyFence(r.device, f.in_flight, nullptr);
-        vkDestroySemaphore(r.device, f.render_finished, nullptr);
         vkDestroySemaphore(r.device, f.image_available, nullptr);
         vkDestroyCommandPool(r.device, f.pool, nullptr);
     }
+    destroy_render_finished_semaphores(r);
 
     vkDestroyQueryPool(r.device, r.query_pool, nullptr);
 

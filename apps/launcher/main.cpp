@@ -16,6 +16,7 @@
 #include "plant_lab/plant_lab.h"
 #include "animals_lab/animals_lab.h"
 #include "world_lab/world_lab.h"
+#include "planet_dev/planet_dev.h"
 #include "globe/globe.h"
 
 #include <string>
@@ -134,8 +135,8 @@ static void render_menu_frame(Renderer& r, FrameData& frame,
 //                for species double-click (ignored by labs without pending_file).
 //   tick(dt):    returns false to request return-to-menu.
 // ---------------------------------------------------------------------------
-enum class AppMode { Menu, PlantLab, AnimalsLab, WorldLab, Globe };
-constexpr int LAB_COUNT = 4;  // PlantLab..Globe; Menu is not a lab
+enum class AppMode { Menu, PlantLab, AnimalsLab, WorldLab, PlanetDev, Globe };
+constexpr int LAB_COUNT = 5;  // PlantLab..Globe; Menu is not a lab
 
 struct Lab {
     const char* title;
@@ -161,6 +162,7 @@ int main()
     PlantLabState   plant_state{};
     AnimalsLabState animals_state{};
     WorldLabState   world_state{};
+    PlanetDevState  planet_dev_state{};
     GlobeState      globe_state{};
 
     // Preview world (attractor scene behind menu)
@@ -179,7 +181,7 @@ int main()
     bool preview_alive = true;
 
     // Lab table, indexed by lab_index(mode). Order must match AppMode:
-    // PlantLab, AnimalsLab, WorldLab, Globe.
+    // PlantLab, AnimalsLab, WorldLab, PlanetDev, Globe.
     std::array<Lab, LAB_COUNT> labs = {{
         Lab{
             "Drift Engine - Plant Lab",
@@ -221,6 +223,19 @@ int main()
                 world_lab_render(world_state, renderer, fr, ii, ex);
             },
             [&]() { world_lab_shutdown(world_state, renderer); },
+        },
+        Lab{
+            "Drift Engine - Planet (Dev)",
+            [&](const std::string&) {
+                planet_dev_state = {};
+                planet_dev_state.embedded = true;
+                planet_dev_init(planet_dev_state, renderer);
+            },
+            [&](const InputFrame& in, float dt) { return planet_dev_tick(planet_dev_state, renderer, in, dt); },
+            [&](FrameData& fr, uint32_t ii, VkExtent2D ex) {
+                planet_dev_render(planet_dev_state, renderer, fr, ii, ex);
+            },
+            [&]() { planet_dev_shutdown(planet_dev_state, renderer); },
         },
         Lab{
             "Drift Engine - Globe",
@@ -314,6 +329,8 @@ int main()
             ImGui::SameLine();
             if (ImGui::Button("Globe", ImVec2(btn_half, 32)))
                 enter_lab(AppMode::Globe);
+            if (ImGui::Button("Planet (Dev)", ImVec2(btn_half, 32)))
+                enter_lab(AppMode::PlanetDev);
 
             ImGui::Spacing();
             ImGui::Separator();

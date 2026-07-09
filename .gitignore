@@ -28,3 +28,4 @@ data/heightmaps/*.tif
 
 # OS
 Thumbs.db
+build-release/

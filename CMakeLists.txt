@@ -105,6 +105,7 @@ add_library(drift_engine_core STATIC
     src/pipeline.cpp
     src/planet.cpp
     src/terrain.cpp
+    src/hydrology.cpp
     src/ui.cpp
 )
 
@@ -143,7 +144,16 @@ add_executable(drift_engine
 )
 
 target_include_directories(drift_engine PRIVATE apps)
-target_link_libraries(drift_engine PRIVATE drift_engine_core)
+target_link_libraries(drift_engine PRIVATE drift_engine_core bestiary)
+
+# Scripted-flight harness: the globe driven by synthesized InputFrames
+# (see apps/globe/pilot_main.cpp). Same module, no human at the controls.
+add_executable(drift_pilot
+    apps/globe/pilot_main.cpp
+    apps/globe/globe.cpp
+)
+target_include_directories(drift_pilot PRIVATE apps)
+target_link_libraries(drift_pilot PRIVATE drift_engine_core bestiary)
 
 if(MSVC)
     target_compile_options(drift_engine PRIVATE /W4 /permissive-)
@@ -161,7 +171,10 @@ set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
 set(SHADER_OUT_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 
-file(GLOB HLSL_SHADERS ${SHADER_DIR}/*.hlsl)
+file(GLOB HLSL_SHADERS CONFIGURE_DEPENDS ${SHADER_DIR}/*.hlsl)
+# .hlsli include files: never compiled standalone, but every .spv rule depends
+# on them so editing an include rebuilds its users.
+file(GLOB HLSL_INCLUDES CONFIGURE_DEPENDS ${SHADER_DIR}/*.hlsli)
 
 set(SPV_OUTPUTS "")
 foreach(HLSL ${HLSL_SHADERS})
@@ -185,7 +198,7 @@ foreach(HLSL ${HLSL_SHADERS})
         OUTPUT ${SPV}
         COMMAND ${GLSLC} -x hlsl -fshader-stage=${SHADER_STAGE} -fentry-point=main
                 --target-env=vulkan1.3 ${HLSL} -o ${SPV}
-        DEPENDS ${HLSL}
+        DEPENDS ${HLSL} ${HLSL_INCLUDES}
         COMMENT "HLSL→SPIR-V [${SHADER_STAGE}]: ${FNAME}"
         VERBATIM
     )
@@ -198,7 +211,7 @@ add_dependencies(drift_engine shaders)
 # ---------------------------------------------------------------------------
 # Copy species files to build dir
 # ---------------------------------------------------------------------------
-file(GLOB SPECIES_FILES ${CMAKE_CURRENT_SOURCE_DIR}/species/*.toml)
+file(GLOB SPECIES_FILES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/species/*.toml)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/species)
 foreach(SF ${SPECIES_FILES})
     get_filename_component(SF_NAME ${SF} NAME)
@@ -212,5 +225,6 @@ add_subdirectory(bestiary)
 add_subdirectory(apps/plant_lab)
 add_subdirectory(apps/animals_lab)
 add_subdirectory(apps/world_lab)
+add_subdirectory(apps/planet_dev)
 add_subdirectory(apps/simCoupleTesting)
 add_subdirectory(apps/launcher)

@@ -303,15 +303,29 @@ void main(uint3 ThreadId : SV_DispatchThreadID)
 
     output[uint3(coord, pool_index)] = float4(h_new, dhdx, dhdy, foam);
 
-    // Mark per-edge "water above static reached this edge" so the CPU can
-    // anchor the corresponding neighbor next frame. Threshold is generous —
-    // slight numerical drift shouldn't trigger expansion.
+    // Mark per-edge "water above static is actively CROSSING this edge" so the
+    // CPU can anchor the neighbor next frame (and keep the tile's bake-back
+    // clock pushed out). Two conditions, both required:
+    //   height: above the static sea column by a generous margin, so ocean
+    //           surface + numerical drift never trigger expansion;
+    //   flux:   edge-normal momentum above epsilon, so SETTLED inland water
+    //           (a seeded lake sitting metres above sea level at a tile edge)
+    //           doesn't flag forever — standing water must be allowed to
+    //           quiesce or brushed tiles never bake back to the field.
     float static_h = max(SEA_LEVEL - z, 0.0f);
     if (h_new > static_h + 0.25f)
     {
-        if (coord.x == 0)         InterlockedOr(edge_flags[pool_index], EDGE_BIT_LEFT);
-        if (coord.x == GRID_W-1)  InterlockedOr(edge_flags[pool_index], EDGE_BIT_RIGHT);
-        if (coord.y == 0)         InterlockedOr(edge_flags[pool_index], EDGE_BIT_DOWN);
-        if (coord.y == GRID_H-1)  InterlockedOr(edge_flags[pool_index], EDGE_BIT_UP);
+        // Velocity, not momentum: deep lakes must not trip the flag on
+        // centimetre-per-second residual currents (depth-independent test).
+        const float EDGE_VEL_EPS = 0.05f;    // m/s edge-normal velocity
+        float inv_h = 1.0f / max(h_new, 0.25f);
+        if (coord.x == 0        && abs(hu_new) * inv_h > EDGE_VEL_EPS)
+            InterlockedOr(edge_flags[pool_index], EDGE_BIT_LEFT);
+        if (coord.x == GRID_W-1 && abs(hu_new) * inv_h > EDGE_VEL_EPS)
+            InterlockedOr(edge_flags[pool_index], EDGE_BIT_RIGHT);
+        if (coord.y == 0        && abs(hv_new) * inv_h > EDGE_VEL_EPS)
+            InterlockedOr(edge_flags[pool_index], EDGE_BIT_DOWN);
+        if (coord.y == GRID_H-1 && abs(hv_new) * inv_h > EDGE_VEL_EPS)
+            InterlockedOr(edge_flags[pool_index], EDGE_BIT_UP);
     }
 }

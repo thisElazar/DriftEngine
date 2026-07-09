@@ -198,6 +198,48 @@ static void cube_face_to_uv(const glm::vec3& cube, uint32_t face, float& u, floa
     }
 }
 
+void planet_sphere_to_face_uv(glm::vec3 sphere_dir, uint32_t& out_face,
+                              float& out_u, float& out_v)
+{
+    out_face = 0; out_u = 0.0f; out_v = 0.0f;
+    if (glm::length(sphere_dir) < 1e-6f) return;
+    sphere_dir = glm::normalize(sphere_dir);
+
+    float ax = std::fabs(sphere_dir.x);
+    float ay = std::fabs(sphere_dir.y);
+    float az = std::fabs(sphere_dir.z);
+    uint32_t face;
+    if (ax >= ay && ax >= az)      face = (sphere_dir.x > 0.0f) ? 0u : 1u;
+    else if (ay >= az)             face = (sphere_dir.y > 0.0f) ? 2u : 3u;
+    else                           face = (sphere_dir.z > 0.0f) ? 4u : 5u;
+
+    float dom = std::max(ax, std::max(ay, az));
+    if (dom < 1e-6f) return;
+    glm::vec3 cube = sphere_dir / dom;
+
+    auto refine = [&](glm::vec3& q) {
+        glm::vec3 s = planet_cube_to_sphere(q);
+        glm::vec3 d = sphere_dir - s;
+        q += d;
+        switch (face) {
+            case 0: q.x =  1.0f; break;
+            case 1: q.x = -1.0f; break;
+            case 2: q.y =  1.0f; break;
+            case 3: q.y = -1.0f; break;
+            case 4: q.z =  1.0f; break;
+            case 5: q.z = -1.0f; break;
+        }
+        q.x = std::clamp(q.x, -1.0f, 1.0f);
+        q.y = std::clamp(q.y, -1.0f, 1.0f);
+        q.z = std::clamp(q.z, -1.0f, 1.0f);
+    };
+    // Cell-accurate inversion needs more iterations than the brush picker's two.
+    for (int it = 0; it < 8; ++it) refine(cube);
+
+    cube_face_to_uv(cube, face, out_u, out_v);
+    out_face = face;
+}
+
 PlanetTilePick planet_pick_tile(
     glm::vec3 sphere_dir,
     const std::vector<QuadNode>& visible_tiles,

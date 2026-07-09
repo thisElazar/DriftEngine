@@ -35,6 +35,13 @@ glm::vec3  planet_cube_to_sphere(glm::vec3 p);
 glm::dvec3 planet_face_uv_to_cube_d(double u, double v, uint32_t face);
 glm::dvec3 planet_cube_to_sphere_d(glm::dvec3 p);
 
+// Inverse of cube_to_sphere(face_uv_to_cube): map a unit sphere direction to its
+// cube face and face-uv in [-1,1]². Dominant-axis face select + two fixed-point
+// refinement steps against cube_to_sphere (same method as planet_pick_tile).
+// Used for cross-face neighbor routing on the hydrology grid.
+void planet_sphere_to_face_uv(glm::vec3 sphere_dir, uint32_t& out_face,
+                              float& out_u, float& out_v);
+
 glm::dvec3 planet_tile_center_dir(const QuadNode& node);
 glm::dvec3 planet_tile_center_on_sphere(const QuadNode& node, float planet_radius);
 

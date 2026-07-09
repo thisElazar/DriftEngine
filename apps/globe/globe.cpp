@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <chrono>
 
 // Alias constants from globe.h for code compatibility.
 static constexpr uint32_t SWE_GRID_W = GLOBE_SWE_GRID_W;
@@ -35,10 +36,153 @@ static constexpr uint32_t SAND_EMIT_PER_FRAME = GLOBE_SAND_EMIT_PER_FRAME;
 static constexpr uint32_t MESH_RES = GLOBE_MESH_RES;
 static constexpr uint32_t PLANET_TILE_RES = GLOBE_TILE_RES;
 static constexpr uint32_t PLANET_TILE_POOL = GLOBE_TILE_POOL;
+// Sentinel for a visible tile that could not get a pool slot this frame
+// (pool exhausted and nothing evictable) — draw loops skip it.
+static constexpr uint32_t SLOT_NONE = 0xFFFFFFFFu;
 static constexpr uint32_t PLANET_MAX_LEVEL = GLOBE_MAX_LEVEL;
 static constexpr float    PLANET_RADIUS = GLOBE_PLANET_RADIUS;
+// PLANET_SEED comes from terrain.h — one constant feeds both the GPU push
+// constant and cpu_terrain_height's noise offsets, so they cannot drift.
 static constexpr float    PLANET_MAX_ELEVATION = GLOBE_MAX_ELEVATION;
 static constexpr float    TILE_SUBDIVIDE_PX = GLOBE_TILE_SUBDIVIDE_PX;
+
+static constexpr double HYDRO_UPLOAD_INTERVAL = 0.08;  // min seconds between texture uploads
+
+// River overlay draw threshold (push constant) and the block mask that skips
+// whole tiles with no channel above it. The overlay pays full grid vertex cost
+// per tile even where every fragment discards (most of the planet is ocean or
+// dry), so tick builds a conservative per-8x8-cell-block presence mask from
+// each published field and the draw loop skips tiles whose blocks are all dry.
+static constexpr float    RIVER_OVERLAY_THRESHOLD = 0.25f;
+static constexpr uint32_t RIVER_MASK_BLOCKS = 16;   // per face axis (GLOBE_HYDRO_RES/16 = 8 cells/block)
+
+// Persistent hydrology worker loop: rebuilds the drainage structure when the
+// terrain changes, otherwise steps the live water and publishes a baked field.
+// Owns its LiveHydrology so nothing but the published snapshot crosses threads.
+static void hydrology_worker_main(HydroAsync* ha)
+{
+    LiveHydrology live;
+    live.res = ha->res;
+    live.sea_level = ha->sea_level.load(std::memory_order_acquire);
+    bool have_structure = false;
+
+    while (!ha->stop.load(std::memory_order_acquire)) {
+        if (ha->structure_dirty.exchange(false, std::memory_order_acq_rel)) {
+            std::vector<TerrainStamp> snap;
+            { std::lock_guard<std::mutex> lk(ha->stamps_mtx); snap = ha->pending_stamps; }
+            // Sea level may have moved (UI slider) — it shapes the land/ocean
+            // mask, ocean sink, and coast tangency, so refresh it per rebuild.
+            live.sea_level = ha->sea_level.load(std::memory_order_acquire);
+            live.rebuild_structure(snap.data(), static_cast<uint32_t>(snap.size()), &ha->stop);
+            if (ha->stop.load(std::memory_order_acquire)) break;  // shutdown mid-rebuild
+            have_structure = true;
+        }
+        if (have_structure) {
+            // Drain brush deposits into the live field, then route them this step.
+            std::vector<WaterDeposit> drained;
+            { std::lock_guard<std::mutex> lk(ha->deposits_mtx); drained.swap(ha->pending_deposits); }
+            for (const auto& d : drained) live.add_water_deposit(d.dir, d.cos_radius, d.amount);
+            // Drain SWE bake-backs (quiesced disturbed tiles handing their
+            // water back to the field) before stepping so the set is atomic
+            // with respect to routing.
+            std::vector<SurfaceSet> sets;
+            { std::lock_guard<std::mutex> lk(ha->sets_mtx); sets.swap(ha->pending_surface_sets); }
+            for (const auto& ss : sets) live.apply_surface_set(ss.cell, ss.surf, ss.mean_depth);
+            live.step();
+            live.step_climate();
+            {
+                std::lock_guard<std::mutex> lk(ha->pub_mtx);
+                live.bake(ha->published);
+                live.bake_climate(ha->climate_published);
+            }
+            ha->publish_ready.store(true, std::memory_order_release);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));  // ~25 steps/sec
+    }
+}
+
+// Planet-scale bestiary environment over a local tangent frame — the
+// watershed→ecosystem moisture bridge (docs/PLANETARY_ECOSYSTEM.md Phase 1).
+// Same east/north frame convention as terrain.vs.hlsl.
+bestiary::EnvironmentField globe_environment_field(const GlobeState& s, glm::vec3 center_dir)
+{
+    glm::vec3 up    = glm::normalize(center_dir);
+    glm::vec3 ref   = std::abs(up.y) > 0.999f ? glm::vec3(1, 0, 0) : glm::vec3(0, 1, 0);
+    glm::vec3 east  = glm::normalize(glm::cross(ref, up));
+    glm::vec3 north = glm::normalize(glm::cross(up, east));
+
+    bestiary::EnvironmentField env;
+    env.sample = [field = s.hydro_field_cpu, res = s.hydro_field_res,
+                  stamps = s.stamps, up, east, north](float x, float z)
+        -> bestiary::EnvironmentSample {
+        glm::vec3 dir = glm::normalize(up + (east * x + north * z) / GLOBE_PLANET_RADIUS);
+        float h = cpu_terrain_height_with_stamps(
+            dir, stamps.empty() ? nullptr : stamps.data(),
+            static_cast<uint32_t>(stamps.size()));
+        HydroSample hs = sample_planet_field(field, res, dir);
+        float m = (h < hs.lake_surface) ? 1.0f : hs.moisture;  // standing water = saturated
+        return { std::clamp(m, 0.0f, 1.0f), planet_temperature(dir, h) };
+    };
+    return env;
+}
+
+// Start the persistent worker (once, in globe_init) seeded from the current stamps.
+static void start_hydrology_worker(GlobeState& s)
+{
+    s.hydro = std::make_unique<HydroAsync>();
+    s.hydro->res = GLOBE_HYDRO_RES;
+    s.hydro->sea_level = s.ui.sea_level;
+    { std::lock_guard<std::mutex> lk(s.hydro->stamps_mtx); s.hydro->pending_stamps = s.stamps; }
+    s.hydro->structure_dirty.store(true, std::memory_order_release);
+    s.hydro_solved_stamp_count = static_cast<uint32_t>(s.stamps.size());
+    s.hydro->worker = std::thread(hydrology_worker_main, s.hydro.get());
+}
+
+// (Re)create the HDR scene target at the given extent and point the tonemap
+// descriptor set at it (when the set exists — init writes it separately the
+// first time). Caller must ensure the GPU is idle if the old image may be in
+// flight (resize path).
+static void globe_create_hdr_target(GlobeState& s, Renderer& r, VkExtent2D extent)
+{
+    if (s.hdr_view) vkDestroyImageView(r.device, s.hdr_view, nullptr);
+    if (s.hdr_img)  vmaDestroyImage(r.allocator, s.hdr_img, s.hdr_alloc);
+
+    VkImageCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    ci.extent = {extent.width, extent.height, 1};
+    ci.mipLevels = 1;
+    ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_AUTO;
+    VK_CHECK(vmaCreateImage(r.allocator, &ci, &ai, &s.hdr_img, &s.hdr_alloc, nullptr));
+
+    VkImageViewCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = s.hdr_img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VK_CHECK(vkCreateImageView(r.device, &vi, nullptr, &s.hdr_view));
+    s.hdr_extent = extent;
+
+    if (s.tonemap_desc_set != VK_NULL_HANDLE) {
+        VkDescriptorImageInfo hdr_info{};
+        hdr_info.imageView = s.hdr_view;
+        hdr_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet w{};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = s.tonemap_desc_set;
+        w.dstBinding = 0;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        w.pImageInfo = &hdr_info;
+        vkUpdateDescriptorSets(r.device, 1, &w, 0, nullptr);
+    }
+}
 
 void globe_init(GlobeState& s, Renderer& r)
 {
@@ -229,7 +373,8 @@ void globe_init(GlobeState& s, Renderer& r)
     VkBufferCreateInfo ubo_ci{};
     ubo_ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     ubo_ci.size = sizeof(CameraData);
-    ubo_ci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    ubo_ci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                 | VK_BUFFER_USAGE_TRANSFER_DST_BIT;   // written via vkCmdUpdateBuffer
 
     VmaAllocationCreateInfo ubo_ai{};
     ubo_ai.usage = VMA_MEMORY_USAGE_AUTO;
@@ -251,20 +396,6 @@ void globe_init(GlobeState& s, Renderer& r)
 
     VK_CHECK(vmaCreateBuffer(allocator, &stamp_buf_ci, &stamp_buf_ai,
         &s.stamp_buf, &s.stamp_buf_alloc, &s.stamp_buf_info));
-
-    // ---- Water stamp buffer (parallel to terrain stamps) --------------------
-    {
-        VkBufferCreateInfo bci{};
-        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bci.size = MAX_WATER_STAMPS * sizeof(WaterStamp);
-        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        VmaAllocationCreateInfo ai{};
-        ai.usage = VMA_MEMORY_USAGE_AUTO;
-        ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-                 | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-        VK_CHECK(vmaCreateBuffer(allocator, &bci, &ai,
-            &s.water_stamp_buf, &s.water_stamp_buf_alloc, &s.water_stamp_buf_info));
-    }
 
     // ---- Planet SWE edge-flag buffer (per-pool-slot, host-readable) ----------
     // The step shader InterlockedOrs bits into edge_flags[pool_index] when water
@@ -380,6 +511,75 @@ void globe_init(GlobeState& s, Renderer& r)
     create_water_array(s.water_state_b_img, s.water_state_b_alloc, s.water_state_b_view);
     create_water_array(s.water_output_img, s.water_output_alloc, s.water_output_view);
 
+    // ---- Hydrology field (coarse global drainage, 6-layer RGBA32F) -------------
+    {
+        VkImageCreateInfo hci{};
+        hci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        hci.imageType = VK_IMAGE_TYPE_2D;
+        hci.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        hci.extent = {GLOBE_HYDRO_RES, GLOBE_HYDRO_RES, 1};
+        hci.mipLevels = 1;
+        hci.arrayLayers = 6;
+        hci.samples = VK_SAMPLE_COUNT_1_BIT;
+        hci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        hci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        hci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        VmaAllocationCreateInfo hai{};
+        hai.usage = VMA_MEMORY_USAGE_AUTO;
+        hai.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        VK_CHECK(vmaCreateImage(allocator, &hci, &hai, &s.hydrology_img, &s.hydrology_alloc, nullptr));
+
+        VkImageViewCreateInfo hvi{};
+        hvi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        hvi.image = s.hydrology_img;
+        hvi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        hvi.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        hvi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6};
+        VK_CHECK(vkCreateImageView(device, &hvi, nullptr, &s.hydrology_view));
+
+        // Upload a zeroed field so the image is immediately valid to sample
+        // (river overlay just discards everywhere until the real field arrives).
+        std::vector<float> zeros(static_cast<size_t>(GLOBE_HYDRO_RES) * GLOBE_HYDRO_RES * 6 * 4, 0.0f);
+        update_rgba32f_array(device, allocator, graphics_queue, gfx_family,
+                             s.hydrology_img, zeros, GLOBE_HYDRO_RES, GLOBE_HYDRO_RES, 6,
+                             VK_IMAGE_LAYOUT_UNDEFINED);
+
+        // ---- Climate field (coarse ocean circulation, 6-layer RGBA32F) --------
+        VkImageCreateInfo cci = hci;   // identical format/extent/usage
+        VK_CHECK(vmaCreateImage(allocator, &cci, &hai, &s.climate_img, &s.climate_alloc, nullptr));
+        VkImageViewCreateInfo cvi = hvi;
+        cvi.image = s.climate_img;
+        VK_CHECK(vkCreateImageView(device, &cvi, nullptr, &s.climate_view));
+        update_rgba32f_array(device, allocator, graphics_queue, gfx_family,
+                             s.climate_img, zeros, GLOBE_HYDRO_RES, GLOBE_HYDRO_RES, 6,
+                             VK_IMAGE_LAYOUT_UNDEFINED);
+
+        // ---- Persistent staging ring for the live field uploads ---------------
+        // The worker publishes ~12x/s forever; going through a one-shot submit
+        // (pool create + fence wait) for each upload stalls the main thread
+        // behind the whole GPU frame. Instead tick just snapshots + flags, and
+        // globe_render memcpys into this frame's staging slot and records the
+        // copy into the frame command buffer — no extra submit, no fence.
+        // Layout per slot: [hydro field][climate field], each HYDRO_FIELD_BYTES.
+        for (uint32_t f = 0; f < FRAMES_IN_FLIGHT; ++f) {
+            VkBufferCreateInfo sbi{};
+            sbi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            sbi.size  = 2 * HYDRO_FIELD_BYTES;
+            sbi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            VmaAllocationCreateInfo sai{};
+            sai.usage = VMA_MEMORY_USAGE_AUTO;
+            sai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+                      | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            VK_CHECK(vmaCreateBuffer(allocator, &sbi, &sai, &s.hydro_staging_buf[f],
+                                     &s.hydro_staging_alloc[f], &s.hydro_staging_info[f]));
+        }
+
+        // Start the persistent live-water worker (the field solves + steps off
+        // the main thread; structure rebuilds are signaled on terrain edits).
+        start_hydrology_worker(s);
+    }
+
     // ---- Sand particle buffer --------------------------------------------------
     VkBufferCreateInfo sand_buf_ci{};
     sand_buf_ci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -414,7 +614,10 @@ void globe_init(GlobeState& s, Renderer& r)
     terrain_samp_ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     VK_CHECK(vkCreateSampler(device, &terrain_samp_ci, nullptr, &s.terrain_linear_sampler));
 
-    pipelines_create(s.pipelines, device);
+    // Scene pipelines render into an RGBA16F HDR target; the tonemap pipeline
+    // resolves it to the swapchain (M1b: scattering + aerial + tonemap).
+    pipelines_create(s.pipelines, device, VK_FORMAT_R16G16B16A16_SFLOAT,
+                     r.vkb_swapchain.image_format);
 
     // ---- Descriptor pool + sets ---------------------------------------------
     // Counts: SWE init(2) + SWE step×2(8) + terrain brush(1) + gfx(4 incl sediment) + erosion×2(8) = needs ~23 descriptors
@@ -422,17 +625,17 @@ void globe_init(GlobeState& s, Renderer& r)
     pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     pool_sizes[0].descriptorCount = 45;
     pool_sizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    pool_sizes[1].descriptorCount = 48;
+    pool_sizes[1].descriptorCount = 60;   // +climate on gfx/clipmap, +hydrology on swe-init, +hdr on tonemap
     pool_sizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    pool_sizes[2].descriptorCount = 4;
+    pool_sizes[2].descriptorCount = 8;    // +sky
     pool_sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     pool_sizes[3].descriptorCount = 12;
     pool_sizes[4].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-    pool_sizes[4].descriptorCount = 32;
+    pool_sizes[4].descriptorCount = 34;   // +swe-init, +tonemap
 
     VkDescriptorPoolCreateInfo dp_ci{};
     dp_ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dp_ci.maxSets = 25;
+    dp_ci.maxSets = 28;                   // +sky, +tonemap
     dp_ci.poolSizeCount = 5;
     dp_ci.pPoolSizes = pool_sizes;
 
@@ -704,7 +907,7 @@ void globe_init(GlobeState& s, Renderer& r)
         sampler_only_info.sampler = s.sampler;
 
         for (int si = 0; si < 2; si++) {
-            VkWriteDescriptorSet writes[9]{};
+            VkWriteDescriptorSet writes[10]{};
 
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = s.gfx_desc_sets[si];
@@ -769,7 +972,17 @@ void globe_init(GlobeState& s, Renderer& r)
             writes[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
             writes[8].pImageInfo = &sampler_only_info;
 
-            vkUpdateDescriptorSets(device, 9, writes, 0, nullptr);
+            VkDescriptorImageInfo climate_info{};
+            climate_info.imageView   = s.climate_view;
+            climate_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[9].dstSet = s.gfx_desc_sets[si];
+            writes[9].dstBinding = 9;
+            writes[9].descriptorCount = 1;
+            writes[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            writes[9].pImageInfo = &climate_info;
+
+            vkUpdateDescriptorSets(device, 10, writes, 0, nullptr);
         }
     }
 
@@ -1473,7 +1686,7 @@ void globe_init(GlobeState& s, Renderer& r)
         sampler_only_info.sampler = s.sampler;
 
         for (int si = 0; si < 2; si++) {
-            VkWriteDescriptorSet writes[9]{};
+            VkWriteDescriptorSet writes[10]{};
 
             writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[0].dstSet = s.clipmap_gfx_desc_sets[si];
@@ -1538,7 +1751,17 @@ void globe_init(GlobeState& s, Renderer& r)
             writes[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
             writes[8].pImageInfo = &sampler_only_info;
 
-            vkUpdateDescriptorSets(device, 9, writes, 0, nullptr);
+            VkDescriptorImageInfo climate_info{};
+            climate_info.imageView   = s.climate_view;
+            climate_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[9].dstSet = s.clipmap_gfx_desc_sets[si];
+            writes[9].dstBinding = 9;
+            writes[9].descriptorCount = 1;
+            writes[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            writes[9].pImageInfo = &climate_info;
+
+            vkUpdateDescriptorSets(device, 10, writes, 0, nullptr);
         }
     }
 
@@ -1567,12 +1790,14 @@ void globe_init(GlobeState& s, Renderer& r)
         output_info.imageView = s.water_output_view;
         output_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkDescriptorBufferInfo water_stamp_bi{};
-        water_stamp_bi.buffer = s.water_stamp_buf;
-        water_stamp_bi.offset = 0;
-        water_stamp_bi.range = MAX_WATER_STAMPS * sizeof(WaterStamp);
+        VkDescriptorImageInfo hyd_info{};
+        hyd_info.imageView = s.hydrology_view;
+        hyd_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-        VkWriteDescriptorSet writes[5]{};
+        VkDescriptorImageInfo samp_info{};
+        samp_info.sampler = s.sampler;
+
+        VkWriteDescriptorSet writes[6]{};
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = s.planet_swe_init_desc_set;
         writes[0].dstBinding = 0;
@@ -1605,10 +1830,17 @@ void globe_init(GlobeState& s, Renderer& r)
         writes[4].dstSet = s.planet_swe_init_desc_set;
         writes[4].dstBinding = 4;
         writes[4].descriptorCount = 1;
-        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[4].pBufferInfo = &water_stamp_bi;
+        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[4].pImageInfo = &hyd_info;
 
-        vkUpdateDescriptorSets(device, 5, writes, 0, nullptr);
+        writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[5].dstSet = s.planet_swe_init_desc_set;
+        writes[5].dstBinding = 5;
+        writes[5].descriptorCount = 1;
+        writes[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes[5].pImageInfo = &samp_info;
+
+        vkUpdateDescriptorSets(device, 6, writes, 0, nullptr);
     }
 
     // Planet SWE h-adjust descriptor: state_a + state_b (storage images, RW).
@@ -1641,6 +1873,118 @@ void globe_init(GlobeState& s, Renderer& r)
         writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         writes[1].pImageInfo = &state_b_info;
         vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+    }
+
+    // ---- River overlay descriptor set: camera UBO + heightmap + hydrology + sampler
+    {
+        VkDescriptorSetAllocateInfo ai{};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = s.desc_pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &s.pipelines.river_desc_layout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &ai, &s.river_desc_set));
+
+        VkDescriptorBufferInfo cam_bi{};
+        cam_bi.buffer = s.camera_ubo;
+        cam_bi.offset = 0;
+        cam_bi.range  = VK_WHOLE_SIZE;
+
+        VkDescriptorImageInfo hm_info{};
+        hm_info.imageView   = s.clipmap_hm_view;
+        hm_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo hyd_info{};
+        hyd_info.imageView   = s.hydrology_view;
+        hyd_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        VkDescriptorImageInfo samp_info{};
+        samp_info.sampler = s.sampler;
+
+        VkWriteDescriptorSet writes[4]{};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = s.river_desc_set;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].pBufferInfo = &cam_bi;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = s.river_desc_set;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[1].pImageInfo = &hm_info;
+
+        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet = s.river_desc_set;
+        writes[2].dstBinding = 2;
+        writes[2].descriptorCount = 1;
+        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        writes[2].pImageInfo = &hyd_info;
+
+        writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[3].dstSet = s.river_desc_set;
+        writes[3].dstBinding = 3;
+        writes[3].descriptorCount = 1;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        writes[3].pImageInfo = &samp_info;
+
+        vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
+    }
+
+    // ---- HDR target + sky/tonemap descriptor sets (M1b) ----------------------
+    {
+        globe_create_hdr_target(s, r, r.vkb_swapchain.extent);
+
+        VkDescriptorSetAllocateInfo sky_ai{};
+        sky_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        sky_ai.descriptorPool = s.desc_pool;
+        sky_ai.descriptorSetCount = 1;
+        sky_ai.pSetLayouts = &s.pipelines.sky_desc_layout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &sky_ai, &s.sky_desc_set));
+
+        VkDescriptorSetAllocateInfo tm_ai{};
+        tm_ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        tm_ai.descriptorPool = s.desc_pool;
+        tm_ai.descriptorSetCount = 1;
+        tm_ai.pSetLayouts = &s.pipelines.tonemap_desc_layout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &tm_ai, &s.tonemap_desc_set));
+
+        VkDescriptorBufferInfo cam_bi{};
+        cam_bi.buffer = s.camera_ubo;
+        cam_bi.offset = 0;
+        cam_bi.range  = VK_WHOLE_SIZE;
+
+        VkDescriptorImageInfo hdr_info{};
+        hdr_info.imageView = s.hdr_view;
+        hdr_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkDescriptorImageInfo samp_info{};
+        samp_info.sampler = s.sampler;
+
+        VkWriteDescriptorSet w[3]{};
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[0].dstSet = s.sky_desc_set;
+        w[0].dstBinding = 0;
+        w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w[0].pBufferInfo = &cam_bi;
+
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[1].dstSet = s.tonemap_desc_set;
+        w[1].dstBinding = 0;
+        w[1].descriptorCount = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        w[1].pImageInfo = &hdr_info;
+
+        w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[2].dstSet = s.tonemap_desc_set;
+        w[2].dstBinding = 1;
+        w[2].descriptorCount = 1;
+        w[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        w[2].pImageInfo = &samp_info;
+
+        vkUpdateDescriptorSets(device, 3, w, 0, nullptr);
     }
 
     {
@@ -1942,8 +2286,283 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
     float terrain_size = s.terrain_size;
 
     s.last_dt = dt;
+    s.last_time = glfwGetTime();   // frame start — HUD cpu_avg measures tick+render from here
     s.ui.embedded = s.embedded;
     s.ui.first_person_mode = (s.camera.mode == CameraMode::FirstPerson);
+
+    // ---- Perf diagnostics: attribute spikes to what last frame did, and print
+    // a rolling 5 s summary. dt is the full previous frame (tick+render+present).
+    {
+        double now = glfwGetTime();
+        s.perf_frames++;
+        s.perf_dt_sum += dt;
+        s.perf_dt_max = std::max(s.perf_dt_max, dt);
+        double avg = s.perf_dt_sum / std::max(s.perf_frames, 1);
+        if (s.perf_frames > 30 && dt > 0.025f && dt > 2.0 * avg) {
+            std::fprintf(stderr,
+                "[perf] SPIKE %.1f ms (avg %.1f) | prev frame: upload %.1f ms, "
+                "bakeback %.1f ms, tilegen %d, swe_init %d\n",
+                dt * 1000.0, avg * 1000.0, s.perf_last_upload_ms,
+                s.perf_last_bakeback_ms, s.perf_last_tilegen, s.perf_last_swe_init);
+        }
+        s.perf_last_upload_ms = 0.0f;
+        s.perf_last_bakeback_ms = 0.0f;
+        s.perf_last_tilegen = 0;
+        s.perf_last_swe_init = 0;
+        if (s.perf_report_t == 0.0) s.perf_report_t = now;
+        if (now - s.perf_report_t >= 5.0) {
+            std::fprintf(stderr,
+                "[perf] %5.1f fps | dt avg %.1f ms max %.1f ms | uploads %d "
+                "(avg %.2f ms, max %.2f ms) | bakebacks %d (max %.2f ms) | "
+                "tiles resident %zu\n",
+                s.perf_frames / (now - s.perf_report_t), avg * 1000.0,
+                s.perf_dt_max * 1000.0, s.perf_uploads,
+                s.perf_uploads ? s.perf_upload_ms_sum / s.perf_uploads : 0.0,
+                s.perf_upload_ms_max, s.perf_bakebacks, s.perf_bakeback_ms_max,
+                s.tile_slot_map.size());
+            s.perf_report_t = now;
+            s.perf_frames = 0;
+            s.perf_dt_sum = 0.0;
+            s.perf_dt_max = 0.0f;
+            s.perf_uploads = 0;
+            s.perf_upload_ms_sum = 0.0;
+            s.perf_upload_ms_max = 0.0;
+            s.perf_bakebacks = 0;
+            s.perf_bakeback_ms_max = 0.0;
+        }
+    }
+
+    // Upload the latest published live-water field (throttled). The image holds a
+    // zeroed field until the worker's first bake, so the globe renders normally
+    // meanwhile; thereafter rivers update live as the water flows / re-routes.
+    if (s.hydro && s.hydro->publish_ready.load(std::memory_order_acquire) &&
+        (glfwGetTime() - s.hydro_last_upload) > HYDRO_UPLOAD_INTERVAL) {
+        // Retain the snapshot on the CPU (for ecosystem sampling) and upload it.
+        // Clear the flag BEFORE copying: a worker publish landing mid-copy then
+        // re-raises it and is picked up next tick, instead of being silently
+        // unflagged (clearing after the copy dropped that bake).
+        s.hydro->publish_ready.store(false, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(s.hydro->pub_mtx);
+            s.hydro_field_cpu    = s.hydro->published;
+            s.climate_field_cpu  = s.hydro->climate_published;
+        }
+        s.hydro_field_res = GLOBE_HYDRO_RES;
+        // No GPU work here: globe_render memcpys these snapshots into this
+        // frame's staging slot and records the copies into the frame command
+        // buffer — the old one-shot submit stalled tick on a fence for the
+        // whole in-flight GPU frame, 12x/s, forever.
+        s.hydro_upload_pending   = !s.hydro_field_cpu.empty();
+        s.climate_upload_pending = !s.climate_field_cpu.empty();
+        s.hydro_last_upload = glfwGetTime();
+
+        // Rebuild the river presence blocks for the overlay draw skip.
+        // Conservative: a block is live if ANY cell reaches the overlay's
+        // smoothstep lower edge, so the skip can never drop a visible channel.
+        if (!s.hydro_field_cpu.empty()) {
+            constexpr uint32_t B   = RIVER_MASK_BLOCKS;
+            constexpr uint32_t CPB = GLOBE_HYDRO_RES / B;   // cells per block
+            const float draw_min = RIVER_OVERLAY_THRESHOLD * 0.7f;
+            s.river_block_mask.assign(size_t{6} * B * B, 0);
+            for (uint32_t face = 0; face < 6; ++face) {
+                const glm::vec4* cells =
+                    s.hydro_field_cpu.data() + size_t{face} * GLOBE_HYDRO_RES * GLOBE_HYDRO_RES;
+                uint8_t* blocks = s.river_block_mask.data() + size_t{face} * B * B;
+                for (uint32_t j = 0; j < GLOBE_HYDRO_RES; ++j)
+                    for (uint32_t i = 0; i < GLOBE_HYDRO_RES; ++i)
+                        if (cells[j * GLOBE_HYDRO_RES + i].x >= draw_min)
+                            blocks[(j / CPB) * B + (i / CPB)] = 1;
+            }
+        }
+
+        // Re-seed every resident tile's SWE standing water from the fresh field
+        // so far lakes track the live field (rise as it rains, drop as they
+        // drain). Disturbed tiles are skipped — their SWE is the live sim and
+        // wins until it quiesces and bakes back. Each re-seed is one tiny
+        // 64² init dispatch; the whole resident set costs well under a ms.
+        for (const auto& [tile, slot] : s.tile_slot_map)
+            if (!s.disturbed_tiles.count(tile))
+                s.pending_water_reseed.insert(tile);
+
+        // One-shot acceptance check for the watershed→ecosystem bridge
+        // (docs/PLANETARY_ECOSYSTEM.md Phase 1): sweep the first published
+        // field through globe_environment_field under the camera and log the
+        // regional moisture/temperature statistics the placement code will see.
+        if (!s.env_bridge_logged) {
+            s.env_bridge_logged = true;
+            glm::vec3 anchor = glm::normalize(glm::vec3(camera_eye_position(s.camera)));
+            bestiary::EnvironmentField env = globe_environment_field(s, anchor);
+            constexpr int   K = 33;
+            constexpr float EXTENT = 25000.0f;   // ±25 km around the sub-camera point
+            float  mmin = 1e9f, mmax = -1e9f, tmin = 1e9f, tmax = -1e9f;
+            double msum = 0.0;
+            int    water_cells = 0;
+            for (int j = 0; j < K; ++j)
+                for (int i = 0; i < K; ++i) {
+                    float x = (i / float(K - 1) * 2.0f - 1.0f) * EXTENT;
+                    float z = (j / float(K - 1) * 2.0f - 1.0f) * EXTENT;
+                    bestiary::EnvironmentSample e = env(x, z);
+                    mmin = std::min(mmin, e.moisture);
+                    mmax = std::max(mmax, e.moisture);
+                    tmin = std::min(tmin, e.temperature);
+                    tmax = std::max(tmax, e.temperature);
+                    msum += e.moisture;
+                    if (e.moisture > 0.99f) water_cells++;
+                }
+            std::fprintf(stderr,
+                "[globe] env bridge live: 50 km sweep at camera — moisture %.2f..%.2f "
+                "(mean %.2f), temp %.2f..%.2f, %d/%d saturated cells\n",
+                mmin, mmax, msum / (K * K), tmin, tmax, water_cells, K * K);
+        }
+    }
+
+    // ---- Bake-back: quiesced disturbed tiles return their water to the field ----
+    // A disturbed tile that has gone GLOBE_SWE_QUIESCE_S without a brush pulse or
+    // cross-edge flow has settled; read back its terrain + water layers (one tiny
+    // blocking submit, ≤1 tile per tick), aggregate the observed water surface per
+    // field cell, hand the sets to the hydrology worker, and un-disturb the tile.
+    // From then on the field owns that water and the re-seed path renders it.
+    if (s.hydro && !s.disturbed_tiles.empty()) {
+        double now_s = glfwGetTime();
+        QuadNode bake_tile{};
+        uint32_t bake_slot = 0;
+        bool     have_bake = false;
+        for (const auto& tile : s.disturbed_tiles) {
+            auto tt = s.disturbed_touch.find(tile);
+            if (tt != s.disturbed_touch.end() && (now_s - tt->second) < GLOBE_SWE_QUIESCE_S)
+                continue;
+            auto it = s.tile_slot_map.find(tile);
+            if (it == s.tile_slot_map.end()) {   // lost its slot somehow — just drop it
+                s.disturbed_tiles.erase(tile);
+                s.disturbed_touch.erase(tile);
+                s.disturbed_since.erase(tile);
+                break;
+            }
+            bake_tile = tile;
+            bake_slot = it->second;
+            have_bake = true;
+            break;
+        }
+
+        if (have_bake) {
+            constexpr uint32_t R = PLANET_TILE_RES;
+            constexpr VkDeviceSize terrain_bytes = R * R * sizeof(float);
+            constexpr VkDeviceSize water_bytes   = R * R * 4 * sizeof(uint16_t);  // RGBA16F
+
+            GpuBuffer rb = create_readback_buffer(allocator, terrain_bytes + water_bytes);
+            double bb_t0 = glfwGetTime();
+            OneShot os = oneshot_begin(device, graphics_queue, gfx_family);
+            {
+                VkMemoryBarrier2 pre{};
+                pre.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                pre.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                pre.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                pre.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                pre.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+                VkDependencyInfo dep{};
+                dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                dep.memoryBarrierCount = 1;
+                dep.pMemoryBarriers = &pre;
+                vkCmdPipelineBarrier2(os.cmd, &dep);
+
+                VkBufferImageCopy tcopy{};
+                tcopy.bufferOffset = 0;
+                tcopy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, bake_slot, 1};
+                tcopy.imageExtent = {R, R, 1};
+                vkCmdCopyImageToBuffer(os.cmd, s.clipmap_hm_image, VK_IMAGE_LAYOUT_GENERAL,
+                                       rb.buffer, 1, &tcopy);
+                VkBufferImageCopy wcopy = tcopy;
+                wcopy.bufferOffset = terrain_bytes;
+                vkCmdCopyImageToBuffer(os.cmd, s.water_output_img, VK_IMAGE_LAYOUT_GENERAL,
+                                       rb.buffer, 1, &wcopy);
+
+                VkMemoryBarrier2 post{};
+                post.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                post.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                post.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                post.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+                post.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+                dep.pMemoryBarriers = &post;
+                vkCmdPipelineBarrier2(os.cmd, &dep);
+            }
+            oneshot_end(os);   // submits + waits (~sub-ms for 48 KB)
+            {
+                double bb_ms = (glfwGetTime() - bb_t0) * 1000.0;
+                s.perf_last_bakeback_ms = static_cast<float>(bb_ms);
+                s.perf_bakebacks++;
+                s.perf_bakeback_ms_max = std::max(s.perf_bakeback_ms_max, bb_ms);
+            }
+
+            VmaAllocationInfo rb_info{};
+            vmaGetAllocationInfo(allocator, rb.allocation, &rb_info);
+            vmaInvalidateAllocation(allocator, rb.allocation, 0, VK_WHOLE_SIZE);
+            const float*    terr = static_cast<const float*>(rb_info.pMappedData);
+            const uint16_t* wat  = reinterpret_cast<const uint16_t*>(
+                static_cast<const uint8_t*>(rb_info.pMappedData) + terrain_bytes);
+
+            // Aggregate wet texels per hydrology field cell (same face as the
+            // tile — tiles never straddle faces). Ocean texels are excluded so
+            // coastal cells don't read the sea as a flood.
+            struct CellAgg { float sum_surf = 0.0f; float sum_h = 0.0f; int n = 0; };
+            std::unordered_map<int, CellAgg> agg;
+            float ts = 2.0f / static_cast<float>(1u << bake_tile.level);
+            float tile_u_min = -1.0f + bake_tile.x * ts;
+            float tile_v_min = -1.0f + bake_tile.y * ts;
+            const float cell_ts = 2.0f / static_cast<float>(GLOBE_HYDRO_RES);
+            const int   RES = static_cast<int>(GLOBE_HYDRO_RES);
+            for (uint32_t y = 0; y < R; ++y) {
+                for (uint32_t x = 0; x < R; ++x) {
+                    float t_h = terr[y * R + x];
+                    if (t_h < s.ui.sea_level) continue;               // ocean texel
+                    float h = half_to_float(wat[(y * R + x) * 4]);    // .r = depth (m)
+                    if (h <= 0.05f) continue;                          // dry
+                    float u = tile_u_min + (static_cast<float>(x) / (R - 1)) * ts;
+                    float v = tile_v_min + (static_cast<float>(y) / (R - 1)) * ts;
+                    int ci = std::clamp(static_cast<int>((u + 1.0f) / cell_ts), 0, RES - 1);
+                    int cj = std::clamp(static_cast<int>((v + 1.0f) / cell_ts), 0, RES - 1);
+                    int cell = static_cast<int>(bake_tile.face) * RES * RES + cj * RES + ci;
+                    CellAgg& a = agg[cell];
+                    a.sum_surf += t_h + h;
+                    a.sum_h    += h;
+                    a.n        += 1;
+                }
+            }
+            destroy_buffer(allocator, rb);
+
+            if (!agg.empty()) {
+                std::vector<SurfaceSet> sets;
+                sets.reserve(agg.size());
+                for (const auto& [cell, a] : agg)
+                    sets.push_back({cell, a.sum_surf / a.n, a.sum_h / a.n});
+                std::lock_guard<std::mutex> lk(s.hydro->sets_mtx);
+                s.hydro->pending_surface_sets.insert(s.hydro->pending_surface_sets.end(),
+                                                     sets.begin(), sets.end());
+            }
+
+            s.disturbed_tiles.erase(bake_tile);
+            s.disturbed_touch.erase(bake_tile);
+            s.disturbed_since.erase(bake_tile);
+        }
+    }
+
+    // Signal a drainage-structure rebuild whenever the terrain changes — every
+    // new stamp, in real time. The rebuild is cheap (cached noise + incremental
+    // stamps + routing), so the worker re-routes the live water continuously as
+    // you brush, rather than snapping after release.
+    if (s.hydro &&
+        static_cast<uint32_t>(s.stamps.size()) != s.hydro_solved_stamp_count) {
+        { std::lock_guard<std::mutex> lk(s.hydro->stamps_mtx); s.hydro->pending_stamps = s.stamps; }
+        s.hydro->structure_dirty.store(true, std::memory_order_release);
+        s.hydro_solved_stamp_count = static_cast<uint32_t>(s.stamps.size());
+    }
+
+    // Same for the sea-level slider: the worker's land/ocean mask, ocean sink,
+    // and coast tangency are all built from sea_level, while the GPU passes read
+    // the live UI value — without this the field keeps the OLD coastline.
+    if (s.hydro && s.hydro->sea_level.load(std::memory_order_relaxed) != s.ui.sea_level) {
+        s.hydro->sea_level.store(s.ui.sea_level, std::memory_order_release);
+        s.hydro->structure_dirty.store(true, std::memory_order_release);
+    }
 
         if (in.key_f5_pressed) {
             pipelines_reload(s.pipelines, device);
@@ -2000,19 +2619,9 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
                     uint16_t hx = px[i * 4 + 0];
                     uint16_t hy = px[i * 4 + 1];
                     uint16_t hp = px[i * 4 + 3];
-                    // IEEE 754 half-to-float conversion
-                    auto h2f = [](uint16_t h) -> float {
-                        uint32_t sign = (h >> 15) & 1;
-                        uint32_t exp  = (h >> 10) & 0x1F;
-                        uint32_t mant = h & 0x3FF;
-                        if (exp == 0) return sign ? -0.0f : 0.0f;
-                        if (exp == 31) return sign ? -1e30f : 1e30f;
-                        float f = std::ldexp(static_cast<float>(1024 + mant), static_cast<int>(exp) - 25);
-                        return sign ? -f : f;
-                    };
-                    float pressure = h2f(hp);
-                    float wx = h2f(hx);
-                    float wy = h2f(hy);
+                    float pressure = half_to_float(hp);
+                    float wx = half_to_float(hx);
+                    float wy = half_to_float(hy);
                     if (pressure > 10.0f) {
                         p_min = std::min(p_min, pressure);
                         p_max = std::max(p_max, pressure);
@@ -2494,29 +3103,24 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
             }
         }
 
-        // ---- Place water stamp on LMB (parallel to terrain stamps) ----
-        // Persistent record of brushed water; applied to every LOD's SWE init so
-        // a brushed lake stays visible from any zoom. The dynamic SWE step still
-        // adds waves on top at the brushed level — this is the static skeleton.
-        if (s.brush_hit && s.brush_mode == BrushMode::Water &&
-            s.water_stamps.size() < MAX_WATER_STAMPS)
+        // ---- Water brush → coarse field deposit (field-only water) ----
+        // The brush no longer seeds the SWE directly; it hands a one-shot slug of
+        // water mass to the hydrology worker, which adds it to the live field and
+        // routes it downstream every step. Result: a flood pulse that flows downhill
+        // and drains to the sea, continuing coarsely even while the camera flies away.
+        if (s.brush_hit && s.brush_mode == BrushMode::Water && s.hydro)
         {
             double now_s = glfwGetTime();
             if (now_s - s.last_water_stamp_time > 0.1) {
-                float angular_radius = s.effective_angular;
-
-                WaterStamp ws{};
-                ws.pos_x = s.stamp_sphere_dir.x;
-                ws.pos_y = s.stamp_sphere_dir.y;
-                ws.pos_z = s.stamp_sphere_dir.z;
-                ws.radius = angular_radius;
-                // The brush deposits a *column*: per stamp adds brush_strength
-                // metres at the center, falling off via the gaussian. This makes
-                // brushing build up a lake over a couple of seconds.
-                ws.water_amount = s.ui.brush_strength;
-                ws.cos_radius = std::cos(angular_radius);
-                s.water_stamps.push_back(ws);
-                s.water_stamps_dirty = true;
+                WaterDeposit d{};
+                d.dir        = s.stamp_sphere_dir;
+                d.cos_radius = std::cos(s.effective_angular);
+                // brush_strength was "metres of column" for the SWE; scale it into
+                // the field's accumulation-based water units (steady river ≈ 2*accum,
+                // river threshold accum≈4). WATER_BRUSH_DEPOSIT is the feel knob.
+                d.amount     = s.ui.brush_strength * WATER_BRUSH_DEPOSIT;
+                { std::lock_guard<std::mutex> lk(s.hydro->deposits_mtx);
+                  s.hydro->pending_deposits.push_back(d); }
                 s.last_water_stamp_time = now_s;
             }
         }
@@ -2541,8 +3145,13 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
             cam.sun_dir = glm::normalize(glm::vec3(0.4f, 0.7f, -0.3f));
             cam._pad0 = 0.0f;
             cam.sun_color = glm::vec3(1.0f, 0.95f, 0.85f);
-            cam._pad1 = 0.0f;
-            cam.cam_pos = glm::vec3(0.0f);  // camera-relative rendering
+            cam.time = static_cast<float>(glfwGetTime());  // drives water-surface animation
+            // Repurposed under camera-relative rendering: the planet center's
+            // position relative to the camera, for the atmosphere/sky passes
+            // (fp32 of ~6.4e6 m is ~0.5 m of noise — irrelevant at km scale
+            // heights). Flat-mode shaders that read this as a camera position
+            // are all dead (if(false)) paths in planet mode.
+            cam.cam_pos = glm::vec3(-camera_eye_position(s.camera));
             cam._pad2 = s.ui.mud_visibility;
             // Two protocols, picked by brush_color.a:
             //   FP (alpha=1): camera-relative world pos + meter radius.
@@ -2565,15 +3174,17 @@ bool globe_tick(GlobeState& s, Renderer& r, const InputFrame& in, float dt)
             }
             cam.brush_color = brush_color;
             cam.inv_view_proj = glm::inverse(cam_proj * cam_view);
-            std::memcpy(s.camera_ubo_info.pMappedData, &cam, sizeof(cam));
-            vmaFlushAllocation(allocator, s.camera_ubo_alloc, 0, VK_WHOLE_SIZE);
+            // Handed to globe_render, which records a vkCmdUpdateBuffer into
+            // the frame command buffer — a host memcpy here raced the previous
+            // in-flight frame's shader reads of the (single) UBO.
+            s.camera_frame_data = cam;
         }
 
         double frame_end = glfwGetTime();
-        s.cpu_times[s.timing_index] = (frame_end - (s.last_time - static_cast<double>(dt))) * 1000.0;
+        s.cpu_times[s.timing_index] = (frame_end - s.last_time) * 1000.0;
         s.timing_index = (s.timing_index + 1) % GlobeState::AVG_FRAMES;
         if (s.timing_count < GlobeState::AVG_FRAMES) s.timing_count++;
-        s.queries_valid = true;
+        s.queries_valid = !s.ui.ocean_enabled;   // planet mode never writes the timestamps
 
         if (frame_end - s.last_title_update >= 1.0) {
             double cpu_sum = 0.0, gpu_sum = 0.0;
@@ -2606,6 +3217,114 @@ void globe_render(GlobeState& s, Renderer& r,
     GLFWwindow* window = r.window;
     float terrain_size = s.terrain_size;
     (void)allocator; (void)graphics_queue; (void)gfx_family; (void)window;
+
+    // HDR target follows the swapchain extent (resize is rare; idle first so
+    // the in-flight frame can't be sampling the old image).
+    if (extent.width != s.hdr_extent.width || extent.height != s.hdr_extent.height) {
+        vkDeviceWaitIdle(device);
+        globe_create_hdr_target(s, r, extent);
+    }
+
+        // ---- Cross-frame WAR guard -------------------------------------------
+        // With FRAMES_IN_FLIGHT > 1 the previous frame's draws may still be
+        // sampling the sim images this frame's dispatches overwrite. The frame
+        // fence only protects the command buffer, not GPU resources, so an
+        // execution dependency (no access masks needed for write-after-read)
+        // must order prior-frame shader reads before this frame's first writes.
+        {
+            VkMemoryBarrier2 war_bar{};
+            war_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            war_bar.srcStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                                 | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                                 // compute + transfer too: prior frame's swe_init
+                                 // samples (and prior frame's staging copy writes)
+                                 // the hydrology image this frame's copy rewrites
+                                 | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                 | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            war_bar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                 | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            VkDependencyInfo war_dep{};
+            war_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            war_dep.memoryBarrierCount = 1;
+            war_dep.pMemoryBarriers = &war_bar;
+            vkCmdPipelineBarrier2(frame.cmd, &war_dep);
+        }
+
+        // ---- Camera UBO update on the GPU timeline ----------------------------
+        // Ordered after prior-frame reads by the WAR guard above; the barrier
+        // below makes the write visible to this frame's shaders.
+        {
+            vkCmdUpdateBuffer(frame.cmd, s.camera_ubo, 0,
+                              sizeof(CameraData), &s.camera_frame_data);
+            VkMemoryBarrier2 cam_bar{};
+            cam_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            cam_bar.srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
+            cam_bar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            cam_bar.dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                                  | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                                  | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            cam_bar.dstAccessMask = VK_ACCESS_2_UNIFORM_READ_BIT;
+            VkDependencyInfo cam_dep{};
+            cam_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            cam_dep.memoryBarrierCount = 1;
+            cam_dep.pMemoryBarriers = &cam_bar;
+            vkCmdPipelineBarrier2(frame.cmd, &cam_dep);
+        }
+
+        // ---- Live hydro/climate field upload (staged by tick) -----------------
+        // memcpy the retained CPU snapshots into this frame's staging slot and
+        // record buffer→image copies here, ordered by the WAR guard above and
+        // the read barrier below. Costs ~a memcpy; replaces the old blocking
+        // one-shot submit that stalled tick behind the whole in-flight frame.
+        if (s.hydro_upload_pending || s.climate_upload_pending) {
+            double up_t0 = glfwGetTime();
+            uint32_t slot = r.current_frame;
+            char* staging = static_cast<char*>(s.hydro_staging_info[slot].pMappedData);
+
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 6};
+            copy.imageExtent = {GLOBE_HYDRO_RES, GLOBE_HYDRO_RES, 1};
+
+            if (s.hydro_upload_pending) {
+                std::memcpy(staging, s.hydro_field_cpu.data(), HYDRO_FIELD_BYTES);
+                copy.bufferOffset = 0;
+                vkCmdCopyBufferToImage(frame.cmd, s.hydro_staging_buf[slot],
+                                       s.hydrology_img, VK_IMAGE_LAYOUT_GENERAL,
+                                       1, &copy);
+            }
+            if (s.climate_upload_pending) {
+                std::memcpy(staging + HYDRO_FIELD_BYTES, s.climate_field_cpu.data(),
+                            HYDRO_FIELD_BYTES);
+                copy.bufferOffset = HYDRO_FIELD_BYTES;
+                vkCmdCopyBufferToImage(frame.cmd, s.hydro_staging_buf[slot],
+                                       s.climate_img, VK_IMAGE_LAYOUT_GENERAL,
+                                       1, &copy);
+            }
+            vmaFlushAllocation(allocator, s.hydro_staging_alloc[slot], 0, VK_WHOLE_SIZE);
+            s.hydro_upload_pending = false;
+            s.climate_upload_pending = false;
+
+            VkMemoryBarrier2 up_bar{};
+            up_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            up_bar.srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
+            up_bar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            up_bar.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                 | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                                 | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            up_bar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                                 | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            VkDependencyInfo up_dep{};
+            up_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            up_dep.memoryBarrierCount = 1;
+            up_dep.pMemoryBarriers = &up_bar;
+            vkCmdPipelineBarrier2(frame.cmd, &up_dep);
+
+            double up_ms = (glfwGetTime() - up_t0) * 1000.0;
+            s.perf_last_upload_ms = static_cast<float>(up_ms);
+            s.perf_uploads++;
+            s.perf_upload_ms_sum += up_ms;
+            s.perf_upload_ms_max = std::max(s.perf_upload_ms_max, up_ms);
+        }
 
         // ---- Terrain brush dispatch (flat-grid only, before SWE) ----
         if (!s.ui.ocean_enabled && s.brush_hit && (s.brush_mode == BrushMode::Raise || s.brush_mode == BrushMode::Lower)) {
@@ -2684,7 +3403,12 @@ void globe_render(GlobeState& s, Renderer& r,
         tp.max_elevation = PLANET_MAX_ELEVATION;
         tp.subdivide_threshold = TILE_SUBDIVIDE_PX;
         tp.max_level = PLANET_MAX_LEVEL;
-        tp.max_tiles = PLANET_TILE_POOL;
+        // Selection budget is HALF the pool, not all of it: the selector is
+        // screen-error-prioritized, so a cap only coarsens pathological views
+        // (first-person at ground level wants 2048+ tiles for the horizon and
+        // ran at 8 fps), and the other half stays available for disturbed-tile
+        // anchoring and streaming churn. Far orbit naturally selects ~430.
+        tp.max_tiles = PLANET_TILE_POOL / 2;
         tp.altitude_above_terrain = s.altitude_above_terrain;
         auto visible_tiles = planet_select_visible_tiles(tp);
         std::sort(visible_tiles.begin(), visible_tiles.end(), [](const QuadNode& a, const QuadNode& b) {
@@ -2708,22 +3432,48 @@ void globe_render(GlobeState& s, Renderer& r,
                     if (flags[sl] == 0) continue;
                     QuadNode tile = s.slot_to_tile[sl];
                     if (tile.face == INVALID_TILE.face) continue;  // slot is unassigned
+                    double flag_now = glfwGetTime();
+                    // Water is actively crossing this tile's edges — it is not
+                    // quiescent, so keep its bake-back clock pushed out. But
+                    // only up to GLOBE_SWE_DISTURB_MAX_S past the last brush
+                    // contact: flow alone must not pin a tile in the live sim
+                    // forever (bake back mid-flow instead).
+                    if (s.disturbed_tiles.count(tile)) {
+                        auto ds = s.disturbed_since.find(tile);
+                        if (ds == s.disturbed_since.end() ||
+                            (flag_now - ds->second) < GLOBE_SWE_DISTURB_MAX_S)
+                            s.disturbed_touch[tile] = flag_now;
+                    }
                     for (int dir = 0; dir < 4; ++dir) {
                         uint32_t bit = 1u << dir;
                         if (!(flags[sl] & bit)) continue;
                         QuadNeighbor nb = planet_neighbor_same_face(tile, dir);
                         if (!nb.valid) continue;
                         if (s.tile_slot_map.count(nb.tile)) {
-                            // Already anchored. Just join the simulation.
-                            s.disturbed_tiles.insert(nb.tile);
+                            // Already anchored. Just join the simulation. The
+                            // touch refresh honors the neighbor's own flow
+                            // ceiling — otherwise two adjacent flagged tiles
+                            // refresh each other forever and nothing ever
+                            // bakes back.
+                            if (s.disturbed_tiles.insert(nb.tile).second)
+                                s.disturbed_since.emplace(nb.tile, flag_now);
+                            auto nds = s.disturbed_since.find(nb.tile);
+                            if (nds == s.disturbed_since.end() ||
+                                (flag_now - nds->second) < GLOBE_SWE_DISTURB_MAX_S)
+                                s.disturbed_touch[nb.tile] = flag_now;
                             continue;
                         }
-                        if (s.free_slots.empty()) continue;
+                        // Leave a streaming reserve: the anchor cascade grows
+                        // flood-fill-style and must never starve camera-driven
+                        // tile allocation (the edge stays reflective instead).
+                        if (s.free_slots.size() <= GLOBE_TILE_ANCHOR_RESERVE) continue;
                         uint32_t ns = s.free_slots.back();
                         s.free_slots.pop_back();
                         s.tile_slot_map.emplace(nb.tile, ns);
                         s.slot_to_tile[ns] = nb.tile;
                         s.disturbed_tiles.insert(nb.tile);
+                        s.disturbed_touch[nb.tile] = flag_now;
+                        s.disturbed_since.emplace(nb.tile, flag_now);
                         s.pending_init.insert(nb.tile);
                     }
                 }
@@ -2753,20 +3503,50 @@ void globe_render(GlobeState& s, Renderer& r,
                 }
             }
 
-            // Resolve / allocate slots for visible tiles.
+            // Resolve / allocate slots for visible tiles. Under pool pressure,
+            // evict the stalest non-visible disturbed tile (its live SWE water
+            // is dropped; the coarse field still has it). If even that fails,
+            // skip the tile this frame (SLOT_NONE — the draw loops skip it)
+            // rather than aliasing slot 0 and double-freeing it later.
             for (uint32_t i = 0; i < visible_tiles.size(); i++) {
                 auto it = s.tile_slot_map.find(visible_tiles[i]);
                 if (it != s.tile_slot_map.end()) {
                     tile_slots[i] = it->second;
-                } else {
-                    // PLANET_TILE_POOL >> typical visible count; underrun should not happen.
-                    uint32_t slot = s.free_slots.empty() ? 0u : s.free_slots.back();
-                    if (!s.free_slots.empty()) s.free_slots.pop_back();
-                    s.tile_slot_map.emplace(visible_tiles[i], slot);
-                    s.slot_to_tile[slot] = visible_tiles[i];
-                    tile_slots[i] = slot;
-                    s.pending_init.insert(visible_tiles[i]);
+                    continue;
                 }
+                if (s.free_slots.empty()) {
+                    QuadNode stalest = INVALID_TILE;
+                    double   stalest_touch = 1e300;
+                    for (const auto& tile : s.disturbed_tiles) {
+                        if (visible_set.count(tile)) continue;
+                        auto tt = s.disturbed_touch.find(tile);
+                        double touch = (tt != s.disturbed_touch.end()) ? tt->second : 0.0;
+                        if (touch < stalest_touch) { stalest_touch = touch; stalest = tile; }
+                    }
+                    if (stalest.face != INVALID_TILE.face) {
+                        auto st = s.tile_slot_map.find(stalest);
+                        if (st != s.tile_slot_map.end()) {
+                            s.slot_to_tile[st->second] = INVALID_TILE;
+                            s.free_slots.push_back(st->second);
+                            s.tile_slot_map.erase(st);
+                        }
+                        s.disturbed_tiles.erase(stalest);
+                        s.disturbed_touch.erase(stalest);
+                        s.disturbed_since.erase(stalest);
+                        s.pending_init.erase(stalest);
+                        s.pending_water_reseed.erase(stalest);
+                    }
+                }
+                if (s.free_slots.empty()) {
+                    tile_slots[i] = SLOT_NONE;
+                    continue;
+                }
+                uint32_t slot = s.free_slots.back();
+                s.free_slots.pop_back();
+                s.tile_slot_map.emplace(visible_tiles[i], slot);
+                s.slot_to_tile[slot] = visible_tiles[i];
+                tile_slots[i] = slot;
+                s.pending_init.insert(visible_tiles[i]);
             }
         }
         if (s.planet_swe_needs_full_init) {
@@ -2781,12 +3561,6 @@ void globe_render(GlobeState& s, Renderer& r,
                 std::memcpy(s.stamp_buf_info.pMappedData, s.stamps.data(), copy_size);
                 vmaFlushAllocation(allocator, s.stamp_buf_alloc, 0, copy_size);
                 s.stamps_dirty = false;
-            }
-            if (s.water_stamps_dirty && !s.water_stamps.empty()) {
-                size_t copy_size = s.water_stamps.size() * sizeof(WaterStamp);
-                std::memcpy(s.water_stamp_buf_info.pMappedData, s.water_stamps.data(), copy_size);
-                vmaFlushAllocation(allocator, s.water_stamp_buf_alloc, 0, copy_size);
-                s.water_stamps_dirty = false;
             }
 
             // Build the set of tiles that need terrain (re)generation:
@@ -2821,7 +3595,7 @@ void globe_render(GlobeState& s, Renderer& r,
                     gen_pc.face = tile.face;
                     gen_pc.pool_index = slot;
                     gen_pc.tex_res = PLANET_TILE_RES;
-                    gen_pc.seed = 42;
+                    gen_pc.seed = PLANET_SEED;
                     gen_pc.stamp_count = static_cast<uint32_t>(s.stamps.size());
 
                     vkCmdPushConstants(frame.cmd, s.pipelines.terrain_gen_pipeline_layout,
@@ -2841,6 +3615,15 @@ void globe_render(GlobeState& s, Renderer& r,
                 gen_dep.memoryBarrierCount = 1;
                 gen_dep.pMemoryBarriers = &gen_bar;
                 vkCmdPipelineBarrier2(frame.cmd, &gen_dep);
+            }
+
+            // With the ocean off there is no SWE init pass to consume these —
+            // terrain was just generated above, so drop them here or every
+            // tile ever added re-generates every frame (unbounded set growth,
+            // and re-enabling the ocean fired a giant stale init burst).
+            if (!s.ui.ocean_enabled) {
+                s.pending_init.clear();
+                s.pending_water_reseed.clear();
             }
         }
 
@@ -2864,14 +3647,18 @@ void globe_render(GlobeState& s, Renderer& r,
                 vkCmdPipelineBarrier2(frame.cmd, &dep);
             }
 
-            // Init dispatch — consume s.pending_init.
-            bool any_init = !s.pending_init.empty();
+            // Init dispatch — consume s.pending_init (new slots: terrain was just
+            // generated) plus s.pending_water_reseed (resident tiles re-seeded from
+            // a freshly-published hydrology field; terrain untouched). Init clears
+            // velocity, which is correct for field water — it is standing state.
+            bool any_init = !s.pending_init.empty() || !s.pending_water_reseed.empty();
             if (any_init) {
                 vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                     s.pipelines.planet_swe_init_pipeline);
                 vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                     s.pipelines.planet_swe_init_pipeline_layout, 0, 1,
                     &s.planet_swe_init_desc_set, 0, nullptr);
+                for (const auto& t : s.pending_water_reseed) s.pending_init.insert(t);
                 for (const auto& t : s.pending_init) {
                     auto it = s.tile_slot_map.find(t);
                     if (it == s.tile_slot_map.end()) continue;
@@ -2885,20 +3672,30 @@ void globe_render(GlobeState& s, Renderer& r,
                     ipc.v_min = -1.0f + t.y * ts;
                     ipc.tile_size = ts;
                     ipc.face = t.face;
-                    ipc.water_stamp_count = static_cast<uint32_t>(s.water_stamps.size());
                     vkCmdPushConstants(frame.cmd, s.pipelines.planet_swe_init_pipeline_layout,
                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ipc), &ipc);
                     vkCmdDispatch(frame.cmd, (PLANET_TILE_RES + 7) / 8, (PLANET_TILE_RES + 7) / 8, 1);
                 }
                 s.pending_init.clear();
+                s.pending_water_reseed.clear();
             }
 
-            // Pick target tile under the cursor for the water brush.
+            // Pick target tile under the cursor for the water brush. Pouring
+            // anywhere wakes the tile into the live SWE ring: the pulse splashes
+            // and flows at fine resolution while the same brush ALSO deposits
+            // into the coarse field (globe_tick), which routes the flood
+            // downstream planet-wide. When the tile quiesces its SWE water is
+            // baked back into the field and the field re-seeds it — so live
+            // water and field water stay one continuous body over time.
             PlanetTilePick pick{};
             bool water_brush_active = s.brush_hit && s.brush_mode == BrushMode::Water;
             if (water_brush_active) {
                 pick = planet_pick_tile(s.stamp_sphere_dir, visible_tiles, PLANET_TILE_RES);
-                if (pick.hit) s.disturbed_tiles.insert(pick.node);
+                if (pick.hit) {
+                    s.disturbed_tiles.insert(pick.node);
+                    s.disturbed_touch[pick.node] = glfwGetTime();
+                    s.disturbed_since[pick.node] = glfwGetTime();  // brush contact resets the flow ceiling
+                }
             }
 
             if (any_init) {
@@ -3180,7 +3977,10 @@ void globe_render(GlobeState& s, Renderer& r,
                         swe_pc.pulse_x = s.grid_x;
                         swe_pc.pulse_y = s.grid_y;
                         swe_pc.pulse_radius = s.ui.brush_radius_grid;
-                        swe_pc.pulse_amount = s.ui.brush_strength;
+                        // dt-scaled (clamped like the terrain brush): a held
+                        // brush must deposit the same water at 240 fps as 60.
+                        swe_pc.pulse_amount =
+                            s.ui.brush_strength * std::min(s.last_dt, 0.033f) * 60.0f;
                     } else {
                         swe_pc.pulse_amount = 0.0f;
                     }
@@ -3257,6 +4057,19 @@ void globe_render(GlobeState& s, Renderer& r,
                 copy.regionCount = 1;
                 copy.pRegions = &region;
                 vkCmdCopyImageToBuffer2(frame.cmd, &copy);
+
+                // Make the copy visible to the host readback in globe_tick.
+                VkMemoryBarrier2 host_bar{};
+                host_bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                host_bar.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                host_bar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                host_bar.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+                host_bar.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+                VkDependencyInfo host_dep{};
+                host_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                host_dep.memoryBarrierCount = 1;
+                host_dep.pMemoryBarriers = &host_bar;
+                vkCmdPipelineBarrier2(frame.cmd, &host_dep);
             }
 
             s.atmo_ping_pong ^= 1;
@@ -3316,7 +4129,7 @@ void globe_render(GlobeState& s, Renderer& r,
 
         // ---- Sand particle dispatch (consumer — after all authority systems) ----
         if (s.ui.atmosphere_enabled && s.ui.sand_enabled) {
-            static uint32_t sand_emit_offset = 0;
+            uint32_t& sand_emit_offset = s.sand_emit_offset;   // per-instance (survives were a static)
 
             SandSimPC spc{};
             spc.dt = std::min(s.last_dt, 0.033f) * s.ui.time_scale;
@@ -3370,6 +4183,8 @@ void globe_render(GlobeState& s, Renderer& r,
                                   | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
                                   | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
+            // The scene renders into the HDR target; the swapchain is
+            // transitioned later, before the tonemap pass.
             VkImageMemoryBarrier2 sc_barrier{};
             sc_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
             sc_barrier.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
@@ -3378,7 +4193,7 @@ void globe_render(GlobeState& s, Renderer& r,
             sc_barrier.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
             sc_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             sc_barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-            sc_barrier.image = r.swapchain_images[image_index];
+            sc_barrier.image = s.hdr_img;
             sc_barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
             VkImageMemoryBarrier2 depth_barrier{};
@@ -3407,11 +4222,12 @@ void globe_render(GlobeState& s, Renderer& r,
         {
             VkRenderingAttachmentInfo color_attachment{};
             color_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            color_attachment.imageView = r.swapchain_views[image_index];
+            color_attachment.imageView = s.hdr_view;
             color_attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-            color_attachment.clearValue.color = {{0.02f, 0.02f, 0.05f, 1.0f}};
+            // Space is black; the sky pass paints the atmosphere where it exists.
+            color_attachment.clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
 
             VkRenderingAttachmentInfo depth_attachment{};
             depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -3455,6 +4271,7 @@ void globe_render(GlobeState& s, Renderer& r,
             glm::dvec3 cam_pos_d = camera_eye_position(s.camera);
 
             for (uint32_t i = 0; i < visible_tiles.size(); i++) {
+                if (tile_slots[i] == SLOT_NONE) continue;   // no pool slot this frame
                 const auto& tile = visible_tiles[i];
                 float ts = 2.0f / static_cast<float>(1u << tile.level);
 
@@ -3477,11 +4294,89 @@ void globe_render(GlobeState& s, Renderer& r,
                 tpc.heightmap_texel = 1.0f / static_cast<float>(PLANET_TILE_RES);
                 tpc.cloud_opacity = 0.0f;
                 tpc.sea_level = s.ui.ocean_enabled ? s.ui.sea_level : -1.0f;
+                tpc.seed_f = static_cast<float>(PLANET_SEED);
+                tpc.atmo_density = s.ui.sky_enabled ? s.ui.atmo_density : 0.0f;
+                tpc.sun_intensity = s.ui.sun_intensity;
 
                 vkCmdPushConstants(frame.cmd, s.pipelines.clipmap_gfx_pipeline_layout,
                     VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                     0, sizeof(tpc), &tpc);
                 vkCmdDrawIndexed(frame.cmd, s.clipmap_index_count, 1, 0, 0, 0);
+            }
+
+            // River overlay pass — animated global drainage, drawn on the surface.
+            {
+                vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipelines.river_pipeline);
+                vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    s.pipelines.river_pipeline_layout, 0, 1, &s.river_desc_set, 0, nullptr);
+                vkCmdBindVertexBuffers(frame.cmd, 0, 1, &s.clipmap_vbo, &clip_offset);
+                vkCmdBindIndexBuffer(frame.cmd, s.clipmap_ibo, 0, VK_INDEX_TYPE_UINT32);
+
+                float river_time = static_cast<float>(glfwGetTime());
+                // Skip tiles whose covered field blocks carry no channel above
+                // the draw threshold — the overlay's fragments all discard
+                // there, but the full tile grid's vertex cost was still paid
+                // (most of the planet: ocean + dry land).
+                auto tile_has_river = [&s](const QuadNode& t) -> bool {
+                    if (s.river_block_mask.empty()) return false;  // field not published yet
+                    constexpr uint32_t B = RIVER_MASK_BLOCKS;
+                    const uint8_t* blocks = s.river_block_mask.data() + size_t{t.face} * B * B;
+                    // Tile spans fraction [x/2^L, (x+1)/2^L] of the face per
+                    // axis; cover it with an inclusive block range.
+                    double inv = 1.0 / static_cast<double>(1u << t.level);
+                    uint32_t bx0 = std::min(B - 1, static_cast<uint32_t>(t.x * inv * B));
+                    uint32_t by0 = std::min(B - 1, static_cast<uint32_t>(t.y * inv * B));
+                    uint32_t bx1 = std::min(B - 1, static_cast<uint32_t>((t.x + 1) * inv * B - 1e-9));
+                    uint32_t by1 = std::min(B - 1, static_cast<uint32_t>((t.y + 1) * inv * B - 1e-9));
+                    for (uint32_t by = by0; by <= by1; ++by)
+                        for (uint32_t bx = bx0; bx <= bx1; ++bx)
+                            if (blocks[by * B + bx]) return true;
+                    return false;
+                };
+                for (uint32_t i = 0; i < visible_tiles.size(); i++) {
+                    if (tile_slots[i] == SLOT_NONE) continue;   // no pool slot this frame
+                    const auto& tile = visible_tiles[i];
+                    if (!tile_has_river(tile)) continue;        // nothing to draw here
+                    float ts = 2.0f / static_cast<float>(1u << tile.level);
+                    glm::dvec3 dir = planet_tile_center_dir(tile);
+                    glm::dvec3 rel_d = dir * static_cast<double>(PLANET_RADIUS) - cam_pos_d;
+
+                    RiverOverlayPC rpc{};
+                    rpc.rel_x = static_cast<float>(rel_d.x);
+                    rpc.rel_y = static_cast<float>(rel_d.y);
+                    rpc.rel_z = static_cast<float>(rel_d.z);
+                    rpc.u_min = -1.0f + tile.x * ts;
+                    rpc.v_min = -1.0f + tile.y * ts;
+                    rpc.tile_size = ts;
+                    rpc.face = tile.face;
+                    rpc.pool_index = tile_slots[i];
+                    rpc.planet_radius = PLANET_RADIUS;
+                    rpc.heightmap_texel = 1.0f / static_cast<float>(PLANET_TILE_RES);
+                    rpc.time = river_time;
+                    rpc.river_threshold = RIVER_OVERLAY_THRESHOLD;  // in lockstep with the mask build
+                    rpc.atmo_density = s.ui.sky_enabled ? s.ui.atmo_density : 0.0f;
+                    rpc.sun_intensity = s.ui.sun_intensity;
+
+                    vkCmdPushConstants(frame.cmd, s.pipelines.river_pipeline_layout,
+                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                        0, sizeof(rpc), &rpc);
+                    vkCmdDrawIndexed(frame.cmd, s.clipmap_index_count, 1, 0, 0, 0);
+                }
+            }
+
+            // Sky pass — fullscreen atmosphere raymarch, depth-EQUAL against the
+            // clear value so it fills exactly the pixels no geometry touched.
+            if (s.ui.sky_enabled) {
+                vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipelines.sky_pipeline);
+                vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    s.pipelines.sky_pipeline_layout, 0, 1, &s.sky_desc_set, 0, nullptr);
+                SkyPC spc{};
+                spc.planet_radius = PLANET_RADIUS;
+                spc.density = s.ui.atmo_density;
+                spc.sun_intensity = s.ui.sun_intensity;
+                vkCmdPushConstants(frame.cmd, s.pipelines.sky_pipeline_layout,
+                    VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(spc), &spc);
+                vkCmdDraw(frame.cmd, 3, 1, 0, 0);
             }
 
             // Water pass (disabled for planet mode — Phase 2)
@@ -3542,6 +4437,63 @@ void globe_render(GlobeState& s, Renderer& r,
                 vkCmdDraw(frame.cmd, SAND_MAX_PARTICLES * 2, 1, 0, 0);
             }
 
+            vkCmdEndRendering(frame.cmd);
+        }
+
+        // ---- Tonemap pass: HDR scene → swapchain ----
+        {
+            VkImageMemoryBarrier2 hdr_to_read{};
+            hdr_to_read.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            hdr_to_read.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            hdr_to_read.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+            hdr_to_read.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            hdr_to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            hdr_to_read.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            hdr_to_read.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            hdr_to_read.image = s.hdr_img;
+            hdr_to_read.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+            VkImageMemoryBarrier2 sc_to_color{};
+            sc_to_color.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            sc_to_color.srcStageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
+            sc_to_color.srcAccessMask = VK_ACCESS_2_NONE;
+            sc_to_color.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            sc_to_color.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+            sc_to_color.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            sc_to_color.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            sc_to_color.image = r.swapchain_images[image_index];
+            sc_to_color.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+            VkImageMemoryBarrier2 tm_barriers[] = {hdr_to_read, sc_to_color};
+            VkDependencyInfo tm_dep{};
+            tm_dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            tm_dep.imageMemoryBarrierCount = 2;
+            tm_dep.pImageMemoryBarriers = tm_barriers;
+            vkCmdPipelineBarrier2(frame.cmd, &tm_dep);
+
+            VkRenderingAttachmentInfo tm_color{};
+            tm_color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            tm_color.imageView = r.swapchain_views[image_index];
+            tm_color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            tm_color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;   // fully overwritten
+            tm_color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+            VkRenderingInfo tm_ri{};
+            tm_ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            tm_ri.renderArea = {{0, 0}, extent};
+            tm_ri.layerCount = 1;
+            tm_ri.colorAttachmentCount = 1;
+            tm_ri.pColorAttachments = &tm_color;
+
+            vkCmdBeginRendering(frame.cmd, &tm_ri);
+            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s.pipelines.tonemap_pipeline);
+            vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                s.pipelines.tonemap_pipeline_layout, 0, 1, &s.tonemap_desc_set, 0, nullptr);
+            TonemapPC tmpc{};
+            tmpc.exposure = s.ui.exposure;
+            vkCmdPushConstants(frame.cmd, s.pipelines.tonemap_pipeline_layout,
+                VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(tmpc), &tmpc);
+            vkCmdDraw(frame.cmd, 3, 1, 0, 0);
             vkCmdEndRendering(frame.cmd);
         }
 
@@ -3606,6 +4558,15 @@ void globe_shutdown(GlobeState& s, Renderer& r)
     vkDestroyImageView(device, s.clipmap_hm_view, nullptr);
     vmaDestroyImage(allocator, s.clipmap_hm_image, s.clipmap_hm_alloc);
 
+    s.hydro.reset();  // join the background solve before tearing down
+
+    vkDestroyImageView(device, s.hydrology_view, nullptr);
+    vmaDestroyImage(allocator, s.hydrology_img, s.hydrology_alloc);
+    vkDestroyImageView(device, s.climate_view, nullptr);
+    vmaDestroyImage(allocator, s.climate_img, s.climate_alloc);
+    for (uint32_t f = 0; f < FRAMES_IN_FLIGHT; ++f)
+        vmaDestroyBuffer(allocator, s.hydro_staging_buf[f], s.hydro_staging_alloc[f]);
+
     vmaDestroyBuffer(allocator, s.clipmap_ibo, s.clipmap_ibo_alloc);
     vmaDestroyBuffer(allocator, s.clipmap_vbo, s.clipmap_vbo_alloc);
 
@@ -3645,7 +4606,8 @@ void globe_shutdown(GlobeState& s, Renderer& r)
     vmaDestroyImage(allocator, s.water_state_b_img, s.water_state_b_alloc);
     vkDestroyImageView(device, s.water_output_view, nullptr);
     vmaDestroyImage(allocator, s.water_output_img, s.water_output_alloc);
-    vmaDestroyBuffer(allocator, s.water_stamp_buf, s.water_stamp_buf_alloc);
+    vkDestroyImageView(device, s.hdr_view, nullptr);
+    vmaDestroyImage(allocator, s.hdr_img, s.hdr_alloc);
     vmaDestroyBuffer(allocator, s.edge_flags_buf, s.edge_flags_alloc);
     vmaDestroyBuffer(allocator, s.atmo_debug_buf, s.atmo_debug_alloc);
 }

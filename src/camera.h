@@ -18,6 +18,12 @@ struct OrbitalState {
                      0.0};
     glm::quat  orientation{1.0f, 0.0f, 0.0f, 0.0f};
     double     arm_length = 5000.0;
+
+    // Smoothing state (gives mouse-look and movement an ease-in/out, weighty
+    // feel and keeps motion surface-locked — see orbital_update).
+    glm::vec2  look_pending{0.0f, 0.0f};  // unconsumed mouse delta (px), drained with easing
+    glm::dvec3 move_vel{0.0, 0.0, 0.0};   // smoothed surface-tangential velocity (m/s, world)
+    double     radial_vel = 0.0;          // smoothed radial (Q/E) velocity (m/s)
 };
 
 // Eye is the camera position; mouse-look rotates the eye in place.
@@ -33,7 +39,8 @@ struct FirstPersonState {
     glm::dvec3 warp_d0{0.0, 0.0, 1.0};      // start direction (unit)
     glm::dvec3 warp_d1{0.0, 0.0, 1.0};      // end direction (unit)
     double     warp_r0 = 0.0;               // start radius from planet center
-    double     warp_r1 = 0.0;               // end radius from planet center
+    glm::quat  warp_o0{1.0f, 0.0f, 0.0f, 0.0f};  // orientation at start
+    glm::quat  warp_o1{1.0f, 0.0f, 0.0f, 0.0f};  // orientation at landing (horizon-level)
     double     warp_arc_h = 0.0;            // peak altitude bump (meters)
     double     warp_duration = 0.0;         // seconds total
     double     warp_elapsed = 0.0;
@@ -58,7 +65,7 @@ struct CameraData {
     glm::mat4 view;
     glm::mat4 proj;
     glm::vec3 sun_dir;   float _pad0;
-    glm::vec3 sun_color; float _pad1;
+    glm::vec3 sun_color; float time;   // _pad1 repurposed: seconds, for water animation
     glm::vec3 cam_pos;   float _pad2;
     glm::vec4 brush_world;
     glm::vec4 brush_color;

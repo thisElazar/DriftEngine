@@ -104,6 +104,15 @@ void ui_draw(UIState& s)
             }
         }
 
+        if (ImGui::CollapsingHeader("Sky", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("Atmosphere", &s.sky_enabled);
+            if (s.sky_enabled) {
+                ImGui::SliderFloat("Density", &s.atmo_density, 0.1f, 4.0f, "%.2f");
+                ImGui::SliderFloat("Sun intensity", &s.sun_intensity, 1.0f, 80.0f, "%.0f");
+            }
+            ImGui::SliderFloat("Exposure", &s.exposure, 0.1f, 4.0f, "%.2f");
+        }
+
         if (ImGui::CollapsingHeader("Scene")) {
             if (ImGui::Button("Regenerate basin")) s.request_basin_reset = true;
             ImGui::TextDisabled("Pulse: SPACE | Modes: 1=raise 2=lower 3=water 4=sand");

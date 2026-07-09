@@ -56,9 +56,16 @@ std::vector<uint32_t> load_spirv(const char* path)
         std::abort();
     }
     auto size = static_cast<size_t>(file.tellg());
+    if (size == 0 || size % sizeof(uint32_t) != 0) {
+        std::fprintf(stderr, "SPIR-V file truncated or invalid (%zu bytes): %s\n", size, path);
+        std::abort();
+    }
     std::vector<uint32_t> buffer(size / sizeof(uint32_t));
     file.seekg(0);
-    file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(size));
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(size))) {
+        std::fprintf(stderr, "Failed to read SPIR-V file: %s\n", path);
+        std::abort();
+    }
     return buffer;
 }
 
@@ -126,7 +133,8 @@ void oneshot_end(OneShot& s)
 void image_barrier(VkCommandBuffer cmd, VkImage img,
                    VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
                    VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access,
-                   VkImageLayout old_layout, VkImageLayout new_layout)
+                   VkImageLayout old_layout, VkImageLayout new_layout,
+                   uint32_t base_layer, uint32_t layer_count)
 {
     VkImageMemoryBarrier2 b{};
     b.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -137,7 +145,7 @@ void image_barrier(VkCommandBuffer cmd, VkImage img,
     b.oldLayout     = old_layout;
     b.newLayout     = new_layout;
     b.image         = img;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, base_layer, layer_count};
 
     VkDependencyInfo di{};
     di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -258,7 +266,7 @@ float half_to_float(uint16_t h)
 void update_r32_image(VkDevice device, VmaAllocator alloc,
                       VkQueue queue, uint32_t family,
                       VkImage img, const std::vector<float>& data,
-                      uint32_t w, uint32_t h)
+                      uint32_t w, uint32_t h, uint32_t layer)
 {
     VkDeviceSize bytes = VkDeviceSize{w} * h * sizeof(float);
     VkBufferCreateInfo bci{};
@@ -280,21 +288,23 @@ void update_r32_image(VkDevice device, VmaAllocator alloc,
     VkImageMemoryBarrier2 b1{};
     b1.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     b1.srcStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-    b1.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                     | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b1.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                     | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
     b1.dstStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
     b1.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     b1.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
     b1.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b1.image         = img;
-    b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1};
     VkDependencyInfo d1{};
     d1.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
     d1.imageMemoryBarrierCount = 1; d1.pImageMemoryBarriers = &b1;
     vkCmdPipelineBarrier2(os.cmd, &d1);
 
     VkBufferImageCopy copy{};
-    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
     copy.imageExtent = {w, h, 1};
     vkCmdCopyBufferToImage(os.cmd, staging, img,
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
@@ -303,8 +313,76 @@ void update_r32_image(VkDevice device, VmaAllocator alloc,
     b2.srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
     b2.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     b2.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-    b2.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                     | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b2.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                     | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    b2.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b2.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
+    VkDependencyInfo d2{};
+    d2.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    d2.imageMemoryBarrierCount = 1; d2.pImageMemoryBarriers = &b2;
+    vkCmdPipelineBarrier2(os.cmd, &d2);
+    oneshot_end(os);
+    vmaDestroyBuffer(alloc, staging, staging_alloc);
+}
+
+void update_rgba32f_array(VkDevice device, VmaAllocator alloc,
+                          VkQueue queue, uint32_t family,
+                          VkImage img, const std::vector<float>& data,
+                          uint32_t w, uint32_t h, uint32_t layers,
+                          VkImageLayout old_layout)
+{
+    VkDeviceSize bytes = VkDeviceSize{w} * h * layers * 4 * sizeof(float);
+    VkBufferCreateInfo bci{};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size  = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_AUTO;
+    ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+             | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VmaAllocation staging_alloc = VK_NULL_HANDLE;
+    VmaAllocationInfo staging_info{};
+    VK_CHECK(vmaCreateBuffer(alloc, &bci, &ai, &staging, &staging_alloc, &staging_info));
+    std::memcpy(staging_info.pMappedData, data.data(), bytes);
+    vmaFlushAllocation(alloc, staging_alloc, 0, VK_WHOLE_SIZE);
+
+    OneShot os = oneshot_begin(device, queue, family);
+    VkImageMemoryBarrier2 b1{};
+    b1.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    b1.srcStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                     | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b1.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                     | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    b1.dstStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
+    b1.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b1.oldLayout     = old_layout;
+    b1.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b1.image         = img;
+    b1.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+    VkDependencyInfo d1{};
+    d1.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    d1.imageMemoryBarrierCount = 1; d1.pImageMemoryBarriers = &b1;
+    vkCmdPipelineBarrier2(os.cmd, &d1);
+
+    // One copy covering all array layers (buffer is layer-contiguous).
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
+    copy.imageExtent = {w, h, 1};
+    vkCmdCopyBufferToImage(os.cmd, staging, img,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+    VkImageMemoryBarrier2 b2 = b1;
+    b2.srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
+    b2.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    b2.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                     | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b2.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                     | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
     b2.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b2.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
     VkDependencyInfo d2{};

@@ -8,7 +8,7 @@ target_include_directories(world_lab PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # Engine shaders (swe_init, swe_step, terrain_brush) are already compiled
 # by the top-level shader rule; we only build app-local render shaders here.
 set(WL_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
-file(GLOB WL_HLSL_SHADERS ${WL_SHADER_DIR}/*.hlsl)
+file(GLOB WL_HLSL_SHADERS CONFIGURE_DEPENDS ${WL_SHADER_DIR}/*.hlsl)
 
 set(WL_SPV_OUTPUTS "")
 foreach(HLSL ${WL_HLSL_SHADERS})

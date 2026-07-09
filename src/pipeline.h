@@ -123,13 +123,12 @@ struct PlanetSweInitPC {
     uint32_t grid_h;
     float    sea_level;
     uint32_t pool_index;
-    // Tile params for sphere_dir reconstruction (used to sample water stamps).
+    // Tile → cube-face uv mapping, for sampling the per-face hydrology field
+    // (init seeds standing water from its water-surface elevation channel).
     float    u_min;
     float    v_min;
     float    tile_size;
     uint32_t face;
-    uint32_t water_stamp_count;
-    uint32_t _pad0, _pad1, _pad2;
 };
 
 struct PlanetSweHAdjustPC {
@@ -185,6 +184,39 @@ struct PlanetTilePC {
     float    heightmap_texel;
     float    cloud_opacity;
     float    sea_level;
+    float    seed_f;        // planet seed, for the shaders' climate/biome functions
+    float    atmo_density;  // aerial perspective density (0 = off)
+    float    sun_intensity; // sun radiance scale, shared with the sky pass
+};
+
+// River overlay: a subset of PlanetTilePC (the fields the overlay VS needs to
+// rebuild the on-surface position) plus animation time and the river threshold.
+// Layout matches the [[vk::push_constant]] cbuffer in river_overlay.{vs,fs}.hlsl.
+struct RiverOverlayPC {
+    float    rel_x, rel_y, rel_z;
+    float    u_min, v_min, tile_size;
+    uint32_t face;
+    uint32_t pool_index;
+    float    planet_radius;
+    float    heightmap_texel;
+    float    time;
+    float    river_threshold;
+    float    atmo_density;  // aerial perspective density (0 = off)
+    float    sun_intensity; // sun radiance scale, shared with the sky pass
+};
+
+// Sky pass (fullscreen atmosphere raymarch): geometry comes from the camera
+// UBO (inv_view_proj + planet_center); these are the tuning knobs.
+struct SkyPC {
+    float planet_radius;
+    float density;
+    float sun_intensity;
+    float _pad;
+};
+
+struct TonemapPC {
+    float exposure;
+    float _pad0, _pad1, _pad2;
 };
 
 struct PlanetGenPC {
@@ -206,16 +238,6 @@ struct TerrainStamp {
     float    _pad0, _pad1;
 };
 
-// Mirrors TerrainStamp for the water brush. Persistent across LOD: tiles at
-// any level read these stamps in their SWE init pass to seed water above the
-// static sea level, so a brushed lake is visible at any zoom.
-struct WaterStamp {
-    float    pos_x, pos_y, pos_z;
-    float    radius;
-    float    water_amount;   // metres of water column to add at the stamp center
-    float    cos_radius;
-    float    _pad0, _pad1;
-};
 
 struct ClumpPC {
     glm::mat4 mvp;
@@ -227,9 +249,9 @@ struct ClumpPC {
 static_assert(sizeof(SweStepPC) == 56, "SweStepPC layout must match shader");
 static_assert(sizeof(TerrainBrushPC) == 32, "TerrainBrushPC layout must match shader");
 static_assert(sizeof(ErosionPC) == 64, "ErosionPC layout must match shader");
+static_assert(sizeof(RiverOverlayPC) == 56, "RiverOverlayPC layout must match shader");
 
 constexpr uint32_t MAX_STAMPS = 4096;
-constexpr uint32_t MAX_WATER_STAMPS = 4096;
 
 struct Pipelines {
     VkShaderModule swe_init_shader = VK_NULL_HANDLE;
@@ -250,6 +272,11 @@ struct Pipelines {
     VkShaderModule planet_swe_init_shader = VK_NULL_HANDLE;
     VkShaderModule planet_swe_step_shader = VK_NULL_HANDLE;
     VkShaderModule planet_swe_h_adjust_shader = VK_NULL_HANDLE;
+    VkShaderModule river_vs = VK_NULL_HANDLE;
+    VkShaderModule river_fs = VK_NULL_HANDLE;
+    VkShaderModule fullscreen_vs = VK_NULL_HANDLE;
+    VkShaderModule sky_fs = VK_NULL_HANDLE;
+    VkShaderModule tonemap_fs = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout swe_init_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout swe_step_desc_layout = VK_NULL_HANDLE;
@@ -263,6 +290,9 @@ struct Pipelines {
     VkDescriptorSetLayout planet_swe_init_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout planet_swe_step_desc_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout planet_swe_h_adjust_desc_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout river_desc_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout sky_desc_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout tonemap_desc_layout = VK_NULL_HANDLE;
 
     VkPipelineLayout swe_init_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout swe_step_pipeline_layout = VK_NULL_HANDLE;
@@ -278,6 +308,9 @@ struct Pipelines {
     VkPipelineLayout planet_swe_init_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout planet_swe_step_pipeline_layout = VK_NULL_HANDLE;
     VkPipelineLayout planet_swe_h_adjust_pipeline_layout = VK_NULL_HANDLE;
+    VkPipelineLayout river_pipeline_layout = VK_NULL_HANDLE;
+    VkPipelineLayout sky_pipeline_layout = VK_NULL_HANDLE;
+    VkPipelineLayout tonemap_pipeline_layout = VK_NULL_HANDLE;
 
     VkPipeline swe_init_pipeline = VK_NULL_HANDLE;
     VkPipeline swe_step_pipeline = VK_NULL_HANDLE;
@@ -294,8 +327,22 @@ struct Pipelines {
     VkPipeline planet_swe_init_pipeline = VK_NULL_HANDLE;
     VkPipeline planet_swe_step_pipeline = VK_NULL_HANDLE;
     VkPipeline planet_swe_h_adjust_pipeline = VK_NULL_HANDLE;
+    VkPipeline river_pipeline = VK_NULL_HANDLE;
+    VkPipeline sky_pipeline = VK_NULL_HANDLE;
+    VkPipeline tonemap_pipeline = VK_NULL_HANDLE;
+
+    // Color format the scene graphics pipelines were built against (the HDR
+    // intermediate when the app tonemaps, else the swapchain format), and the
+    // present format the tonemap pipeline writes to; remembered so
+    // pipelines_reload can recreate them identically.
+    VkFormat color_format = VK_FORMAT_B8G8R8A8_UNORM;
+    VkFormat present_format = VK_FORMAT_B8G8R8A8_UNORM;
 };
 
-void pipelines_create(Pipelines& p, VkDevice device);
+// `color_format` is what the scene pipelines render into. `present_format`
+// (when not UNDEFINED) is what the tonemap pipeline writes to; UNDEFINED means
+// "same as color_format" (apps that render straight to the swapchain).
+void pipelines_create(Pipelines& p, VkDevice device, VkFormat color_format,
+                      VkFormat present_format = VK_FORMAT_UNDEFINED);
 void pipelines_reload(Pipelines& p, VkDevice device);
 void pipelines_destroy(Pipelines& p, VkDevice device);

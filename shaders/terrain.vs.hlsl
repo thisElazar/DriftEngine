@@ -23,6 +23,7 @@ cbuffer PlanetTilePC {
     float heightmap_texel;
     float cloud_opacity;
     float sea_level;
+    float seed_f;        // planet seed, for the climate/biome functions
 };
 
 struct VSInput {
@@ -73,11 +74,21 @@ VSOutput main(VSInput input)
     float2 grid = clamp(input.grid_pos, 0.0, GRID_MAX);
     bool is_skirt = any(input.grid_pos != grid);
 
+    // tile_uv (clamped) drives heightmap sampling + texturing.
     float2 tile_uv = grid / GRID_MAX;
 
+    // Skirt position: flare the curtain OUTWARD (beyond the tile edge) as well as
+    // dropping it down, so it overlaps the neighbouring tile and covers T-junction
+    // cracks even when the neighbour is several LOD levels coarser. Non-skirt verts
+    // are unaffected (grid_pos == grid → flare is zero). Height still comes from the
+    // clamped edge sample below, dropped by SKIRT_DROP.
+    static const float SKIRT_FLARE = 4.0;   // cells to extend the skirt past the edge
+    float2 pos_grid = grid + (input.grid_pos - grid) * SKIRT_FLARE;
+    float2 pos_uv = pos_grid / GRID_MAX;
+
     float2 face_uv;
-    face_uv.x = u_min + tile_uv.x * tile_size;
-    face_uv.y = v_min + tile_uv.y * tile_size;
+    face_uv.x = u_min + pos_uv.x * tile_size;
+    face_uv.y = v_min + pos_uv.y * tile_size;
 
     float3 sphere_dir = cube_to_sphere(face_uv_to_cube(face_uv, face));
 
