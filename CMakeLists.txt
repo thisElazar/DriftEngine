@@ -144,7 +144,16 @@ add_executable(drift_engine
 )
 
 target_include_directories(drift_engine PRIVATE apps)
-target_link_libraries(drift_engine PRIVATE drift_engine_core)
+target_link_libraries(drift_engine PRIVATE drift_engine_core bestiary)
+
+# Scripted-flight harness: the globe driven by synthesized InputFrames
+# (see apps/globe/pilot_main.cpp). Same module, no human at the controls.
+add_executable(drift_pilot
+    apps/globe/pilot_main.cpp
+    apps/globe/globe.cpp
+)
+target_include_directories(drift_pilot PRIVATE apps)
+target_link_libraries(drift_pilot PRIVATE drift_engine_core bestiary)
 
 if(MSVC)
     target_compile_options(drift_engine PRIVATE /W4 /permissive-)

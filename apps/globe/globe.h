@@ -15,6 +15,7 @@
 #include "ui.h"
 #include "vk_util.h"
 #include "input_frame.h"
+#include "environment.h"   // bestiary — planet-scale EnvironmentField bridge
 
 #include <unordered_map>
 #include <unordered_set>
@@ -45,6 +46,9 @@ constexpr float    GLOBE_TILE_SUBDIVIDE_PX = 512.0f;
 constexpr uint32_t GLOBE_HYDRO_RES         = 128;  // coarse global drainage grid, per cube face
                                                    // (128 keeps the synchronous build fast; raised
                                                    //  once the solve moves to a worker thread)
+// Bytes of one published field (hydro or climate): 6 cube faces of RGBA32F.
+constexpr VkDeviceSize HYDRO_FIELD_BYTES =
+    VkDeviceSize{GLOBE_HYDRO_RES} * GLOBE_HYDRO_RES * 6 * 4 * sizeof(float);
 constexpr float    WATER_BRUSH_DEPOSIT     = 75.0f; // brush_strength → field water units per deposit
                                                     // (feel knob for the field-only flood pulse)
 
@@ -70,6 +74,19 @@ struct SurfaceSet { int cell; float surf; float mean_depth; };
 // to the re-seed pool. Long enough for a splash to settle under damping.
 constexpr double GLOBE_SWE_QUIESCE_S = 6.0;
 
+// Hard ceiling on how long cross-edge flow (edge flags) can keep extending a
+// tile's disturbance after its last brush contact. Prevents any feedback loop
+// (however exotic) from pinning tiles in the live sim forever; a tile baked
+// back mid-flow just freezes its observed surface into the field.
+constexpr double GLOBE_SWE_DISTURB_MAX_S = 30.0;
+
+// Slots the edge-flag auto-anchor must leave free for camera-driven tile
+// streaming. The anchor cascade grows flood-fill-style (each anchored tile's
+// waves can anchor its neighbors), so without a reserve one big splash — or
+// the animated ocean in first-person — consumes the whole pool and visible
+// tiles start aliasing slots.
+constexpr size_t GLOBE_TILE_ANCHOR_RESERVE = 256;
+
 struct HydroAsync {
     std::thread       worker;
     std::atomic<bool> stop{false};
@@ -90,7 +107,9 @@ struct HydroAsync {
     std::vector<glm::vec4> climate_published;   // latest baked climate field (sst/current), guarded by pub_mtx
 
     uint32_t res = 0;
-    float    sea_level = 800.0f;
+    // Live-synced from the UI slider (main thread stores + sets structure_dirty;
+    // worker re-reads it at every structure rebuild).
+    std::atomic<float> sea_level{800.0f};
 
     ~HydroAsync() {
         stop.store(true, std::memory_order_release);
@@ -128,6 +147,9 @@ struct GlobeState {
     VkBuffer          camera_ubo       = VK_NULL_HANDLE;
     VmaAllocation     camera_ubo_alloc = VK_NULL_HANDLE;
     VmaAllocationInfo camera_ubo_info{};
+    // Built by tick, written to the UBO by globe_render via vkCmdUpdateBuffer
+    // — a host memcpy raced the previous in-flight frame's shader reads.
+    CameraData        camera_frame_data{};
 
     // --- Stamp buffers ---
     VkBuffer          stamp_buf       = VK_NULL_HANDLE;
@@ -178,6 +200,15 @@ struct GlobeState {
     VkImage       hydrology_img   = VK_NULL_HANDLE;
     VmaAllocation hydrology_alloc = VK_NULL_HANDLE;
     VkImageView   hydrology_view  = VK_NULL_HANDLE;
+    // Persistent per-in-flight-frame staging for hydro+climate field uploads
+    // (slot layout: [hydro][climate], HYDRO_FIELD_BYTES each). tick snapshots
+    // the published fields and sets the pending flags; globe_render memcpys
+    // into this frame's slot and records the copies into the frame cmd buffer.
+    VkBuffer          hydro_staging_buf[FRAMES_IN_FLIGHT]   = {};
+    VmaAllocation     hydro_staging_alloc[FRAMES_IN_FLIGHT] = {};
+    VmaAllocationInfo hydro_staging_info[FRAMES_IN_FLIGHT]  = {};
+    bool              hydro_upload_pending   = false;
+    bool              climate_upload_pending = false;
     std::unique_ptr<HydroAsync> hydro;          // persistent live-water worker (see HydroAsync)
     uint32_t      hydro_solved_stamp_count = 0; // stamp count the structure is based on
     double        hydro_last_upload = 0.0;      // throttle for uploading published fields
@@ -185,6 +216,10 @@ struct GlobeState {
     // sample it (moisture/river/lake) by sphere direction — see sample_planet_field.
     std::vector<glm::vec4> hydro_field_cpu;
     uint32_t      hydro_field_res = 0;
+    // Per-face river presence blocks (6 * RIVER_MASK_BLOCKS^2, rebuilt each
+    // field upload) — lets the river overlay skip tiles with no channels.
+    std::vector<uint8_t>   river_block_mask;
+    bool          env_bridge_logged = false;  // one-shot Phase-1 acceptance log fired
 
     // --- Climate: coarse ocean circulation field (6-layer RGBA32F, GLOBE_HYDRO_RES²) ---
     // r=sst, g=sst_base(reserved for humidity), b=current angle, a=current speed.
@@ -249,6 +284,9 @@ struct GlobeState {
     // cross-edge flow). Once a tile goes GLOBE_SWE_QUIESCE_S untouched, its
     // water is baked back into the hydrology field and it is un-disturbed.
     std::unordered_map<QuadNode, double, QuadNodeHash> disturbed_touch;
+    // When each disturbed tile was last brushed (not merely flow-touched).
+    // Edge flags may extend disturbance only GLOBE_SWE_DISTURB_MAX_S past this.
+    std::unordered_map<QuadNode, double, QuadNodeHash> disturbed_since;
     std::unordered_set<QuadNode, QuadNodeHash> pending_init;
     // Resident tiles whose SWE water should be re-seeded from the hydrology
     // field (queued on every field publish; skips disturbed tiles so live SWE
@@ -275,6 +313,22 @@ struct GlobeState {
     double altitude_above_terrain = 100000.0;
     float  accumulated_atmo_time  = 0.0f;
 
+    // --- Perf diagnostics (stderr spike attribution + 5 s summaries) ---
+    double perf_report_t      = 0.0;
+    int    perf_frames        = 0;
+    double perf_dt_sum        = 0.0;
+    float  perf_dt_max        = 0.0f;
+    int    perf_uploads       = 0;   // hydro/climate field uploads this window
+    double perf_upload_ms_sum = 0.0;
+    double perf_upload_ms_max = 0.0;
+    int    perf_bakebacks     = 0;
+    double perf_bakeback_ms_max = 0.0;
+    // What the PREVIOUS frame did — read when this frame's dt spikes.
+    float  perf_last_upload_ms   = 0.0f;
+    float  perf_last_bakeback_ms = 0.0f;
+    int    perf_last_tilegen     = 0;
+    int    perf_last_swe_init    = 0;
+
     // --- Timing ---
     double last_time         = 0.0;
     double ns_per_tick       = 0.0;
@@ -299,12 +353,22 @@ struct GlobeState {
     glm::mat4 cam_proj{1.0f};
 
     // --- Static statics that need to be per-instance ---
+    uint32_t sand_emit_offset    = 0;
     double last_stamp_time       = 0.0;
     double last_water_stamp_time = 0.0;
     int    current_cursor_mode   = -1;
 };
 
 // Module API ---------------------------------------------------------------
+
+// Planet-scale ecosystem environment (docs/PLANETARY_ECOSYSTEM.md Phase 1).
+// Builds a bestiary::EnvironmentField over a local tangent frame at
+// `center_dir` (unit sphere direction): sample(x, z) maps x metres east /
+// z metres north of the center to watershed moisture from the live hydrology
+// field (standing water forces moisture to 1) and latitude/altitude
+// temperature. Snapshots the field + stamps, so the returned closure stays
+// valid and consistent while the worker publishes fresher fields.
+bestiary::EnvironmentField globe_environment_field(const GlobeState& s, glm::vec3 center_dir);
 
 void globe_init(GlobeState& s, Renderer& r);
 

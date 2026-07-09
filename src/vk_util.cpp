@@ -288,8 +288,10 @@ void update_r32_image(VkDevice device, VmaAllocator alloc,
     VkImageMemoryBarrier2 b1{};
     b1.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     b1.srcStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-    b1.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                     | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b1.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                     | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
     b1.dstStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
     b1.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     b1.oldLayout     = VK_IMAGE_LAYOUT_GENERAL;
@@ -311,8 +313,10 @@ void update_r32_image(VkDevice device, VmaAllocator alloc,
     b2.srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
     b2.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     b2.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-    b2.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                     | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b2.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                     | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
     b2.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b2.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
     VkDependencyInfo d2{};
@@ -349,8 +353,10 @@ void update_rgba32f_array(VkDevice device, VmaAllocator alloc,
     VkImageMemoryBarrier2 b1{};
     b1.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
     b1.srcStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-    b1.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                     | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b1.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                     | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
     b1.dstStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
     b1.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     b1.oldLayout     = old_layout;
@@ -373,8 +379,10 @@ void update_rgba32f_array(VkDevice device, VmaAllocator alloc,
     b2.srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
     b2.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     b2.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
-                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
-    b2.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                     | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT
+                     | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    b2.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+                     | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
     b2.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     b2.newLayout     = VK_IMAGE_LAYOUT_GENERAL;
     VkDependencyInfo d2{};

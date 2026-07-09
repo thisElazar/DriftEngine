@@ -106,6 +106,54 @@ static constexpr float RANGE_H     = 3200.0f; // peak height added along belts (
 static constexpr float RANGE_WARP  = 0.55f;   // how much ranges wander off the plate edge
 static constexpr float HILL_H      = 280.0f;  // rolling-hill amplitude on land
 
+// ---------------------------------------------------------------------------
+// CPU mirror of shaders/planet_climate.hlsli. pc_fbm3 there adds NO seed
+// offset inside the loop (seed enters via the `so` offsets at call sites), so
+// it gets its own helper rather than reusing cpu_fbm3d.
+// ---------------------------------------------------------------------------
+static float cpu_pc_fbm3(glm::vec3 p, int octaves) {
+    float sum = 0.0f, amp = 1.0f, freq = 1.0f, norm = 0.0f;
+    for (int i = 0; i < octaves; i++) {
+        sum += cpu_gradient_noise_3d(p * freq) * amp;
+        norm += amp;
+        freq *= 2.0f;
+        amp *= 0.5f;
+    }
+    return sum / norm;
+}
+
+CpuPlanetClimate cpu_planet_climate(glm::vec3 n, float seed_f) {
+    glm::vec3 so(seed_f * 0.0173f, seed_f * 0.0091f, seed_f * 0.0047f);
+
+    float cos_lat = std::sqrt(std::clamp(1.0f - n.y * n.y, 0.0f, 1.0f));
+    float t = std::pow(cos_lat, 1.5f);
+    t += 0.25f * (cpu_pc_fbm3(n * 2.1f + so, 4) - 0.5f);
+
+    glm::vec3 w = glm::vec3(cpu_pc_fbm3(n * 1.3f + so + 11.7f, 3),
+                            cpu_pc_fbm3(n * 1.3f + so + 31.9f, 3),
+                            cpu_pc_fbm3(n * 1.3f + so + 57.3f, 3)) - 0.5f;
+    float m = cpu_pc_fbm3((n + 0.55f * w) * 1.7f + so, 4);
+    m = std::clamp((m - 0.30f) * 2.2f, 0.0f, 1.0f);
+
+    CpuPlanetClimate c;
+    c.temperature = std::clamp(t, 0.0f, 1.0f);
+    c.moisture    = m;
+    return c;
+}
+
+glm::vec4 cpu_planet_biome_weights(CpuPlanetClimate c) {
+    float warm = glm::smoothstep(0.25f, 0.45f, c.temperature);
+    float hot  = glm::smoothstep(0.55f, 0.75f, c.temperature);
+    float wet  = glm::smoothstep(0.30f, 0.55f, c.moisture);
+
+    glm::vec4 wgt;
+    wgt.x = hot * (1.0f - wet);
+    wgt.w = 1.0f - warm;
+    wgt.z = warm * wet * (1.0f - wgt.x);
+    wgt.y = std::max(1.0f - wgt.x - wgt.z - wgt.w, 0.0f);
+    return wgt / std::max(wgt.x + wgt.y + wgt.z + wgt.w, 1e-3f);
+}
+
 // 3D domain-warp offset, recentered to roughly [-0.5, 0.5]. Mirrors warp3().
 static glm::vec3 cpu_warp3(glm::vec3 p, float seed_ofs) {
     return glm::vec3(
@@ -117,7 +165,7 @@ static glm::vec3 cpu_warp3(glm::vec3 p, float seed_ofs) {
 float cpu_terrain_height(glm::vec3 sphere_dir) {
     glm::vec3 n  = sphere_dir;
     glm::vec3 sp = n * 1000.0f;
-    constexpr uint32_t seed = 42;
+    constexpr uint32_t seed = PLANET_SEED;   // shared with the GPU push constant (terrain.h)
 
     // ===== CONTINENTS (smooth, domain-warped) =====
     glm::vec3 wn = n + CONT_WARP * cpu_warp3(n * 1.6f, seed * 0.07f);
@@ -134,19 +182,30 @@ float cpu_terrain_height(glm::vec3 sphere_dir) {
     glm::vec3 rw = sp * 0.02f + RANGE_WARP * cpu_warp3(sp * 0.01f, seed * 0.4f);
     float ranges = cpu_ridged3d(rw, 5) * RANGE_H * belt;
 
-    // ===== ROLLING HILLS + MULTI-OCTAVE DETAIL =====
-    float hills = (cpu_fbm3d(sp * 0.05f, 5, 2.0f, 0.5f) - 0.5f) * HILL_H * land;
+    // ===== CLIMATE -> BIOME (mirrors planet_climate.hlsli) =====
+    CpuPlanetClimate clim = cpu_planet_climate(n, static_cast<float>(seed));
+    glm::vec4 bw = cpu_planet_biome_weights(clim);
+
+    // ===== ROLLING HILLS + MULTI-OCTAVE DETAIL, biome-scaled =====
+    float hill_amp = HILL_H * glm::dot(bw, glm::vec4(0.45f, 1.0f, 1.1f, 0.55f));
+    float hills = (cpu_fbm3d(sp * 0.05f, 5, 2.0f, 0.5f) - 0.5f) * hill_amp * land;
+
+    float dunes = (1.0f - std::abs(2.0f * cpu_fbm3d(sp * 0.12f, 3, 2.0f, 0.5f) - 1.0f)) * 45.0f;
+    dunes += (1.0f - std::abs(2.0f * cpu_fbm3d(sp * 0.45f, 2, 2.0f, 0.5f) - 1.0f)) * 12.0f;
+    dunes *= bw.x * land;
+
+    float rough = glm::dot(bw, glm::vec4(1.15f, 0.85f, 0.55f, 1.0f));
 
     float detail = 0.0f;
-    detail += cpu_ridged3d(sp * 0.4f, 4) * 120.0f * land;
+    detail += cpu_ridged3d(sp * 0.4f, 4) * 120.0f * land * rough;
     detail += (cpu_fbm3d(sp * 0.08f, 6, 2.0f, 0.5f) - 0.5f) * 120.0f;
     detail += (cpu_gradient_noise_3d(sp * 0.15f) - 0.5f) * 40.0f;
-    detail += (cpu_fbm3d(sp * 1.6f, 3, 2.0f, 0.5f) - 0.5f) * 90.0f;
+    detail += (cpu_fbm3d(sp * 1.6f, 3, 2.0f, 0.5f) - 0.5f) * 90.0f * rough;
     detail += (cpu_gradient_noise_3d(sp * 13.0f) - 0.5f) * 25.0f;
     detail += (cpu_gradient_noise_3d(sp * 80.0f) - 0.5f) * 8.0f;
     detail += (cpu_gradient_noise_3d(sp * 640.0f) - 0.5f) * 1.5f;
 
-    float h = base + ranges + hills + detail;
+    float h = base + ranges + hills + dunes + detail;
     return std::clamp(h, -3000.0f, 8000.0f);
 }
 

@@ -20,6 +20,23 @@ static glm::quat orientation_from_up(glm::vec3 up)
     return glm::angleAxis(angle, axis);
 }
 
+// Level, horizon-facing orientation at a surface point: forward = fwd_hint
+// projected onto the tangent plane (arbitrary tangent if degenerate, e.g.
+// when the hint points straight down), up = radial.
+static glm::quat horizon_orientation(glm::vec3 radial_up, glm::vec3 fwd_hint)
+{
+    glm::vec3 t = fwd_hint - glm::dot(fwd_hint, radial_up) * radial_up;
+    if (glm::dot(t, t) < 1e-6f) {
+        glm::vec3 alt = std::abs(radial_up.y) > 0.9f ? glm::vec3(1, 0, 0)
+                                                     : glm::vec3(0, 1, 0);
+        t = alt - glm::dot(alt, radial_up) * radial_up;
+    }
+    t = glm::normalize(t);
+    glm::vec3 right = glm::normalize(glm::cross(t, radial_up));
+    glm::mat3 m(right, radial_up, -t);
+    return glm::normalize(glm::quat_cast(m));
+}
+
 // ---------- shared accessors ----------
 
 glm::quat camera_orientation(const Camera& cam)
@@ -62,13 +79,22 @@ static void orbital_mouse_look(OrbitalState& s, float dx, float dy, float sensit
     glm::quat yaw_rot = glm::angleAxis(-dx * sensitivity, radial_up);
     glm::quat pitch_rot = glm::angleAxis(-dy * sensitivity, right);
 
-    s.orientation = glm::normalize(yaw_rot * pitch_rot * s.orientation);
+    glm::quat proposed = glm::normalize(yaw_rot * pitch_rot * s.orientation);
 
-    glm::vec3 fwd = s.orientation * glm::vec3(0.0f, 0.0f, -1.0f);
-    glm::vec3 corrected_right = glm::normalize(glm::cross(fwd, radial_up));
-    glm::vec3 corrected_up = glm::cross(corrected_right, fwd);
-    glm::mat3 m(corrected_right, corrected_up, -fwd);
-    s.orientation = glm::normalize(glm::quat_cast(m));
+    // Re-orthonormalize against radial up — but only if the proposed forward
+    // is safely off the radial pole. Pitching to straight down/up makes the
+    // cross degenerate (normalize of ~0 → NaN quaternion that poisons every
+    // subsequent frame), so at the pole we keep the pre-pitch orientation.
+    glm::vec3 fwd = proposed * glm::vec3(0.0f, 0.0f, -1.0f);
+    glm::vec3 corrected_right = glm::cross(fwd, radial_up);
+    float rl2 = glm::dot(corrected_right, corrected_right);
+    if (rl2 > 1e-6f) {
+        corrected_right /= std::sqrt(rl2);
+        glm::vec3 corrected_up = glm::cross(corrected_right, fwd);
+        glm::mat3 m(corrected_right, corrected_up, -fwd);
+        s.orientation = glm::normalize(glm::quat_cast(m));
+    }
+    // else: drop this pitch step — orientation stays at last valid frame.
 }
 
 // Feel-tuning constants for the orbital camera.
@@ -134,13 +160,18 @@ static CameraUpdateResult orbital_update(OrbitalState& s, const InputFrame& in, 
     // Keep smoothed velocity strictly tangential (no altitude leak).
     s.move_vel -= glm::dot(s.move_vel, pivot_dir_d) * pivot_dir_d;
 
+    // Integration dt is clamped: a stalled frame (window drag, debugger, load
+    // hitch) must not rotate the pivot a large arc in one step — the sim paths
+    // all clamp the same way. Easing above uses raw dt (exp is stall-safe).
+    double dt_i = std::min(static_cast<double>(dt), 0.05);
+
     // Apply tangential motion as a ROTATION about the planet center so the
     // pivot stays glued to the surface. (Linear translation slid off along the
     // tangent and the horizon crept up — the bug this replaces.)
     double v = glm::length(s.move_vel);
     if (v > 1e-6) {
         glm::dvec3 mdir = s.move_vel / v;
-        double dtheta = v * static_cast<double>(dt) / glm::length(pivot);
+        double dtheta = v * dt_i / glm::length(pivot);
         glm::dvec3 axis = glm::cross(pivot_dir_d, mdir);
         double axis_len = glm::length(axis);
         if (axis_len > 1e-9) {
@@ -154,7 +185,7 @@ static CameraUpdateResult orbital_update(OrbitalState& s, const InputFrame& in, 
 
     // Radial motion (Q/E) changes altitude — straight in/out from center.
     if (std::abs(s.radial_vel) > 1e-6)
-        s.pivot += pivot_dir_d * (s.radial_vel * static_cast<double>(dt));
+        s.pivot += pivot_dir_d * (s.radial_vel * dt_i);
 
     // Re-anchor the basis to the (new) radial up so roll never accumulates and
     // the horizon stays level. Guard against the fwd≈up singularity at zenith.
@@ -242,8 +273,13 @@ static CameraUpdateResult fp_update(FirstPersonState& s, const InputFrame& in, f
               + (std::sin(ts * angle) / sa) * s.warp_d1);
         }
 
-        // Radius: lerp endpoint radii + sin-arc altitude bump (peaks at t=0.5).
-        double r_lerp = s.warp_r0 + (s.warp_r1 - s.warp_r0) * ts;
+        // Radius: lerp toward the LIVE landing radius (terrain can refine under
+        // LOD streaming while we fly — chasing it each frame means t=1 touches
+        // down exactly, no landing snap) + sin-arc altitude bump (peaks at 0.5).
+        double r1_live = static_cast<double>(planet_radius)
+                       + static_cast<double>(height_fn(glm::vec3(s.warp_d1)))
+                       + static_cast<double>(s.eye_height_offset);
+        double r_lerp = s.warp_r0 + (r1_live - s.warp_r0) * ts;
         double r_arc = std::sin(t * 3.14159265358979) * s.warp_arc_h;
         double r = r_lerp + r_arc;
 
@@ -256,13 +292,15 @@ static CameraUpdateResult fp_update(FirstPersonState& s, const InputFrame& in, f
 
         s.eye = dir * r;
 
+        // Ease the view from the takeoff orientation to horizon-level at the
+        // destination along the same smoothstep (mouse-look is overridden for
+        // the duration of the flight).
+        s.orientation = glm::normalize(glm::slerp(s.warp_o0, s.warp_o1,
+                                                  static_cast<float>(ts)));
+
         if (t >= 1.0) {
-            // Land — snap to target, restore walking state.
-            glm::vec3 land_dir = glm::vec3(s.warp_d1);
-            float land_h = height_fn(land_dir);
-            double land_r = static_cast<double>(planet_radius) + static_cast<double>(land_h)
-                          + static_cast<double>(s.eye_height_offset);
-            s.eye = glm::dvec3(land_dir) * land_r;
+            // Landed — the path already ends on the surface; just restore
+            // walking state.
             s.warping = false;
             s.vertical_velocity = 0.0f;
             s.grounded = true;
@@ -439,43 +477,49 @@ void camera_switch_to_first_person(Camera& cam, float planet_radius,
 {
     if (cam.mode == CameraMode::FirstPerson) return;
 
-    // Place the FP eye at the orbital pivot's surface position + eye_height.
+    // Landing spot: the surface under the orbital pivot, at eye height.
     glm::dvec3 pivot = cam.orbit.pivot;
     glm::vec3 dir = glm::normalize(glm::vec3(pivot));
     double h = static_cast<double>(height_fn(dir));
     double target_radius = static_cast<double>(planet_radius) + h
                          + static_cast<double>(cam.fp.eye_height_offset);
+    glm::dvec3 target_eye = glm::dvec3(dir) * target_radius;
 
-    cam.fp.eye = glm::dvec3(dir) * target_radius;
-
-    // Orbital forward looks back at the pivot — that's straight down once we're
-    // standing on it. Re-anchor: project orbital forward onto the tangent plane
-    // at the new eye and rebuild orientation looking along the horizon.
-    glm::vec3 radial_up = dir;
-    glm::vec3 orbit_fwd = glm::normalize(cam.orbit.orientation * glm::vec3(0.0f, 0.0f, -1.0f));
-    glm::vec3 tangent_fwd = orbit_fwd - glm::dot(orbit_fwd, radial_up) * radial_up;
-    if (glm::dot(tangent_fwd, tangent_fwd) < 1e-6f) {
-        // Degenerate (orbital was looking straight down). Pick an arbitrary tangent.
-        glm::vec3 alt = std::abs(radial_up.y) > 0.9f ? glm::vec3(1, 0, 0) : glm::vec3(0, 1, 0);
-        tangent_fwd = glm::normalize(alt - glm::dot(alt, radial_up) * radial_up);
-    } else {
-        tangent_fwd = glm::normalize(tangent_fwd);
-    }
-    glm::vec3 right = glm::normalize(glm::cross(tangent_fwd, radial_up));
-    glm::mat3 m(right, radial_up, -tangent_fwd);
-    cam.fp.orientation = glm::normalize(glm::quat_cast(m));
-
+    // Continuity: FP takes over exactly where the orbital eye was, looking the
+    // same way, then GLIDES down on the warp path (teleporting from a high
+    // orbit straight to the ground was the jarring cut this replaces). The
+    // warp also eases the view level with the horizon for landing.
+    glm::dvec3 eye0 = camera_eye_position(cam);
+    cam.fp.eye = eye0;
+    cam.fp.orientation = cam.orbit.orientation;
+    cam.fp.vertical_velocity = 0.0f;
     cam.mode = CameraMode::FirstPerson;
+
+    if (glm::length(eye0 - target_eye) > 3.0) {
+        camera_begin_warp_to(cam, target_eye);
+    } else {
+        cam.fp.eye = target_eye;
+        cam.fp.orientation = horizon_orientation(
+            dir, glm::normalize(cam.orbit.orientation * glm::vec3(0.0f, 0.0f, -1.0f)));
+        cam.fp.grounded = true;
+    }
 }
 
 void camera_switch_to_orbital(Camera& cam)
 {
     if (cam.mode == CameraMode::Orbital) return;
 
-    // Pivot at the FP eye, short arm — preserves view continuity.
-    cam.orbit.pivot = cam.fp.eye;
+    // Continuity: the eye does not move. Short arm with the pivot just ahead
+    // along the view ray, so pivot + orientation*(0,0,arm) lands exactly on
+    // the FP eye. (Reusing the stale arm_length from the last orbit session
+    // used to pop the camera straight back to space on this switch.)
     cam.orbit.orientation = cam.fp.orientation;
-    cam.orbit.arm_length = std::max(cam.orbit.arm_length, 50.0);
+    cam.orbit.arm_length = 50.0;
+    cam.orbit.pivot = cam.fp.eye
+                    - glm::dvec3(cam.fp.orientation * glm::vec3(0.0f, 0.0f, 50.0f));
+    cam.orbit.move_vel = glm::dvec3(0.0);
+    cam.orbit.radial_vel = 0.0;
+    cam.orbit.look_pending = glm::vec2(0.0f);
     cam.fp.warping = false;
     cam.mode = CameraMode::Orbital;
 }
@@ -487,7 +531,6 @@ void camera_begin_warp_to(Camera& cam, glm::dvec3 target_eye)
     glm::dvec3 d0 = glm::normalize(cam.fp.eye);
     glm::dvec3 d1 = glm::normalize(target_eye);
     double r0 = glm::length(cam.fp.eye);
-    double r1 = glm::length(target_eye);
 
     double dot01 = glm::clamp(glm::dot(d0, d1), -1.0, 1.0);
     double angle = std::acos(dot01);
@@ -496,10 +539,24 @@ void camera_begin_warp_to(Camera& cam, glm::dvec3 target_eye)
     cam.fp.warp_d0 = d0;
     cam.fp.warp_d1 = d1;
     cam.fp.warp_r0 = r0;
-    cam.fp.warp_r1 = r1;
     cam.fp.warp_arc_h = std::clamp(arc_dist * 0.1, 50.0, 5000.0);
-    cam.fp.warp_duration = std::clamp(arc_dist / 10000.0, 0.4, 3.0);
+    // Duration from the full 3D endpoint distance, not just the surface arc —
+    // a mostly-radial descent from orbit should take its time too.
+    double chord = glm::length(target_eye - cam.fp.eye);
+    cam.fp.warp_duration = std::clamp(chord / 10000.0, 0.6, 3.0);
     cam.fp.warp_elapsed = 0.0;
+    // View: ease from the current orientation to horizon-level at the
+    // destination, facing the way we flew (or the current heading when the
+    // flight is straight down).
+    glm::vec3 travel = (chord > 1e-6) ? glm::vec3(glm::normalize(target_eye - cam.fp.eye))
+                                      : glm::vec3(0.0f);
+    glm::vec3 up1 = glm::vec3(d1);
+    glm::vec3 travel_t = travel - glm::dot(travel, up1) * up1;
+    glm::vec3 fwd_hint = (glm::dot(travel_t, travel_t) > 1e-6f)
+        ? travel_t
+        : cam.fp.orientation * glm::vec3(0.0f, 0.0f, -1.0f);
+    cam.fp.warp_o0 = cam.fp.orientation;
+    cam.fp.warp_o1 = horizon_orientation(up1, fwd_hint);
     cam.fp.warping = true;
     cam.fp.vertical_velocity = 0.0f;
     cam.fp.grounded = false;  // we're in flight
