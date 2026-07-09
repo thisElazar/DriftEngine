@@ -39,7 +39,8 @@ struct FirstPersonState {
     glm::dvec3 warp_d0{0.0, 0.0, 1.0};      // start direction (unit)
     glm::dvec3 warp_d1{0.0, 0.0, 1.0};      // end direction (unit)
     double     warp_r0 = 0.0;               // start radius from planet center
-    double     warp_r1 = 0.0;               // end radius from planet center
+    glm::quat  warp_o0{1.0f, 0.0f, 0.0f, 0.0f};  // orientation at start
+    glm::quat  warp_o1{1.0f, 0.0f, 0.0f, 0.0f};  // orientation at landing (horizon-level)
     double     warp_arc_h = 0.0;            // peak altitude bump (meters)
     double     warp_duration = 0.0;         // seconds total
     double     warp_elapsed = 0.0;

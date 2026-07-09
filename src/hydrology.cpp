@@ -191,52 +191,6 @@ static std::vector<double> compute_accumulation(const std::vector<float>& filled
     return accum;
 }
 
-PlanetHydrology build_planet_hydrology(uint32_t res, float sea_level,
-                                       const TerrainStamp* stamps, uint32_t stamp_count)
-{
-    PlanetHydrology h;
-    h.res = res;
-    const size_t N = static_cast<size_t>(6) * res * res;
-    h.cells.assign(N, glm::vec4(0.0f));
-
-    std::vector<glm::vec3> dir;
-    std::vector<float> base;
-    sample_base(res, dir, base, nullptr);
-    std::vector<float> height(N);
-    for (size_t c = 0; c < N; ++c)
-        height[c] = base[c] + stamp_delta(dir[c], stamps, stamp_count);
-
-    std::vector<float> filled;
-    std::vector<int> downstream;
-    route_drainage(res, sea_level, height, filled, downstream);
-    std::vector<double> accum = compute_accumulation(filled, downstream);
-
-    double max_accum = RIVER_ACCUM_MIN + 1.0;
-    for (size_t c = 0; c < N; ++c)
-        if (height[c] >= sea_level) max_accum = std::max(max_accum, accum[c]);
-    const float lr_min = std::log(1.0f + RIVER_ACCUM_MIN);
-    const float lr_max = std::log(1.0f + static_cast<float>(max_accum));
-    const float lm_ref = std::log(1.0f + MOIST_ACCUM_REF);
-
-    for (size_t c = 0; c < N; ++c) {
-        bool land = height[c] >= sea_level;
-        float la = std::log(1.0f + static_cast<float>(accum[c]));
-
-        float strength = 0.0f, moisture = 1.0f, flow_a = 0.5f;
-        // a = water-surface elevation (m), full depressions (static variant).
-        float surf = land ? filled[c] : height[c];
-
-        if (land) {
-            strength = std::clamp((la - lr_min) / std::max(lr_max - lr_min, 1e-4f), 0.0f, 1.0f);
-            moisture = std::clamp(la / std::max(lm_ref, 1e-4f), 0.0f, 1.0f);
-            int d = downstream[c];
-            if (d >= 0) flow_a = flow_angle01(dir[c], dir[d]);
-        }
-        h.cells[c] = glm::vec4(strength, moisture, flow_a, surf);
-    }
-    return h;
-}
-
 HydroSample sample_planet_field(const std::vector<glm::vec4>& cells, uint32_t res,
                                 glm::vec3 sphere_dir)
 {

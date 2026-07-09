@@ -90,16 +90,25 @@ float4 main(PSInput input) : SV_Target
     float  NdotV = saturate(dot(Nw, V));
     float  fresnel = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);
 
+    // Same atmospheric sun/twilight treatment as the terrain pass, so rivers
+    // redden and darken with the landscape at the terminator.
+    float3 pp = input.world_pos - planet_center;
+    float3 sunT = (atmo_density > 0.0)
+                ? atmo_sun_transmittance(pp, L, planet_radius, atmo_density)
+                : float3(1.0, 1.0, 1.0);
+    float  day = smoothstep(-0.08, 0.2, dot(normalize(pp), L));
+
     float3 Rr = reflect(-V, Nw);
     float  sky_t = saturate(Rr.y * 0.5 + 0.5);
     float3 sky = lerp(float3(0.85, 0.88, 0.92), float3(0.30, 0.55, 0.85), sky_t);
+    sky *= lerp(0.06, 1.0, day);
 
     float3 H = normalize(L + V);
     float  spec = pow(saturate(dot(Nw, H)), 64.0);
-    float3 specular = sun_color * spec * 0.8;
+    float3 specular = sun_color * spec * 0.8 * sunT;
 
     float  NdotL = saturate(dot(Nw, L));
-    float3 lit = col * (0.4 + 0.6 * NdotL);
+    float3 lit = col * (0.4 * lerp(0.08, 1.0, day) + 0.6 * NdotL * sunT);
     float3 outc = lerp(lit, sky, fresnel) + specular;
 
     // Aerial perspective, matching the terrain beneath so distant rivers haze

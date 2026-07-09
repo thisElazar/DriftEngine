@@ -16,32 +16,6 @@
 
 struct TerrainStamp;  // fwd (src/pipeline.h)
 
-struct PlanetHydrology {
-    uint32_t res = 0;  // R: cells per cube-face edge
-
-    // Per-cell payload, 6 faces laid out contiguously.
-    // Index: face*res*res + j*res + i.
-    //   .r = river_strength (0..1, log-normalized accumulation; >threshold = river)
-    //   .g = moisture       (0..1, watershed wetness for the ecosystem)
-    //   .b = flow_dir east  (local tangent frame)
-    //   .a = flow_dir north (local tangent frame)
-    std::vector<glm::vec4> cells;
-
-    bool valid() const {
-        return res > 0 && cells.size() == static_cast<size_t>(6) * res * res;
-    }
-    size_t index(uint32_t face, uint32_t i, uint32_t j) const {
-        return static_cast<size_t>(face) * res * res + static_cast<size_t>(j) * res + i;
-    }
-};
-
-// Build the coarse global hydrology field. `stamps`/`stamp_count` are the terrain
-// edit stamps (may be null/0). Runs on the CPU; safe to call off the main thread
-// as long as `stamps` points at a stable snapshot for the call's duration.
-//
-PlanetHydrology build_planet_hydrology(uint32_t res, float sea_level,
-                                       const TerrainStamp* stamps, uint32_t stamp_count);
-
 // ---------------------------------------------------------------------------
 // CPU sampling of a baked hydrology field (the worker's published RGBA payload).
 // This is the bridge the ecosystem reads: given a sphere direction, return the
@@ -55,8 +29,8 @@ struct HydroSample {
                                       // water exists where terrain sits below it
 };
 
-// Sample the field (6*res*res RGBA cells, as produced by bake/build) at a unit
-// sphere direction. Returns defaults if the field is empty/mismatched.
+// Sample the field (6*res*res RGBA cells, as produced by LiveHydrology::bake)
+// at a unit sphere direction. Returns defaults if the field is empty/mismatched.
 HydroSample sample_planet_field(const std::vector<glm::vec4>& cells, uint32_t res,
                                 glm::vec3 sphere_dir);
 

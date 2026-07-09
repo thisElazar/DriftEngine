@@ -78,7 +78,10 @@ float3 land_color(float h_norm, float3 N, float3 sphere_dir, float seed_v)
     return c;
 }
 
-float3 compute_water_color(float depth, float3 sphere_dir, float3 world_pos, float sst)
+// sunT = atmospheric transmittance of direct sun at this point (reddens and
+// dies at the terminator); day = twilight factor for ambient/sky light.
+float3 compute_water_color(float depth, float3 sphere_dir, float3 world_pos, float sst,
+                           float3 sunT, float day)
 {
     float3 baseN = normalize(sphere_dir);
     float3 ref = (abs(baseN.y) > 0.999) ? float3(1.0, 0.0, 0.0) : float3(0.0, 1.0, 0.0);
@@ -131,13 +134,15 @@ float3 compute_water_color(float depth, float3 sphere_dir, float3 world_pos, flo
     float3 R = reflect(-V, N);
     float sky_t = saturate(R.y * 0.5 + 0.5);
     float3 sky = lerp(float3(0.85, 0.88, 0.92), float3(0.30, 0.55, 0.85), sky_t);
+    sky *= lerp(0.06, 1.0, day);   // the reflected sky goes dark at night
 
     float3 H = normalize(L + V);
     float spec = pow(saturate(dot(N, H)), 64.0);
-    float3 specular = sun_color * spec * 0.8;
+    float3 specular = sun_color * spec * 0.8 * sunT;   // glint reddens, then dies
 
     float NdotL = saturate(dot(N, L));
-    float3 diffuse = base * (0.4 + 0.6 * NdotL) * (0.90 + 0.20 * meta);
+    float3 diffuse = base * (0.4 * lerp(0.08, 1.0, day) + 0.6 * NdotL * sunT)
+                   * (0.90 + 0.20 * meta);
 
     return lerp(diffuse, sky, fresnel) + specular;
 }
@@ -152,30 +157,42 @@ float4 main(PSInput input) : SV_Target
     float2 clim_uv = face_uv * 0.5 + 0.5;
     float  sst     = climate.SampleLevel(tex_sampler, float3(clim_uv, float(face)), 0).r;
 
+    // Direct sun filtered through the atmosphere at this point: ~neutral at
+    // noon, gold/red at a low sun, zero past the terminator (the Chapman
+    // depth is analytic — see atmosphere_planet.hlsli). `day` is the twilight
+    // factor for ambient/sky light, easing to a faint floor on the night side
+    // so the dark hemisphere stays barely legible from orbit.
+    float3 L = normalize(sun_dir);
+    float3 pp = input.world_pos - planet_center;   // fragment rel. planet center
+    float3 sunT = (atmo_density > 0.0)
+                ? atmo_sun_transmittance(pp, L, planet_radius, atmo_density)
+                : float3(1.0, 1.0, 1.0);
+    float day = smoothstep(-0.08, 0.2, dot(normalize(pp), L));
+    float ambient_lit = lerp(0.08, 1.0, day);
+
     float shore_band = max(max_elevation * 0.005, 0.5);
     if (input.water_depth > shore_band) {
-        color = compute_water_color(input.water_depth, input.sphere_direction, input.world_pos, sst);
+        color = compute_water_color(input.water_depth, input.sphere_direction,
+                                    input.world_pos, sst, sunT, day);
         color = lerp(color, float3(0.95, 0.95, 0.97), saturate(input.foam));
     } else if (input.water_depth > 0.0) {
         float3 terrain_color = land_color(input.height_normalized, input.world_normal,
                                           input.sphere_direction, seed_f);
-        float3 L = normalize(sun_dir);
         float3 N = normalize(input.world_normal);
         float NdotL = max(dot(N, L), 0.0);
-        terrain_color *= 0.3 + 0.7 * NdotL;
+        terrain_color *= 0.3 * ambient_lit + 0.7 * NdotL * sunT;
 
-        float3 water_col = compute_water_color(input.water_depth, input.sphere_direction, input.world_pos, sst);
+        float3 water_col = compute_water_color(input.water_depth, input.sphere_direction,
+                                               input.world_pos, sst, sunT, day);
         float blend = smoothstep(0.0, shore_band, input.water_depth);
         color = lerp(terrain_color, water_col, blend);
     } else {
         color = land_color(input.height_normalized, input.world_normal,
                            input.sphere_direction, seed_f);
-        float3 L = normalize(sun_dir);
         float3 N = normalize(input.world_normal);
         float NdotL = max(dot(N, L), 0.0);
         float ambient = 0.3;
-        float lighting = ambient + (1.0 - ambient) * NdotL;
-        color *= lighting;
+        color *= ambient * ambient_lit + (1.0 - ambient) * NdotL * sunT;
     }
 
     // Brush cursor — two protocols selected by brush_color.a:

@@ -76,13 +76,57 @@ float2 atmo_sun_depth(float3 p, float3 sun_dir, float r_ground)
         H_MIE      * exp(-alt / H_MIE)      * atmo_chapman(xm, coschi));
 }
 
-// First ground-sphere hit along the ray, in METRES (negative = no hit).
-// For the sky pass's t_max; computed in km for the same precision reason.
-float atmo_ground_hit(float3 ro_m, float3 rd, float r_ground_m)
+// Transmittance of direct sunlight down to a point (METRES, planet-center
+// frame): the analytic Chapman depth turned into a color. Cheap enough for
+// per-pixel surface lighting — low sun goes gold, below the horizon it
+// collapses to zero, so the terminator falls out for free.
+float3 atmo_sun_transmittance(float3 p_m, float3 sun_dir, float r_ground_m,
+                              float density)
 {
-    float2 g = atmo_ray_sphere_km(ro_m * ATMO_KM_PER_M, rd, r_ground_m * ATMO_KM_PER_M);
-    if (g.x < g.y && g.x > 0.0) return g.x / ATMO_KM_PER_M;
-    return -1.0;
+    float2 d = atmo_sun_depth(p_m * ATMO_KM_PER_M, sun_dir,
+                              r_ground_m * ATMO_KM_PER_M);
+    return exp(-(BETA_RAY * d.x + BETA_MIE * 1.1 * d.y) * density);
+}
+
+// Soft ground clip for the sky pass. Returns the march end distance in METRES
+// and a 0..1 miss weight (0 = solid ground hit, 1 = clean miss into space).
+//
+// Why not a plain ray-sphere hit test: its discriminant subtracts two huge,
+// nearly equal terms, and from a high orbit the resulting hit/miss boundary
+// wobbles by kilometres under camera motion — the limb sparkled. (Dropping
+// the ground test entirely traded that for warm haze glowing through the
+// planet on sub-horizon pixels — the reverted attempt.) Here the decision
+// uses the IMPACT PARAMETER (perpendicular distance from the planet center
+// to the ray line), which is fp32-stable at orbital distance, feathered over
+// a few km so no pixel ever flips a binary; t_max slides continuously from
+// the ground hit to the shell exit across the band, and the underground
+// density clamp in atmo_integrate keeps intermediate values graceful.
+static const float ATMO_LIMB_FEATHER = 4.0;   // impact-parameter band, km
+
+float atmo_sky_tmax(float3 ro_m, float3 rd, float r_ground_m, out float miss_w)
+{
+    float3 ro = ro_m * ATMO_KM_PER_M;
+    float  rg = r_ground_m * ATMO_KM_PER_M;
+
+    float  b = dot(ro, rd);            // -distance to closest approach
+    float3 perp = ro - b * rd;
+    float  impact = length(perp);      // stable: no near-equal subtraction
+
+    miss_w = smoothstep(rg - ATMO_LIMB_FEATHER, rg + ATMO_LIMB_FEATHER, impact);
+    // Below the datum sphere (deep basins) the ground is beneath the camera,
+    // not across the ray — march the shell and let extinction handle it.
+    miss_w = max(miss_w, smoothstep(0.0, -0.4, length(ro) - rg));
+    // Closest approach behind the camera: the ray points away — pure miss.
+    // (Required: an up-ray's line still pierces the planet behind us.)
+    if (b >= 0.0) miss_w = 1.0;
+
+    // Ground-side end: the near hit, degenerating to the closest approach for
+    // a graze (continuous at impact == rg).
+    float t_ground = max(-b - sqrt(max(rg * rg - impact * impact, 0.0)), 0.0);
+    // Miss-side end: exit of the atmosphere shell.
+    float t_exit = max(atmo_ray_sphere_km(ro, rd, rg + ATMO_HEIGHT).y, 0.0);
+
+    return lerp(t_ground, t_exit, miss_w) / ATMO_KM_PER_M;
 }
 
 struct AtmoResult {

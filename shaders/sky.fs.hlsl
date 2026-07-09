@@ -46,23 +46,22 @@ float4 main(PSInput input) : SV_Target
 
     // Rays that hit the planet datum stop there (terrain pixels have their own
     // aerial perspective; this only covers sub-horizon gaps), others march the
-    // whole shell. The hit test runs in km inside the helper — see the
-    // precision note in atmosphere_planet.hlsli.
-    float ground_t = atmo_ground_hit(ro, rd, planet_radius);
-    float t_max = (ground_t > 0.0) ? ground_t : 1e12;
+    // whole shell. The clip is SOFT — feathered on the fp32-stable impact
+    // parameter — so the limb never sparkles under camera motion. See
+    // atmo_sky_tmax in atmosphere_planet.hlsli.
+    float miss_w;
+    float t_max = atmo_sky_tmax(ro, rd, planet_radius, miss_w);
 
     AtmoResult ar = atmo_integrate(ro, rd, t_max, L, planet_radius,
                                    density, sun_intensity, 24);
 
-    // Sun disk + glow, attenuated by the atmosphere in front of it. Only when
-    // the ray leaves the shell unobstructed (t_max is space).
+    // Sun disk + glow, attenuated by the atmosphere in front of it and faded
+    // by the same miss weight — no binary occlusion gate to pop.
     float3 col = ar.inscatter;
-    if (t_max > 1e11) {
-        float mu = dot(rd, L);
-        float disk = smoothstep(0.99995, 0.99999, mu);
-        float glow = pow(saturate(mu), 2000.0) * 0.4;
-        col += (disk * 4.0 + glow) * sun_color * ar.transmittance;
-    }
+    float mu = dot(rd, L);
+    float disk = smoothstep(0.99995, 0.99999, mu);
+    float glow = pow(saturate(mu), 2000.0) * 0.4;
+    col += (disk * 4.0 + glow) * sun_color * ar.transmittance * miss_w;
 
     return float4(col, 1.0);
 }
